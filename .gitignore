@@ -1,0 +1,45 @@
+# === Sample Videos ===
+/samples
+
+# === Sentinel Master Binary (Go) ===
+# Ignore the compiled orchestrator binary
+/sentinel
+/sentinel.exe
+*.test
+*.out
+
+# === Python Inference Engine ===
+# Ignore virtual environments and caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# === AI Models & Local Data ===
+# Ignore large pre-trained dlib model files (.dat)
+*.dat
+# Ignore your local 'known_faces' or 'temp_frames' directories
+/data/known_faces/
+/data/temp_frames/
+/output/redacted_videos/
+
+# === Database & Secrets ===
+# Never commit sensitive database credentials
+.env
+config.json
+*.db
+*.sqlite
+
+# === System & IDE ===
+# Ignore OS-specific junk and IDE settings
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# === Logs ===
+# Keep your project root clean of execution logs
+*.log
+pip-log.txt
