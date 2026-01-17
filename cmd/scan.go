@@ -25,7 +25,6 @@ var (
 	videoPath  string
 	nthFrame   int
 	numEngines int
-	dbURL      string
 )
 
 var scanCmd = &cobra.Command{
@@ -40,7 +39,6 @@ func init() {
 	scanCmd.Flags().StringVarP(&videoPath, "input", "i", "", "Path to video")
 	scanCmd.Flags().IntVarP(&nthFrame, "nth-frame", "n", 10, "AI keyframe interval (e.g. scan every 10th frame)")
 	scanCmd.Flags().IntVarP(&numEngines, "engines", "e", runtime.NumCPU(), "Number of parallel engine workers")
-	scanCmd.Flags().StringVar(&dbURL, "db", "postgres://localhost:5432/sentinel", "PostgreSQL connection string")
 
 	scanCmd.MarkFlagRequired("input")
 	rootCmd.AddCommand(scanCmd)
@@ -55,20 +53,15 @@ var frameBufferPool = sync.Pool{
 func runScan() {
 	validateScanFlags()
 
-	// 1. Initialize Database
+	// 1. Database is initialized in Root PersistentPreRun
 	ctx := context.Background()
-	db, err := store.New(ctx, dbURL)
-	if err != nil {
-		utils.Die("Failed to connect to database", err, nil)
-	}
-	defer db.Close(ctx)
 
 	// 2. Generate Video ID & Register
 	videoID, err := utils.GenerateVideoID(videoPath)
 	if err != nil {
 		utils.Die("Failed to generate video ID", err, nil)
 	}
-	if err := db.EnsureVideoMetadata(ctx, videoID, videoPath); err != nil {
+	if err := DB.EnsureVideoMetadata(ctx, videoID, videoPath); err != nil {
 		utils.Die("Failed to register video metadata", err, nil)
 	}
 	fmt.Fprintf(os.Stderr, "📼 Processing Video ID: %s\n", videoID[:12])
@@ -95,7 +88,7 @@ func runScan() {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			startWorker(workerID, taskChan, db, videoID)
+			startWorker(workerID, taskChan, DB, videoID)
 		}(i)
 	}
 
