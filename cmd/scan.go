@@ -3,12 +3,14 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"runtime"
 	"sync"
 
+	"github.com/andresmejia3/sentinel/internal/store"
 	"github.com/andresmejia3/sentinel/internal/types"
 	"github.com/andresmejia3/sentinel/internal/utils"
 	"github.com/andresmejia3/sentinel/internal/worker"
@@ -23,6 +25,7 @@ var (
 	videoPath  string
 	nthFrame   int
 	numEngines int
+	dbURL      string
 )
 
 var scanCmd = &cobra.Command{
@@ -37,6 +40,7 @@ func init() {
 	scanCmd.Flags().StringVarP(&videoPath, "input", "i", "", "Path to video")
 	scanCmd.Flags().IntVarP(&nthFrame, "nth-frame", "n", 10, "AI keyframe interval (e.g. scan every 10th frame)")
 	scanCmd.Flags().IntVarP(&numEngines, "engines", "e", runtime.NumCPU(), "Number of parallel engine workers")
+	scanCmd.Flags().StringVar(&dbURL, "db", "postgres://localhost:5432/sentinel", "PostgreSQL connection string")
 
 	scanCmd.MarkFlagRequired("input")
 	rootCmd.AddCommand(scanCmd)
@@ -49,6 +53,24 @@ var frameBufferPool = sync.Pool{
 
 func runScan() {
 	validateScanFlags()
+
+	// 1. Initialize Database
+	ctx := context.Background()
+	db, err := store.New(ctx, dbURL)
+	if err != nil {
+		utils.Die("Failed to connect to database", err, nil)
+	}
+	defer db.Close(ctx)
+
+	// 2. Generate Video ID & Register
+	videoID, err := utils.GenerateVideoID(videoPath)
+	if err != nil {
+		utils.Die("Failed to generate video ID", err, nil)
+	}
+	if err := db.EnsureVideoMetadata(ctx, videoID, videoPath); err != nil {
+		utils.Die("Failed to register video metadata", err, nil)
+	}
+	fmt.Fprintf(os.Stderr, "📼 Processing Video ID: %s\n", videoID[:12])
 
 	// 0. Get total frames for progress bar
 	totalVideoFrames := utils.GetTotalFrames(videoPath)
@@ -67,16 +89,16 @@ func runScan() {
 	taskChan := make(chan types.FrameTask, numEngines*2)
 	var wg sync.WaitGroup
 
-	// 1. Spawn the Engine Pool
+	// 3. Spawn the Engine Pool
 	for i := 0; i < numEngines; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			startWorker(workerID, taskChan)
+			startWorker(workerID, taskChan, db, videoID)
 		}(i)
 	}
 
-	// 2. Start FFmpeg
+	// 4. Start FFmpeg
 	ffmpeg := utils.NewFFmpegCmd(videoPath)
 
 	var stderrBuf bytes.Buffer
@@ -92,7 +114,7 @@ func runScan() {
 		utils.Die("Failed to start FFmpeg", err, nil)
 	}
 
-	// 3. Frame Splitter & Nth-Frame Logic
+	// 5. Frame Splitter & Nth-Frame Logic
 	scanner := bufio.NewScanner(ffmpegOut)
 	scanner.Buffer(make([]byte, megabyte), 64*megabyte)
 	scanner.Split(utils.SplitJpeg)
@@ -121,7 +143,7 @@ func runScan() {
 		utils.Die("Frame scanner failed", err, nil)
 	}
 
-	// 4. Cleanup & Completion Check
+	// 6. Cleanup & Completion Check
 	if err := ffmpeg.Wait(); err != nil {
 		if stderrBuf.Len() > 0 {
 			fmt.Fprintf(os.Stderr, "\nFFmpeg Logs:\n%s\n", stderrBuf.String())
@@ -136,7 +158,7 @@ func runScan() {
 	fmt.Fprintf(os.Stderr, "\n🏁 Scan Complete. Processed %d keyframes out of %d total.\n", sentFrames, totalFrames)
 }
 
-func startWorker(id int, tasks <-chan types.FrameTask) {
+func startWorker(id int, tasks <-chan types.FrameTask, db *store.Store, videoID string) {
 	worker, err := worker.NewPythonWorker(id)
 	if err != nil {
 		utils.Die("Worker startup failed", err, nil)
@@ -170,7 +192,10 @@ func startWorker(id int, tasks <-chan types.FrameTask) {
 			continue
 		}
 
-		// TODO: Send 'faces' to a results channel for DB insertion
+		// Insert results into DB
+		if err := db.InsertDetections(context.Background(), videoID, task.Index, faces); err != nil {
+			fmt.Fprintf(os.Stderr, "\n⚠️ DB Insert Failed (Frame %d): %v\n", task.Index, err)
+		}
 	}
 }
 

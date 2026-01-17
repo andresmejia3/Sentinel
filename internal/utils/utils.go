@@ -2,6 +2,8 @@ package utils
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -92,4 +94,16 @@ func NewFFmpegCmd(inputPath string) *exec.Cmd {
 	// Using -vcodec mjpeg ensures we get JPEGs Go can split
 	// Added -hide_banner and -loglevel error to prevent memory bloat in stderr buffer
 	return exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-i", inputPath, "-f", "image2pipe", "-vcodec", "mjpeg", "-")
+}
+
+// GenerateVideoID creates a deterministic hash for the video file
+// based on its path, size, and modification time.
+func GenerateVideoID(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	input := fmt.Sprintf("%s-%d-%d", path, info.Size(), info.ModTime().UnixNano())
+	hash := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(hash[:]), nil
 }
