@@ -77,7 +77,7 @@ func runScan(opts Options) {
 		utils.Die("Invalid gap duration format (use '2s', '500ms')", err, nil)
 	}
 
-	// 0. Get total frames for progress bar
+	// 5. Get total frames for progress bar
 	totalVideoFrames := utils.GetTotalFrames(opts.InputPath)
 
 	if totalVideoFrames <= 0 {
@@ -95,7 +95,7 @@ func runScan(opts Options) {
 	resultsChan := make(chan scanResult, opts.NumEngines*2)
 	var wg sync.WaitGroup
 
-	// 3. Start Aggregator (Consumer)
+	// 6. Start Aggregator (Consumer)
 	// Must run concurrently to prevent deadlock on resultsChan
 	aggDone := make(chan struct{})
 	go func() {
@@ -103,7 +103,7 @@ func runScan(opts Options) {
 		close(aggDone)
 	}()
 
-	// 3. Spawn the Engine Pool
+	// 7. Spawn the Engine Pool
 	for i := 0; i < opts.NumEngines; i++ {
 		wg.Add(1)
 		go func(workerID int) {
@@ -112,7 +112,7 @@ func runScan(opts Options) {
 		}(i)
 	}
 
-	// 4. Start FFmpeg
+	// 8. Start FFmpeg
 	ffmpeg := utils.NewFFmpegCmd(opts.InputPath)
 
 	var stderrBuf bytes.Buffer
@@ -128,7 +128,7 @@ func runScan(opts Options) {
 		utils.Die("Failed to start FFmpeg", err, nil)
 	}
 
-	// 5. Frame Splitter & Nth-Frame Logic
+	// 9. Frame Splitter & Nth-Frame Logic
 	scanner := bufio.NewScanner(ffmpegOut)
 	scanner.Buffer(make([]byte, megabyte), 64*megabyte)
 	scanner.Split(utils.SplitJpeg)
@@ -157,7 +157,7 @@ func runScan(opts Options) {
 		utils.Die("Frame scanner failed", err, nil)
 	}
 
-	// 6. Cleanup & Completion Check
+	// 10. Cleanup & Completion Check
 	if err := ffmpeg.Wait(); err != nil {
 		if stderrBuf.Len() > 0 {
 			fmt.Fprintf(os.Stderr, "\nFFmpeg Logs:\n%s\n", stderrBuf.String())
@@ -247,6 +247,9 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 	var tracks []*activeTrack
 	nextTrackID := 1
 	maxGapFrames := int(gap.Seconds() * fps)
+	if maxGapFrames < 1 {
+		maxGapFrames = 1 // Ensure at least 1 frame gap to prevent instant closing
+	}
 
 	for res := range results {
 		buffer[res.Index] = res
