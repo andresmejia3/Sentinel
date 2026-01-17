@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
-	"strings"
 )
 
 // --- 1. Process Safety & Command Wrapping ---
@@ -56,8 +56,36 @@ var (
 // GetTotalFrames uses ffprobe to count packets for the progress bar
 // It returns 0 if the count fails, allowing the scanner to fallback to a spinner.
 func GetTotalFrames(path string) int {
+	// 0. Check dependency
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️  ffprobe not found. Cannot provide a progress bar estimation because of this.\n")
+		return 0
+	}
+
+	// Helper struct for structured JSON parsing
+	type ffprobeOutput struct {
+		Streams []struct {
+			NbFrames      string `json:"nb_frames"`
+			NbReadPackets string `json:"nb_read_packets"`
+		} `json:"streams"`
+	}
+
+	// 1. Fast Path: Check Container Metadata
+	// This is instant but might return "N/A" or be inaccurate for VFR.
+	cmdFast := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames", "-of", "json", path)
+	if out, err := cmdFast.Output(); err == nil {
+		var res ffprobeOutput
+		if json.Unmarshal(out, &res) == nil && len(res.Streams) > 0 {
+			if count, err := strconv.Atoi(res.Streams[0].NbFrames); err == nil && count > 0 {
+				return count
+			}
+		}
+	}
+
+	// 2. Slow Path: Count Packets (Fallback)
+	fmt.Fprintf(os.Stderr, "⏳ Metadata missing. Counting frames (this may take a moment)...\n")
 	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
-		"-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path)
+		"-show_entries", "stream=nb_read_packets", "-of", "json", path)
 
 	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
@@ -67,10 +95,18 @@ func GetTotalFrames(path string) int {
 		return 0
 	}
 
-	cleanOut := strings.TrimRight(strings.TrimSpace(string(out)), ",")
-	count, err := strconv.Atoi(cleanOut)
+	var res ffprobeOutput
+	if err := json.Unmarshal(out, &res); err != nil {
+		fmt.Fprintf(os.Stderr, "ffprobe JSON parse error: %v\n", err)
+		return 0
+	}
+	if len(res.Streams) == 0 {
+		return 0
+	}
+
+	count, err := strconv.Atoi(res.Streams[0].NbReadPackets)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ffprobe parse error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "ffprobe integer parse error: %v\n", err)
 		return 0
 	}
 	return count

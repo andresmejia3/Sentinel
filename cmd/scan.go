@@ -169,7 +169,7 @@ func startWorker(id int, tasks <-chan types.FrameTask, db *store.Store, videoID 
 	defer worker.Close()
 
 	for task := range tasks {
-		resp, err := worker.Communicate(task.Data)
+		resp, err := worker.ProcessFrame(task.Data)
 
 		// Return buffer to pool immediately after sending
 		frameBufferPool.Put(task.Data)

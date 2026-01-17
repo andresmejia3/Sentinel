@@ -54,9 +54,9 @@ func NewPythonWorker(id int) (*PythonWorker, error) {
 	}, nil
 }
 
-// Communicate sends a frame to the worker via Stdin and waits for the JSON response via the DataPipe.
+// ProcessFrame sends a frame to the worker via Stdin and waits for the JSON response via the DataPipe.
 // It handles the binary protocol: [4-byte Length][Payload].
-func (w *PythonWorker) Communicate(data []byte) ([]byte, error) {
+func (w *PythonWorker) ProcessFrame(data []byte) ([]byte, error) {
 	// Protocol: [Length][Data]
 	if err := binary.Write(w.Stdin, binary.BigEndian, uint32(len(data))); err != nil {
 		return nil, err
