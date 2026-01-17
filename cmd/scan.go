@@ -95,6 +95,14 @@ func runScan(opts Options) {
 	resultsChan := make(chan scanResult, opts.NumEngines*2)
 	var wg sync.WaitGroup
 
+	// 3. Start Aggregator (Consumer)
+	// Must run concurrently to prevent deadlock on resultsChan
+	aggDone := make(chan struct{})
+	go func() {
+		processResults(resultsChan, DB, videoID, fps, gap, opts)
+		close(aggDone)
+	}()
+
 	// 3. Spawn the Engine Pool
 	for i := 0; i < opts.NumEngines; i++ {
 		wg.Add(1)
@@ -161,8 +169,8 @@ func runScan(opts Options) {
 	wg.Wait()
 	close(resultsChan)
 
-	// Process and merge all results
-	processResults(resultsChan, DB, videoID, fps, gap, opts)
+	// Wait for aggregator to finish processing
+	<-aggDone
 
 	bar.Finish()
 	fmt.Fprintf(os.Stderr, "\n🏁 Scan Complete. Processed %d keyframes out of %d total.\n", sentFrames, totalFrames)
@@ -265,7 +273,7 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 				}
 
 				if bestMatch != -1 {
-					// Update existing track
+					// Update existing track if there's a match
 					t := tracks[bestMatch]
 					t.LastFrame = frame.Index
 					t.Count++
@@ -274,7 +282,7 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 						t.MeanVec[j] = t.SumVec[j] / float64(t.Count)
 					}
 				} else {
-					// Create new track
+					// Create new track if there's no match
 					newT := &activeTrack{
 						ID:         nextTrackID,
 						StartFrame: frame.Index,
@@ -297,7 +305,9 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 					// Track ended, persist it
 					startSec := float64(t.StartFrame) / fps
 					endSec := float64(t.LastFrame) / fps
-					db.InsertInterval(context.Background(), videoID, startSec, endSec, t.Count, t.MeanVec)
+					if err := db.InsertInterval(context.Background(), videoID, startSec, endSec, t.Count, t.MeanVec); err != nil {
+						utils.Die(fmt.Sprintf("Failed to persist track %d", t.ID), err, nil)
+					}
 				} else {
 					active = append(active, t)
 				}
@@ -311,7 +321,9 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 	for _, t := range tracks {
 		startSec := float64(t.StartFrame) / fps
 		endSec := float64(t.LastFrame) / fps
-		db.InsertInterval(context.Background(), videoID, startSec, endSec, t.Count, t.MeanVec)
+		if err := db.InsertInterval(context.Background(), videoID, startSec, endSec, t.Count, t.MeanVec); err != nil {
+			utils.Die(fmt.Sprintf("Failed to persist track %d", t.ID), err, nil)
+		}
 	}
 }
 
@@ -341,5 +353,8 @@ func validateScanFlags(opts *Options) {
 	}
 	if opts.NumEngines < 1 {
 		opts.NumEngines = 1
+	}
+	if opts.MatchThreshold <= 0 || opts.MatchThreshold > 1.0 {
+		utils.Die("Invalid match threshold", fmt.Errorf("must be between 0.0 and 1.0, got %f", opts.MatchThreshold), nil)
 	}
 }
