@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 )
 
 // --- 1. Process Safety & Command Wrapping ---
@@ -147,4 +148,27 @@ func GenerateVideoID(path string) (string, error) {
 	input := fmt.Sprintf("%s-%d-%d", path, info.Size(), info.ModTime().UnixNano())
 	hash := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(hash[:]), nil
+}
+
+// GetVideoFPS returns the average frame rate of the video.
+func GetVideoFPS(path string) (float64, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, err
+	}
+
+	// Output is typically "30/1" or "30000/1001"
+	parts := strings.Split(strings.TrimSpace(string(out)), "/")
+	if len(parts) == 1 {
+		return strconv.ParseFloat(parts[0], 64)
+	} else if len(parts) == 2 {
+		num, err1 := strconv.ParseFloat(parts[0], 64)
+		den, err2 := strconv.ParseFloat(parts[1], 64)
+		if err1 != nil || err2 != nil || den == 0 {
+			return 0, fmt.Errorf("invalid framerate format: %s", string(out))
+		}
+		return num / den, nil
+	}
+	return 0, fmt.Errorf("unknown framerate format: %s", string(out))
 }
