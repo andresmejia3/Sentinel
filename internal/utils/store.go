@@ -9,10 +9,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// Store manages the PostgreSQL connection and pgvector operations.
 type Store struct {
 	conn *pgx.Conn
 }
 
+// New establishes a connection to the database and ensures the schema is initialized.
 func New(ctx context.Context, connString string) (*Store, error) {
 	conn, err := pgx.Connect(ctx, connString)
 	if err != nil {
@@ -28,6 +30,7 @@ func New(ctx context.Context, connString string) (*Store, error) {
 	return &Store{conn: conn}, nil
 }
 
+// initSchema creates the necessary tables and vector extension if they don't exist (Auto-Migration).
 func initSchema(ctx context.Context, conn *pgx.Conn) error {
 	query := `
 		CREATE EXTENSION IF NOT EXISTS vector;
@@ -49,10 +52,12 @@ func initSchema(ctx context.Context, conn *pgx.Conn) error {
 	return err
 }
 
+// Close terminates the database connection.
 func (s *Store) Close(ctx context.Context) {
 	s.conn.Close(ctx)
 }
 
+// EnsureVideoMetadata registers the video in the database. If it exists, it updates the timestamp.
 func (s *Store) EnsureVideoMetadata(ctx context.Context, videoID, path string) error {
 	_, err := s.conn.Exec(ctx, `
 		INSERT INTO video_metadata (id, path, indexed_at)
@@ -62,6 +67,7 @@ func (s *Store) EnsureVideoMetadata(ctx context.Context, videoID, path string) e
 	return err
 }
 
+// InsertDetections saves a batch of face embeddings and their locations to the database.
 func (s *Store) InsertDetections(ctx context.Context, videoID string, frameIdx int, faces []types.FaceResult) error {
 	if len(faces) == 0 {
 		return nil
@@ -81,6 +87,7 @@ func (s *Store) InsertDetections(ctx context.Context, videoID string, frameIdx i
 	return nil
 }
 
+// vecToString formats a float slice into a PostgreSQL vector string format "[1.0,2.0,...]"
 func vecToString(vec []float64) string {
 	var b strings.Builder
 	b.WriteByte('[')

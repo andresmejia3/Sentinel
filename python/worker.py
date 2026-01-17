@@ -7,6 +7,7 @@ import numpy as np
 import struct
 from PIL import Image
 
+# read_exactly reads n bytes from the stream, handling partial reads from OS pipes.
 def read_exactly(stream, n):
     chunks = []
     bytes_read = 0
@@ -19,6 +20,7 @@ def read_exactly(stream, n):
     return b''.join(chunks)
 
 def main():
+    """Main loop for the Python Inference Worker."""
     # Logging to stderr is SAFE (Go ignores it or logs it separately)
     # printing to stdout will BREAK the program.
     sys.stderr.write("Worker Engine Warm. Awaiting frames...\n")

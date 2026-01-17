@@ -51,6 +51,7 @@ var frameBufferPool = sync.Pool{
 	New: func() interface{} { return make([]byte, 0, megabyte) },
 }
 
+// runScan orchestrates the video scanning process: DB setup, Worker Pool, FFmpeg streaming, and Progress tracking.
 func runScan() {
 	validateScanFlags()
 
@@ -158,6 +159,8 @@ func runScan() {
 	fmt.Fprintf(os.Stderr, "\n🏁 Scan Complete. Processed %d keyframes out of %d total.\n", sentFrames, totalFrames)
 }
 
+// startWorker manages the lifecycle of a single Python worker process.
+// It reads tasks from the channel, sends them to Python, and persists the results to the DB.
 func startWorker(id int, tasks <-chan types.FrameTask, db *store.Store, videoID string) {
 	worker, err := worker.NewPythonWorker(id)
 	if err != nil {
@@ -199,6 +202,7 @@ func startWorker(id int, tasks <-chan types.FrameTask, db *store.Store, videoID 
 	}
 }
 
+// validateScanFlags ensures all CLI arguments are valid before starting heavy processes.
 func validateScanFlags() {
 	info, err := os.Stat(videoPath)
 	if err != nil {

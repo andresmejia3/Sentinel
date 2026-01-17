@@ -9,6 +9,7 @@ import (
 	"github.com/andresmejia3/sentinel/internal/utils" // Using the SafeCommand wrapper
 )
 
+// PythonWorker manages the external Python process for neural inference.
 type PythonWorker struct {
 	ID       int
 	Cmd      *utils.SafeCommand
@@ -16,6 +17,7 @@ type PythonWorker struct {
 	DataPipe io.ReadCloser
 }
 
+// NewPythonWorker spawns a new Python process and sets up the IPC pipes (Stdin + Side-channel).
 func NewPythonWorker(id int) (*PythonWorker, error) {
 	// 1. Initialize the SafeCommand we built
 	py := utils.NewSafeCommand("python3", "-u", "python/worker.py")
@@ -52,6 +54,8 @@ func NewPythonWorker(id int) (*PythonWorker, error) {
 	}, nil
 }
 
+// Communicate sends a frame to the worker via Stdin and waits for the JSON response via the DataPipe.
+// It handles the binary protocol: [4-byte Length][Payload].
 func (w *PythonWorker) Communicate(data []byte) ([]byte, error) {
 	// Protocol: [Length][Data]
 	if err := binary.Write(w.Stdin, binary.BigEndian, uint32(len(data))); err != nil {
@@ -74,6 +78,7 @@ func (w *PythonWorker) Communicate(data []byte) ([]byte, error) {
 	return respBody, err
 }
 
+// Close cleans up the worker resources, closing pipes and waiting for the process to exit.
 func (w *PythonWorker) Close() {
 	w.Stdin.Close()
 	w.DataPipe.Close()

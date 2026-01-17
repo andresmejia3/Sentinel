@@ -14,12 +14,14 @@ import (
 // --- 1. Process Safety & Command Wrapping ---
 
 // SafeCommand wraps a standard exec.Cmd with a buffer to catch Stderr (Python logs)
+// This ensures we don't lose critical crash information if a worker dies.
 type SafeCommand struct {
 	*exec.Cmd
 	Stderr *bytes.Buffer
 }
 
 // NewSafeCommand initializes a command and attaches a buffer to its Stderr pipe
+// It prepares the command for execution but does not start it.
 func NewSafeCommand(name string, args ...string) *SafeCommand {
 	cmd := exec.Command(name, args...)
 	stderr := &bytes.Buffer{}
@@ -52,6 +54,7 @@ var (
 )
 
 // GetTotalFrames uses ffprobe to count packets for the progress bar
+// It returns 0 if the count fails, allowing the scanner to fallback to a spinner.
 func GetTotalFrames(path string) int {
 	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
 		"-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path)
@@ -74,6 +77,7 @@ func GetTotalFrames(path string) int {
 }
 
 // SplitJpeg is the custom splitter for bufio.Scanner
+// It locates the Start Of Image (FFD8) and End Of Image (FFD9) markers to extract full JPEG frames.
 func SplitJpeg(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	if atEOF && len(data) == 0 {
 		return 0, nil, nil
@@ -90,6 +94,7 @@ func SplitJpeg(data []byte, atEOF bool) (advance int, token []byte, err error) {
 }
 
 // NewFFmpegCmd creates a standard decoder pipe
+// It configures FFmpeg to output raw MJPEG frames to Stdout for ingestion.
 func NewFFmpegCmd(inputPath string) *exec.Cmd {
 	// Using -vcodec mjpeg ensures we get JPEGs Go can split
 	// Added -hide_banner and -loglevel error to prevent memory bloat in stderr buffer
