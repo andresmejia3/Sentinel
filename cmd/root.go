@@ -9,6 +9,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Options holds shared configuration for scan, find, and redact commands
+type Options struct {
+	InputPath      string
+	NthFrame       int
+	NumEngines     int
+	GapDuration    string
+	MatchThreshold float64
+}
+
 var (
 	// DB is the global database connection shared by subcommands
 	DB *store.Store
