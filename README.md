@@ -155,4 +155,3 @@ We employ a **Mock-Heavy** testing approach to ensure CI speed and reliability:
 **Andres Mejia**  
 *Systems Engineer | Go & Python Specialist*
 GitHub Profile
-```
