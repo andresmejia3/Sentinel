@@ -21,16 +21,16 @@ class TestWorkerLogic(unittest.TestCase):
         })
         self.modules_patcher.start()
 
-        # 3. Import (or reload) the worker module to ensure it uses the NEW mocks
-        # We check if it's already loaded to handle the reload correctly
-        if 'worker' in sys.modules:
-            self.worker = importlib.reload(sys.modules['worker'])
-        else:
-            self.worker = importlib.import_module('worker')
+        # 3. Import the worker module
+        # Since we clean up in tearDown, we can simply import fresh every time.
+        self.worker = importlib.import_module('worker')
 
     def tearDown(self):
         # Stop patching to clean up
         self.modules_patcher.stop()
+        # Remove worker from sys.modules so it doesn't pollute other tests
+        if 'worker' in sys.modules:
+            del sys.modules['worker']
 
     def test_process_frame_success(self):
         """Test that valid image data returns correct JSON structure."""
