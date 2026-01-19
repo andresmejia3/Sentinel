@@ -64,19 +64,6 @@ Sentinel does not store a row for every frame.
 
 ## 5. CLI Configuration
 
-### Performance & Accuracy
-| Flag | Name | Description | Default |
-| :--- | :--- | :--- | :--- |
-| `-n` | `--nth-frame` | AI keyframe interval (e.g., scan every 10th frame). | `10` |
-| `-e` | `--engines` | Number of parallel Python worker processes. | `CPU_CORES` |
-
-### Privacy & Redaction
-| Flag | Name | Description | Default |
-| :--- | :--- | :--- | :--- |
-| `-m` | `--mode` | `blur-all`, `selective`, `targeted`, or `none`. | `none` |
-| `-g` | `--gap` | Persistence: Blur duration after tracking loss. | `2.0s` |
-| `--blur` | `--blur-strength`| Intensity of the Gaussian blur kernel. | `99` |
-| `--db-merge` | `--db-merge` | Max absence allowed before splitting a result. | `5.0s` |
 
 ---
 

@@ -11,11 +11,14 @@ import (
 
 // Options holds shared configuration for scan, find, and redact commands
 type Options struct {
-	InputPath      string
-	NthFrame       int
-	NumEngines     int
-	GapDuration    string
-	MatchThreshold float64
+	InputPath        string
+	NthFrame         int
+	NumEngines       int
+	GracePeriod      string
+	Linger           string
+	MatchThreshold   float64
+	DisableSafetyNet bool
+	BlurStrength     int
 }
 
 var (

@@ -37,11 +37,15 @@ func init() {
 	scanCmd.Flags().StringVarP(&scanOpts.InputPath, "input", "i", "", "Path to video")
 	scanCmd.Flags().IntVarP(&scanOpts.NthFrame, "nth-frame", "n", 10, "AI keyframe interval (e.g. scan every 10th frame)")
 	scanCmd.Flags().IntVarP(&scanOpts.NumEngines, "engines", "e", runtime.NumCPU(), "Number of parallel engine workers")
-	scanCmd.Flags().StringVarP(&scanOpts.GapDuration, "gap", "g", "2s", "Max absence duration before closing a track")
-	scanCmd.Flags().Float64Var(&scanOpts.MatchThreshold, "threshold", 0.6, "Face matching distance threshold (lower is stricter)")
+	scanCmd.Flags().StringVarP(&scanOpts.GracePeriod, "grace-period", "g", "2s", "The longest period where a face can be missing before Sentinel declares they are out of frame and logs it to the database")
+	scanCmd.Flags().StringVarP(&scanOpts.Linger, "linger", "l", "2s", "How long to keep blurring after a face is lost")
+	scanCmd.Flags().Float64Var(&scanOpts.MatchThreshold, "threshold", 0.6, "Face matching threshold (lower is stricter)")
+	scanCmd.Flags().BoolVar(&scanOpts.DisableSafetyNet, "disable-safety-net", false, "Disable the \"blur all\" safety net (blur everything if we lost the targets face)")
+	scanCmd.Flags().IntVarP(&scanOpts.BlurStrength, "strength", "s", 99, "Strength of the Gaussian blur kernel")
 
 	scanCmd.MarkFlagRequired("input")
 	rootCmd.AddCommand(scanCmd)
+
 }
 
 // Buffer pool to reduce GC pressure during scanning
@@ -73,7 +77,7 @@ func runScan(opts Options) {
 	}
 
 	// 4. Parse Gap Duration
-	gap, err := time.ParseDuration(opts.GapDuration)
+	gap, err := time.ParseDuration(opts.GracePeriod)
 	if err != nil {
 		utils.Die("Invalid gap duration format (use '2s', '500ms')", err, nil)
 	}
