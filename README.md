@@ -2,7 +2,7 @@
 
 **A High-Performance, Privacy-First Biometric Video Indexing & Redaction Engine.**
 
-[![Version](https://img.shields.io/badge/version-1.2-blue.svg)](https://github.com/andresmejia3/sentinel)
+[![Version](https://img.shields.io/badge/version-0.0.1-blue.svg)](https://github.com/andresmejia3/sentinel)
 [![Status](https://img.shields.io/badge/status-Architecture%20Finalized-green.svg)](https://github.com/andresmejia3/sentinel)
 
 Sentinel is an enterprise-grade biometric tool designed to transform unstructured "Dark Data" (raw video) into searchable mathematical vectors. By bridging high-concurrency systems engineering in **Go** with state-of-the-art neural inference in **Python**, Sentinel solves the tension between security monitoring and data privacy compliance (GDPR/CCPA).

@@ -25,9 +25,13 @@ var (
 	dbURL string
 )
 
+// Version is the application version.
+const Version = "0.0.1"
+
 var rootCmd = &cobra.Command{
-	Use:   "sentinel",
-	Short: "Biometric Video Indexing & Redaction Engine",
+	Use:     "sentinel",
+	Short:   "Biometric Video Indexing & Redaction Engine",
+	Version: Version, // This enables the --version flag
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		// Initialize DB connection
 		var err error
@@ -46,6 +50,9 @@ var rootCmd = &cobra.Command{
 }
 
 func Execute() {
+	// This tells Cobra not to print the version in the help text, which is cleaner.
+	rootCmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
+
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
