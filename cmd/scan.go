@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -235,15 +237,8 @@ type activeTrack struct {
 	SumVec     []float64
 	MeanVec    []float64
 	Count      int
-}
-
-// identityHistory maintains the long-term average embedding for a person
-// even after their active track has closed. Used for Re-Identification.
-type identityHistory struct {
-	ID      int
-	SumVec  []float64
-	Count   int
-	MeanVec []float64
+	BestThumb  []byte  // Raw JPEG bytes of the best face
+	MaxQuality float64 // Best quality score seen so far
 }
 
 type timeRange struct {
@@ -258,8 +253,14 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 
 	// Tracking state
 	var tracks []*activeTrack
-	nextTrackID := 1
-	knownIdentities := make([]*identityHistory, 0) // Long-term memory
+
+	// Local cache for thumbnails found in THIS session (for the summary report)
+	type thumbData struct {
+		Data    []byte
+		Quality float64
+	}
+	sessionThumbs := make(map[int]thumbData)
+
 	summary := make(map[int][]timeRange)
 	totalDetections := 0
 	gracePeriod, _ := time.ParseDuration(opts.GracePeriod)
@@ -305,43 +306,36 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 						t.SumVec[j] += face.Vec[j]
 						t.MeanVec[j] = t.SumVec[j] / float64(t.Count)
 					}
-				} else {
-					// No active track matched. Try Re-ID against history.
-					bestIDMatch := -1
-					minIDDist := opts.MatchThreshold
-
-					for i, hist := range knownIdentities {
-						// Skip empty histories (newly created identities that haven't closed a track yet)
-						if hist.Count == 0 {
-							continue
-						}
-						dist := cosineDist(face.Vec, hist.MeanVec)
-						if dist < minIDDist {
-							minIDDist = dist
-							bestIDMatch = i
+					// Update best thumbnail if this face is higher quality
+					if face.Quality > t.MaxQuality {
+						// Decode Base64 only when we find a better image
+						if imgBytes, err := base64.StdEncoding.DecodeString(face.ThumbB64); err == nil && len(imgBytes) > 0 {
+							t.MaxQuality = face.Quality
+							t.BestThumb = imgBytes
 						}
 					}
+				} else {
+					// No active track matched. Try Re-ID against history.
+					// Query DB for nearest neighbor using pgvector
+					matchID, err := db.FindClosestIdentity(context.Background(), face.Vec, opts.MatchThreshold)
+					if err != nil {
+						utils.Die("DB Identity Lookup failed", err, nil)
+					}
 
-					if bestIDMatch != -1 {
+					if matchID != -1 {
 						// Re-ID Successful: Resurrect existing Identity
-						hist := knownIdentities[bestIDMatch]
-						newT := newActiveTrack(hist.ID, frame.Index, face.Vec)
+						newT := newActiveTrack(matchID, frame.Index, face.Vec, face.ThumbB64, face.Quality)
 						tracks = append(tracks, newT)
 					} else {
-						// Truly New Identity
-						newT := newActiveTrack(nextTrackID, frame.Index, face.Vec)
+						// Truly New Identity -> Create in DB immediately
+						newID, err := db.CreateIdentity(context.Background(), face.Vec)
+						if err != nil {
+							utils.Die("Failed to create new identity", err, nil)
+						}
+
+						newT := newActiveTrack(newID, frame.Index, face.Vec, face.ThumbB64, face.Quality)
 						tracks = append(tracks, newT)
 
-						// Initialize empty history for this new ID
-						// It will be populated when the first track closes.
-						newHist := &identityHistory{
-							ID:      nextTrackID,
-							SumVec:  make([]float64, embeddingDim),
-							MeanVec: make([]float64, embeddingDim),
-							Count:   0,
-						}
-						knownIdentities = append(knownIdentities, newHist)
-						nextTrackID++
 					}
 				}
 			}
@@ -359,20 +353,21 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 						continue
 					}
 
-					if err := db.InsertInterval(context.Background(), videoID, startSec, endSec, t.Count, t.MeanVec); err != nil {
+					if err := db.InsertInterval(context.Background(), videoID, startSec, endSec, t.Count, t.ID); err != nil {
 						utils.Die(fmt.Sprintf("Failed to persist track %d", t.ID), err, nil)
 					}
 					summary[t.ID] = append(summary[t.ID], timeRange{Start: startSec, End: endSec})
 
-					// Update Long-Term Memory (History)
-					for _, hist := range knownIdentities {
-						if hist.ID == t.ID {
-							hist.Count += t.Count
-							for k := 0; k < embeddingDim; k++ {
-								hist.SumVec[k] += t.SumVec[k]
-								hist.MeanVec[k] = hist.SumVec[k] / float64(hist.Count)
-							}
-							break
+					// Update Global Identity (Weighted Average)
+					if err := db.UpdateIdentity(context.Background(), t.ID, t.MeanVec, t.Count); err != nil {
+						utils.Die(fmt.Sprintf("Failed to update identity %d", t.ID), err, nil)
+					}
+
+					// Update session thumbnail if this track had a better one
+					if cur, exists := sessionThumbs[t.ID]; !exists || t.MaxQuality > cur.Quality {
+						sessionThumbs[t.ID] = thumbData{
+							Data:    t.BestThumb,
+							Quality: t.MaxQuality,
 						}
 					}
 				} else {
@@ -394,19 +389,19 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 			continue
 		}
 
-		if err := db.InsertInterval(context.Background(), videoID, startSec, endSec, t.Count, t.MeanVec); err != nil {
+		if err := db.InsertInterval(context.Background(), videoID, startSec, endSec, t.Count, t.ID); err != nil {
 			utils.Die(fmt.Sprintf("Failed to persist track %d", t.ID), err, nil)
 		}
 		summary[t.ID] = append(summary[t.ID], timeRange{Start: startSec, End: endSec})
-		// Update history (though strictly not needed as scan is ending)
-		for _, hist := range knownIdentities {
-			if hist.ID == t.ID {
-				hist.Count += t.Count
-				for k := 0; k < embeddingDim; k++ {
-					hist.SumVec[k] += t.SumVec[k]
-					hist.MeanVec[k] = hist.SumVec[k] / float64(hist.Count)
-				}
-				break
+
+		if err := db.UpdateIdentity(context.Background(), t.ID, t.MeanVec, t.Count); err != nil {
+			utils.Die(fmt.Sprintf("Failed to update identity %d", t.ID), err, nil)
+		}
+
+		if cur, exists := sessionThumbs[t.ID]; !exists || t.MaxQuality > cur.Quality {
+			sessionThumbs[t.ID] = thumbData{
+				Data:    t.BestThumb,
+				Quality: t.MaxQuality,
 			}
 		}
 	}
@@ -422,7 +417,17 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 	sort.Ints(ids)
 
 	for _, id := range ids {
-		fmt.Fprintf(os.Stderr, "\n👤 Identity %d Found:\n", id)
+		thumbNote := ""
+		// Check session thumbs
+		if thumb, ok := sessionThumbs[id]; ok && len(thumb.Data) > 0 {
+			filename := fmt.Sprintf("identity_%d.jpg", id)
+			outDir := filepath.Join("/data", "thumbnails", videoID)
+			_ = os.MkdirAll(outDir, 0755)
+			_ = os.WriteFile(filepath.Join(outDir, filename), thumb.Data, 0644)
+			thumbNote = fmt.Sprintf("(See thumbnails/%s/%s)", videoID, filename)
+		}
+
+		fmt.Fprintf(os.Stderr, "\n👤 Identity %d Found: %s\n", id, thumbNote)
 		for _, r := range summary[id] {
 			fmt.Fprintf(os.Stderr, "   %s -> %s\n", fmtTime(r.Start), fmtTime(r.End))
 		}
@@ -433,7 +438,10 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 }
 
-func newActiveTrack(id, frameIndex int, vec []float64) *activeTrack {
+func newActiveTrack(id, frameIndex int, vec []float64, thumbB64 string, quality float64) *activeTrack {
+	// Decode initial thumbnail
+	imgBytes, _ := base64.StdEncoding.DecodeString(thumbB64) // Ignore error, bytes will be empty if invalid
+
 	t := &activeTrack{
 		ID:         id,
 		StartFrame: frameIndex,
@@ -441,6 +449,8 @@ func newActiveTrack(id, frameIndex int, vec []float64) *activeTrack {
 		SumVec:     make([]float64, embeddingDim),
 		MeanVec:    make([]float64, embeddingDim),
 		Count:      1,
+		BestThumb:  imgBytes,
+		MaxQuality: quality,
 	}
 	copy(t.SumVec, vec)
 	copy(t.MeanVec, vec)

@@ -7,6 +7,7 @@ import numpy as np
 import struct
 import uuid
 import time
+import base64
 from PIL import Image, ImageDraw
 
 # --- Global InsightFace App Initialization ---
@@ -60,9 +61,25 @@ def process_frame(image_bytes, debug=False):
             if norm > 0:
                 embedding = embedding / norm
 
+            # Calculate Quality Score (Confidence * Area)
+            # This helps us pick the "best" shot of a person later.
+            box = face.bbox.astype(int)
+            area = (box[2] - box[0]) * (box[3] - box[1])
+            quality = face.det_score * area
+
+            # Encode thumbnail to Base64 (In-Memory)
+            h, w = frame_array.shape[:2]
+            x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
+            face_img = Image.fromarray(frame_array[y1:y2, x1:x2])
+            mem_file = io.BytesIO()
+            face_img.save(mem_file, format="JPEG", quality=85)
+            thumb_b64 = base64.b64encode(mem_file.getvalue()).decode('utf-8')
+
             results.append({
                 "loc": face.bbox.astype(int).tolist(), # Bounding box
-                "vec": embedding.tolist()         # 512-d vector
+                "vec": embedding.tolist(),        # 512-d vector
+                "thumb_b64": thumb_b64,
+                "quality": float(quality)
             })
         return json.dumps(results)
     except Exception as e:
