@@ -51,12 +51,26 @@ class TestWorkerLogic(unittest.TestCase):
 
         # Simulate InsightFace returning one face object
         mock_face = MagicMock()
-        # InsightFace returns a bbox as a numpy array, we mock the astype().tolist() chain
-        mock_face.bbox.astype.return_value.tolist.return_value = [10, 20, 30, 40]
-        # InsightFace returns a 512-d embedding
+        mock_face.det_score = 0.99 # Must be a float for quality calc
+
+        # Mock bbox: Needs to support indexing (box[0]) AND .tolist()
+        # box = [10, 20, 30, 40]
+        mock_box = MagicMock()
+        coords = [10, 20, 30, 40]
+        mock_box.__getitem__.side_effect = lambda i: coords[i]
+        mock_box.tolist.return_value = coords
+        mock_face.bbox.astype.return_value = mock_box
+
+        # Mock embedding: Needs to support division and .tolist()
         fake_vec = [0.1] * 512
-        mock_face.embedding.tolist.return_value = fake_vec
+        mock_embedding = MagicMock()
+        mock_face.embedding = mock_embedding
         
+        # Mock numpy linalg norm
+        self.mock_np.linalg.norm.return_value = 1.0
+        # Mock division result (embedding / norm)
+        mock_embedding.__truediv__.return_value.tolist.return_value = fake_vec
+
         self.mock_app_instance.get.return_value = [mock_face]
         
         # 2. Run the function under test
