@@ -2,7 +2,6 @@ import sys
 import os
 import io
 import json
-import face_recognition
 import insightface
 import numpy as np
 import struct

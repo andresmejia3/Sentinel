@@ -27,7 +27,7 @@ The Go binary serves as the master orchestrator, managing the entire pipeline:
 
 ### B. The Inference Engine (Python)
 Stripped-down, high-speed daemons that stay resident in memory:
-* **Biometric Extraction:** Uses **ResNet-34** (via `dlib` and `face_recognition`) to generate 128-dimensional embeddings.
+* **Biometric Extraction:** Uses **ArcFace** (via `InsightFace` and `ONNX Runtime`) to generate 512-dimensional embeddings.
 * **Redaction Logic:** Performs frame-level manipulation using **OpenCV** based on signals from the Go orchestrator.
 * **Bypassing the GIL:** Running $N$ independent processes allows for true multi-core utilization, bypassing Python's Global Interpreter Lock.
 
@@ -56,7 +56,7 @@ Sentinel does not store a row for every frame.
 | Component | Technology | Specific Framework/Library |
 | :--- | :--- | :--- |
 | **Orchestration** | **Go 1.22+** | `Cobra` (CLI), `pgx` (Postgres), `zerolog` |
-| **Inference** | **Python 3.11** | `face_recognition`, `OpenCV`, `NumPy` |
+| **Inference** | **Python 3.11** | `InsightFace`, `ONNX Runtime (GPU)`, `NumPy` |
 | **Database** | **PostgreSQL 16**| `pgvector` extension (HNSW Indexing) |
 | **Processing** | **FFmpeg** | Headless binary via Unix Pipes |
 
@@ -94,7 +94,7 @@ CREATE TABLE face_intervals (
     video_id UUID REFERENCES video_metadata(id),
     start_offset FLOAT,
     end_offset FLOAT,
-    face_embedding VECTOR(128),
+    face_embedding VECTOR(512),
     confidence FLOAT
 );
 
@@ -131,7 +131,7 @@ Sentinel's power lies in its automated pipelines. Below are the three primary ex
 
 Sentinel employs a **Mock-Heavy Testing Strategy** to ensure rapid CI feedback without the overhead of compiling heavy AI dependencies (dlib, numpy) in every build.
 
-*   **Scope of Testing:** We explicitly do **not** test "Does the AI recognize a face?"—that is the responsibility of the underlying `dlib` library.
+*   **Scope of Testing:** We explicitly do **not** test "Does the AI recognize a face?"—that is the responsibility of the underlying `InsightFace` library.
 *   **Contract Verification:** Instead, tests focus on **Glue Code Verification**: ensuring the Python worker correctly formats AI outputs into the strict JSON schema expected by the Go orchestrator.
 *   **Protocol Isolation:** Go unit tests verify the binary IPC protocol (4-byte headers) using `io.Reader` mocks, proving the system handles stream fragmentation and endianness correctly without spawning real processes.
 

@@ -8,13 +8,13 @@ class TestWorkerLogic(unittest.TestCase):
     
     def setUp(self):
         # 1. Create fresh mocks for every single test run
-        self.mock_fr = MagicMock()
+        self.mock_insightface = MagicMock()
         self.mock_np = MagicMock()
         self.mock_pil = MagicMock()
         
         # 2. Patch sys.modules so 'import worker' sees our mocks instead of real libraries
         self.modules_patcher = patch.dict(sys.modules, {
-            "face_recognition": self.mock_fr,
+            "insightface": self.mock_insightface,
             "numpy": self.mock_np,
             "PIL": self.mock_pil,
             "PIL.Image": self.mock_pil.Image,
@@ -22,6 +22,10 @@ class TestWorkerLogic(unittest.TestCase):
         self.modules_patcher.start()
 
         # 3. Import the worker module
+        # We need to mock the app initialization that happens at module level
+        self.mock_app_instance = MagicMock()
+        self.mock_insightface.app.FaceAnalysis.return_value = self.mock_app_instance
+
         # Since we clean up in tearDown, we can simply import fresh every time.
         self.worker = importlib.import_module('worker')
 
@@ -40,18 +44,21 @@ class TestWorkerLogic(unittest.TestCase):
         mock_image_obj = MagicMock()
         self.mock_pil.Image.open.return_value.convert.return_value = mock_image_obj
 
-        # Simulate finding one face
-        self.mock_fr.face_locations.return_value = [(10, 20, 30, 40)]
-        # Simulate a 128-d vector
-        fake_vec = [0.1] * 128
-        self.mock_fr.face_encodings.return_value = [MagicMock(tolist=lambda: fake_vec)]
+        # Simulate InsightFace returning one face object
+        mock_face = MagicMock()
+        # InsightFace returns a bbox as a numpy array, we mock the astype().tolist() chain
+        mock_face.bbox.astype.return_value.tolist.return_value = [10, 20, 30, 40]
+        # InsightFace returns a 512-d embedding
+        fake_vec = [0.1] * 512
+        mock_face.embedding.tolist.return_value = fake_vec
+        
+        self.mock_app_instance.get.return_value = [mock_face]
         
         # 2. Run the function under test
         result_json = self.worker.process_frame(b"fake_image_bytes")
         
         # 3. Assertions
         result = json.loads(result_json)
-        self.assertIsInstance(result, list)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]['loc'], [10, 20, 30, 40])
         self.assertEqual(result[0]['vec'], fake_vec)
