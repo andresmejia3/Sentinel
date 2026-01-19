@@ -187,3 +187,14 @@ func (s *Store) RenameIdentity(ctx context.Context, id int, newName string) erro
 	_, err := s.conn.Exec(ctx, "UPDATE known_identities SET name = $1 WHERE id = $2", newName, id)
 	return err
 }
+
+// Reset drops all application tables to clear the database state.
+// This is useful for development to force a schema refresh without migrations.
+func (s *Store) Reset(ctx context.Context) error {
+	_, err := s.conn.Exec(ctx, `
+		DROP TABLE IF EXISTS face_intervals CASCADE;
+		DROP TABLE IF EXISTS known_identities CASCADE;
+		DROP TABLE IF EXISTS video_metadata CASCADE;
+	`)
+	return err
+}
