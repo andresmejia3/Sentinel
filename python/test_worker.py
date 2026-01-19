@@ -1,30 +1,36 @@
 import sys
 import unittest
 import json
+import importlib
 from unittest.mock import MagicMock, patch
-
-# --- MOCKING HEAVY DEPENDENCIES ---
-# We mock ALL heavy libraries before importing worker.
-# This allows tests to run in CI with ONLY `pip install pytest`.
-mock_fr = MagicMock()
-mock_np = MagicMock()
-mock_pil = MagicMock()
-
-sys.modules["face_recognition"] = mock_fr
-sys.modules["numpy"] = mock_np
-sys.modules["PIL"] = mock_pil
-sys.modules["PIL.Image"] = mock_pil.Image
-
-# Now we can safely import our worker
-from worker import process_frame
 
 class TestWorkerLogic(unittest.TestCase):
     
     def setUp(self):
-        # Reset mocks before each test
-        mock_fr.reset_mock()
-        mock_np.reset_mock()
-        mock_pil.reset_mock()
+        # 1. Create fresh mocks for every single test run
+        self.mock_fr = MagicMock()
+        self.mock_np = MagicMock()
+        self.mock_pil = MagicMock()
+        
+        # 2. Patch sys.modules so 'import worker' sees our mocks instead of real libraries
+        self.modules_patcher = patch.dict(sys.modules, {
+            "face_recognition": self.mock_fr,
+            "numpy": self.mock_np,
+            "PIL": self.mock_pil,
+            "PIL.Image": self.mock_pil.Image,
+        })
+        self.modules_patcher.start()
+
+        # 3. Import (or reload) the worker module to ensure it uses the NEW mocks
+        # We check if it's already loaded to handle the reload correctly
+        if 'worker' in sys.modules:
+            self.worker = importlib.reload(sys.modules['worker'])
+        else:
+            self.worker = importlib.import_module('worker')
+
+    def tearDown(self):
+        # Stop patching to clean up
+        self.modules_patcher.stop()
 
     def test_process_frame_success(self):
         """Test that valid image data returns correct JSON structure."""
@@ -32,16 +38,16 @@ class TestWorkerLogic(unittest.TestCase):
         # 1. Setup the Mock AI responses
         # When worker calls Image.open().convert("RGB")...
         mock_image_obj = MagicMock()
-        mock_pil.Image.open.return_value.convert.return_value = mock_image_obj
+        self.mock_pil.Image.open.return_value.convert.return_value = mock_image_obj
 
         # Simulate finding one face
-        mock_fr.face_locations.return_value = [(10, 20, 30, 40)]
+        self.mock_fr.face_locations.return_value = [(10, 20, 30, 40)]
         # Simulate a 128-d vector
         fake_vec = [0.1] * 128
-        mock_fr.face_encodings.return_value = [MagicMock(tolist=lambda: fake_vec)]
+        self.mock_fr.face_encodings.return_value = [MagicMock(tolist=lambda: fake_vec)]
         
         # 2. Run the function under test
-        result_json = process_frame(b"fake_image_bytes")
+        result_json = self.worker.process_frame(b"fake_image_bytes")
         
         # 3. Assertions
         result = json.loads(result_json)
@@ -53,9 +59,9 @@ class TestWorkerLogic(unittest.TestCase):
     def test_process_frame_error_handling(self):
         """Test that invalid data returns a JSON error object."""
         # Force Image.open to raise an exception
-        mock_pil.Image.open.side_effect = Exception("Corrupt Data")
+        self.mock_pil.Image.open.side_effect = Exception("Corrupt Data")
 
-        result_json = process_frame(b"garbage")
+        result_json = self.worker.process_frame(b"garbage")
         result = json.loads(result_json)
         self.assertIn("error", result)
         self.assertEqual(result["error"], "Corrupt Data")
