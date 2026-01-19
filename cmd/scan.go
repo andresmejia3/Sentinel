@@ -239,6 +239,7 @@ type activeTrack struct {
 	Count      int
 	BestThumb  []byte  // Raw JPEG bytes of the best face
 	MaxQuality float64 // Best quality score seen so far
+	Name       string  // Display name (e.g. "Jenny" or "Identity 1")
 }
 
 type timeRange struct {
@@ -260,6 +261,7 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 		Quality float64
 	}
 	sessionThumbs := make(map[int]thumbData)
+	idNames := make(map[int]string)
 
 	summary := make(map[int][]timeRange)
 	totalDetections := 0
@@ -317,15 +319,17 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 				} else {
 					// No active track matched. Try Re-ID against history.
 					// Query DB for nearest neighbor using pgvector
-					matchID, err := db.FindClosestIdentity(context.Background(), face.Vec, opts.MatchThreshold)
+					matchID, matchName, err := db.FindClosestIdentity(context.Background(), face.Vec, opts.MatchThreshold)
 					if err != nil {
 						utils.Die("DB Identity Lookup failed", err, nil)
 					}
 
 					if matchID != -1 {
 						// Re-ID Successful: Resurrect existing Identity
-						newT := newActiveTrack(matchID, frame.Index, face.Vec, face.ThumbB64, face.Quality)
+						newT := newActiveTrack(matchID, frame.Index, face.Vec, face.ThumbB64, face.Quality, matchName)
+						fmt.Fprintf(os.Stderr, "DEBUG: Matched ID %d Name '%s'\n", matchID, matchName)
 						tracks = append(tracks, newT)
+						idNames[matchID] = matchName
 					} else {
 						// Truly New Identity -> Create in DB immediately
 						newID, err := db.CreateIdentity(context.Background(), face.Vec)
@@ -333,8 +337,10 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 							utils.Die("Failed to create new identity", err, nil)
 						}
 
-						newT := newActiveTrack(newID, frame.Index, face.Vec, face.ThumbB64, face.Quality)
+						name := fmt.Sprintf("Identity %d", newID)
+						newT := newActiveTrack(newID, frame.Index, face.Vec, face.ThumbB64, face.Quality, name)
 						tracks = append(tracks, newT)
+						idNames[newID] = name
 
 					}
 				}
@@ -427,7 +433,11 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 			thumbNote = fmt.Sprintf("(See thumbnails/%s/%s)", videoID, filename)
 		}
 
-		fmt.Fprintf(os.Stderr, "\n👤 Identity %d Found: %s\n", id, thumbNote)
+		name := idNames[id]
+		if name == "" {
+			name = fmt.Sprintf("Identity %d", id)
+		}
+		fmt.Fprintf(os.Stderr, "\n👤 %s Found: %s\n", name, thumbNote)
 		for _, r := range summary[id] {
 			fmt.Fprintf(os.Stderr, "   %s -> %s\n", fmtTime(r.Start), fmtTime(r.End))
 		}
@@ -438,7 +448,7 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 }
 
-func newActiveTrack(id, frameIndex int, vec []float64, thumbB64 string, quality float64) *activeTrack {
+func newActiveTrack(id, frameIndex int, vec []float64, thumbB64 string, quality float64, name string) *activeTrack {
 	// Decode initial thumbnail
 	imgBytes, _ := base64.StdEncoding.DecodeString(thumbB64) // Ignore error, bytes will be empty if invalid
 
@@ -451,6 +461,7 @@ func newActiveTrack(id, frameIndex int, vec []float64, thumbB64 string, quality 
 		Count:      1,
 		BestThumb:  imgBytes,
 		MaxQuality: quality,
+		Name:       name,
 	}
 	copy(t.SumVec, vec)
 	copy(t.MeanVec, vec)

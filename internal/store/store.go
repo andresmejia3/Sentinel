@@ -40,6 +40,13 @@ func initSchema(ctx context.Context, conn *pgx.Conn) error {
 			path TEXT NOT NULL,
 			indexed_at TIMESTAMPTZ DEFAULT NOW()
 		);
+		CREATE TABLE IF NOT EXISTS known_identities (
+			id SERIAL PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			embedding VECTOR(512) NOT NULL,
+			face_count INT DEFAULT 1,
+			created_at TIMESTAMPTZ DEFAULT NOW()
+		);
 		CREATE TABLE IF NOT EXISTS face_intervals (
 			id BIGSERIAL PRIMARY KEY, 
 			video_id TEXT REFERENCES video_metadata(id),
@@ -47,13 +54,6 @@ func initSchema(ctx context.Context, conn *pgx.Conn) error {
 			end_time DOUBLE PRECISION NOT NULL,
 			face_count INT NOT NULL,
 			known_identity_id INT REFERENCES known_identities(id)
-		);
-		CREATE TABLE IF NOT EXISTS known_identities (
-			id SERIAL PRIMARY KEY,
-			name TEXT NOT NULL UNIQUE,
-			embedding VECTOR(512) NOT NULL,
-			face_count INT DEFAULT 1,
-			created_at TIMESTAMPTZ DEFAULT NOW()
 		);
 		CREATE INDEX IF NOT EXISTS face_intervals_video_id_idx ON face_intervals (video_id);
 	`
@@ -106,22 +106,23 @@ func vecToString(vec []float64) string {
 
 // FindClosestIdentity searches for the nearest neighbor in the database using cosine distance.
 // Returns -1 if no match is found within the threshold.
-func (s *Store) FindClosestIdentity(ctx context.Context, vec []float64, threshold float64) (int, error) {
+func (s *Store) FindClosestIdentity(ctx context.Context, vec []float64, threshold float64) (int, string, error) {
 	vecStr := vecToString(vec)
 	// <=> is the cosine distance operator in pgvector
 	// We order by distance and limit to 1 to find the nearest neighbor
-	query := `SELECT id FROM known_identities WHERE embedding <=> $1::vector < $2 ORDER BY embedding <=> $1::vector ASC LIMIT 1`
+	query := `SELECT id, name FROM known_identities WHERE embedding <=> $1::vector < $2 ORDER BY embedding <=> $1::vector ASC LIMIT 1`
 
 	var id int
-	err := s.conn.QueryRow(ctx, query, vecStr, threshold).Scan(&id)
+	var name string
+	err := s.conn.QueryRow(ctx, query, vecStr, threshold).Scan(&id, &name)
 	if err == pgx.ErrNoRows {
-		return -1, nil // No match found
+		return -1, "", nil // No match found
 	}
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 
-	return id, nil
+	return id, name, nil
 }
 
 // CreateIdentity inserts a new unknown identity and returns its ID.
@@ -197,4 +198,31 @@ func (s *Store) Reset(ctx context.Context) error {
 		DROP TABLE IF EXISTS video_metadata CASCADE;
 	`)
 	return err
+}
+
+// IdentityMetadata represents the display info for an identity
+type IdentityMetadata struct {
+	ID        int
+	Name      string
+	Count     int
+	CreatedAt time.Time
+}
+
+// ListIdentities returns all known identities for display.
+func (s *Store) ListIdentities(ctx context.Context) ([]IdentityMetadata, error) {
+	rows, err := s.conn.Query(ctx, "SELECT id, name, face_count, created_at FROM known_identities ORDER BY id ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []IdentityMetadata
+	for rows.Next() {
+		var i IdentityMetadata
+		if err := rows.Scan(&i.ID, &i.Name, &i.Count, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		results = append(results, i)
+	}
+	return results, nil
 }
