@@ -11,8 +11,8 @@ RUN go mod download
 COPY . .
 
 # Build the binary. 
-# We assume the entry point (package main) is in the root directory.
-RUN go build -o /bin/sentinel .
+# The entry point is in cmd/sentinel
+RUN go build -o /bin/sentinel ./cmd/sentinel
 
 # Stage 2: Runtime Environment (Python + FFmpeg)
 FROM python:3.11-slim-bookworm
