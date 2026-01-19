@@ -156,8 +156,3 @@ We employ a **Mock-Heavy** testing approach to ensure CI speed and reliability:
 *Systems Engineer | Go & Python Specialist*
 GitHub Profile
 ```
-
-<!--
-[PROMPT_SUGGESTION]How can I add a 'CONTRIBUTING.md' file to further demonstrate open-source best practices?[/PROMPT_SUGGESTION]
-[PROMPT_SUGGESTION]Can you help me write a 'find' command implementation in Go that queries the pgvector database?[/PROMPT_SUGGESTION]
--->
