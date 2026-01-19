@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  # The Sentinel Application
+  app:
+    build: .
+    container_name: sentinel_core
+    depends_on:
+      - db
+    volumes:
+      # Mount the current directory to /data so you can scan local files
+      # Usage: sentinel scan -i /data/myvideo.mp4
+      - .:/data
+    # Keep the container alive or override with a command
+    entrypoint: ["sentinel"]
+    command: ["--help"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+
+  # PostgreSQL with pgvector extension
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: sentinel_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

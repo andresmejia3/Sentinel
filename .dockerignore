@@ -1,0 +1,8 @@
+.git
+.github
+.vscode
+bin
+*.mp4
+*.mkv
+postgres_data
+.env

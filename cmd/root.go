@@ -33,6 +33,23 @@ var rootCmd = &cobra.Command{
 	Short:   "Biometric Video Indexing & Redaction Engine",
 	Version: Version, // This enables the --version flag
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// If no flag was provided, try to build the connection string from the environment
+		if dbURL == "" {
+			if host := os.Getenv("POSTGRES_HOST"); host != "" {
+				user := os.Getenv("POSTGRES_USER")
+				pass := os.Getenv("POSTGRES_PASSWORD")
+				name := os.Getenv("POSTGRES_DB")
+				port := os.Getenv("POSTGRES_PORT")
+				if port == "" {
+					port = "5432"
+				}
+				dbURL = fmt.Sprintf("postgres://%s:%s@%s:%s/%s", user, pass, host, port, name)
+			} else {
+				// Fallback to local default if no env vars are present
+				dbURL = "postgres://localhost:5432/sentinel"
+			}
+		}
+
 		// Initialize DB connection
 		var err error
 		// We use a background context for the connection
@@ -60,5 +77,5 @@ func Execute() {
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&dbURL, "db", "postgres://localhost:5432/sentinel", "PostgreSQL connection string")
+	rootCmd.PersistentFlags().StringVar(&dbURL, "db", "", "PostgreSQL connection string (default: postgres://localhost:5432/sentinel)")
 }
