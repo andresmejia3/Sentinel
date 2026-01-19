@@ -49,7 +49,7 @@ The system is built on a "Right Tool for the Job" philosophy. We use **Go 1.25**
 ## ⚡ Key Features
 
 *   **Hysteresis Redaction:** Implements a "safety net" temporal buffer. If a face is momentarily lost by the tracker, the system maintains the redaction mask to prevent privacy leaks (flicker).
-*   **Hybrid Tracking:** Combines heavy Neural Network inference (every $N$ frames) with lightweight Optical Flow tracking (inter-frame) to achieve high FPS.
+*   **Tracking by Detection:** Utilizes high-frequency re-identification (every $N$ frames) combined with temporal smoothing to maintain identity continuity without the drift associated with pure visual trackers.
 *   **Interval Debouncing:** Optimizes storage by merging contiguous detections into time intervals (e.g., "Person A: 00:01:05 - 00:01:10") rather than storing per-frame rows.
 
 ---
@@ -64,6 +64,8 @@ Sentinel exposes a robust CLI interface for tuning performance and privacy param
 | `-n` | `--nth-frame` | AI keyframe interval (e.g., scan every 10th frame). | `10` |
 | `-e` | `--engines` | Number of parallel engine worker processes. | `1` |
 | `-t` | `--threshold` | Face matching threshold (lower is stricter). | `0.6` |
+| `-b` | `--blip-duration` | Minimum duration of a track to be considered valid (filters blips). | `100ms` |
+| `-d` | `--debug-screenshots` | Save debug images with bounding boxes to `/data/debug_frames/`. | `false` |
 
 ### Privacy & Redaction
 | Flag | Name | Description | Default |

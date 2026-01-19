@@ -18,9 +18,13 @@ type PythonWorker struct {
 }
 
 // NewPythonWorker spawns a new Python process and sets up the IPC pipes (Stdin + Side-channel).
-func NewPythonWorker(id int) (*PythonWorker, error) {
+func NewPythonWorker(id int, debug bool) (*PythonWorker, error) {
+	args := []string{"-u", "python/worker.py"}
+	if debug {
+		args = append(args, "--debug")
+	}
 	// 1. Initialize the SafeCommand we built
-	py := utils.NewSafeCommand("python3", "-u", "python/worker.py")
+	py := utils.NewSafeCommand("python3", args...)
 
 	// Create a side-channel pipe (FD 3) for clean data transfer
 	r, w, err := os.Pipe()

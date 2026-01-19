@@ -21,8 +21,8 @@ __pycache__/
 # Ignore large pre-trained dlib model files (.dat)
 *.dat
 # Ignore your local 'known_faces' or 'temp_frames' directories
-/data/known_faces/
-/data/temp_frames/
+/known_faces/
+/debug_frames/
 /output/redacted_videos/
 
 # === Database & Secrets ===

@@ -5,7 +5,9 @@ import json
 import insightface
 import numpy as np
 import struct
-from PIL import Image
+import uuid
+import time
+from PIL import Image, ImageDraw
 
 # --- Global InsightFace App Initialization ---
 # This is done once when the worker starts to load the models into memory (and GPU VRAM).
@@ -25,7 +27,7 @@ def read_exactly(stream, n):
         bytes_read += len(chunk)
     return b''.join(chunks)
 
-def process_frame(image_bytes):
+def process_frame(image_bytes, debug=False):
     """
     Decodes an image and returns a JSON string of face vectors.
     Isolated for testing purposes.
@@ -37,11 +39,30 @@ def process_frame(image_bytes):
         # Use InsightFace to get all face data in one call
         faces = app.get(frame_array)
 
+        if debug and len(faces) > 0:
+            try:
+                draw = ImageDraw.Draw(image)
+                for face in faces:
+                    bbox = face.bbox.astype(int)
+                    draw.rectangle(bbox.tolist(), outline="red", width=3)
+                
+                # Save to /data/debug_frames (mounted volume)
+                os.makedirs("/data/debug_frames", exist_ok=True)
+                image.save(f"/data/debug_frames/debug_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}.jpg")
+            except Exception as e:
+                sys.stderr.write(f"Debug save failed: {e}\n")
+
         results = []
         for face in faces:
+            # Normalize embedding to unit length for Cosine Similarity
+            embedding = face.embedding
+            norm = np.linalg.norm(embedding)
+            if norm > 0:
+                embedding = embedding / norm
+
             results.append({
                 "loc": face.bbox.astype(int).tolist(), # Bounding box
-                "vec": face.embedding.tolist()         # 512-d vector
+                "vec": embedding.tolist()         # 512-d vector
             })
         return json.dumps(results)
     except Exception as e:
@@ -53,6 +74,8 @@ def main():
     # printing to stdout will BREAK the program.
     sys.stderr.write("Worker Engine Warm. Awaiting frames...\n")
     sys.stderr.flush()
+
+    debug_mode = "--debug" in sys.argv
 
     # Open File Descriptor 3 (passed from Go) for clean data output
     with os.fdopen(3, 'wb') as out_pipe:
@@ -69,7 +92,7 @@ def main():
             if len(image_bytes) != frame_size:
                 break
 
-            response_data = process_frame(image_bytes)
+            response_data = process_frame(image_bytes, debug=debug_mode)
 
             # 6. Strict Output Protocol
             resp_bytes = response_data.encode('utf-8')

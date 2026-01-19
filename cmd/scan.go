@@ -38,7 +38,9 @@ func init() {
 	scanCmd.Flags().IntVarP(&scanOpts.NthFrame, "nth-frame", "n", 10, "AI keyframe interval (e.g. scan every 10th frame)")
 	scanCmd.Flags().IntVarP(&scanOpts.NumEngines, "engines", "e", 1, "Number of parallel engine workers")
 	scanCmd.Flags().StringVarP(&scanOpts.GracePeriod, "grace-period", "g", "2s", "The longest period where a face can be missing before Sentinel declares they are out of frame and logs it to the database")
-	scanCmd.Flags().Float64Var(&scanOpts.MatchThreshold, "threshold", 0.6, "Face matching threshold (lower is stricter)")
+	scanCmd.Flags().Float64VarP(&scanOpts.MatchThreshold, "threshold", "t", 0.6, "Face matching threshold (lower is stricter)")
+	scanCmd.Flags().StringVarP(&scanOpts.BlipDuration, "blip-duration", "b", "100ms", "Minimum duration of a track to be considered valid (filters blips)")
+	scanCmd.Flags().BoolVarP(&scanOpts.DebugScreenshots, "debug-screenshots", "d", false, "Save debug images with bounding boxes to /data/debug_frames/")
 
 	scanCmd.MarkFlagRequired("input")
 	rootCmd.AddCommand(scanCmd)
@@ -105,7 +107,7 @@ func runScan(opts Options) {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			startWorker(workerID, taskChan, resultsChan)
+			startWorker(workerID, taskChan, resultsChan, opts.DebugScreenshots)
 		}(i)
 	}
 
@@ -181,8 +183,8 @@ type scanResult struct {
 
 // startWorker manages the lifecycle of a single Python worker process.
 // It reads tasks from the channel, sends them to Python, and persists the results to the DB.
-func startWorker(id int, tasks <-chan types.FrameTask, results chan<- scanResult) {
-	worker, err := worker.NewPythonWorker(id)
+func startWorker(id int, tasks <-chan types.FrameTask, results chan<- scanResult, debug bool) {
+	worker, err := worker.NewPythonWorker(id, debug)
 	if err != nil {
 		utils.Die("Worker startup failed", err, nil)
 	}
@@ -235,6 +237,15 @@ type activeTrack struct {
 	Count      int
 }
 
+// identityHistory maintains the long-term average embedding for a person
+// even after their active track has closed. Used for Re-Identification.
+type identityHistory struct {
+	ID      int
+	SumVec  []float64
+	Count   int
+	MeanVec []float64
+}
+
 type timeRange struct {
 	Start float64
 	End   float64
@@ -248,13 +259,17 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 	// Tracking state
 	var tracks []*activeTrack
 	nextTrackID := 1
+	knownIdentities := make([]*identityHistory, 0) // Long-term memory
 	summary := make(map[int][]timeRange)
 	totalDetections := 0
 	gracePeriod, _ := time.ParseDuration(opts.GracePeriod)
+	blipDuration, _ := time.ParseDuration(opts.BlipDuration)
 	maxGapFrames := int(gracePeriod.Seconds() * fps)
 	if maxGapFrames < 1 {
 		maxGapFrames = 1 // Ensure at least 1 frame gap to prevent instant closing
 	}
+
+	fmt.Fprintf(os.Stderr, "⚙️  Tracker initialized with Cosine Distance (Threshold: %.2f)\n", opts.MatchThreshold)
 
 	for res := range results {
 		buffer[res.Index] = res
@@ -274,7 +289,7 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 				minDist := opts.MatchThreshold
 
 				for i, t := range tracks {
-					dist := euclideanDist(face.Vec, t.MeanVec)
+					dist := cosineDist(face.Vec, t.MeanVec)
 					if dist < minDist {
 						minDist = dist
 						bestMatch = i
@@ -291,19 +306,43 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 						t.MeanVec[j] = t.SumVec[j] / float64(t.Count)
 					}
 				} else {
-					// Create new track if there's no match
-					newT := &activeTrack{
-						ID:         nextTrackID,
-						StartFrame: frame.Index,
-						LastFrame:  frame.Index,
-						SumVec:     make([]float64, embeddingDim),
-						MeanVec:    make([]float64, embeddingDim),
-						Count:      1,
+					// No active track matched. Try Re-ID against history.
+					bestIDMatch := -1
+					minIDDist := opts.MatchThreshold
+
+					for i, hist := range knownIdentities {
+						// Skip empty histories (newly created identities that haven't closed a track yet)
+						if hist.Count == 0 {
+							continue
+						}
+						dist := cosineDist(face.Vec, hist.MeanVec)
+						if dist < minIDDist {
+							minIDDist = dist
+							bestIDMatch = i
+						}
 					}
-					copy(newT.SumVec, face.Vec)
-					copy(newT.MeanVec, face.Vec)
-					tracks = append(tracks, newT)
-					nextTrackID++
+
+					if bestIDMatch != -1 {
+						// Re-ID Successful: Resurrect existing Identity
+						hist := knownIdentities[bestIDMatch]
+						newT := newActiveTrack(hist.ID, frame.Index, face.Vec)
+						tracks = append(tracks, newT)
+					} else {
+						// Truly New Identity
+						newT := newActiveTrack(nextTrackID, frame.Index, face.Vec)
+						tracks = append(tracks, newT)
+
+						// Initialize empty history for this new ID
+						// It will be populated when the first track closes.
+						newHist := &identityHistory{
+							ID:      nextTrackID,
+							SumVec:  make([]float64, embeddingDim),
+							MeanVec: make([]float64, embeddingDim),
+							Count:   0,
+						}
+						knownIdentities = append(knownIdentities, newHist)
+						nextTrackID++
+					}
 				}
 			}
 
@@ -314,10 +353,28 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 					// Track ended, persist it
 					startSec := float64(t.StartFrame) / fps
 					endSec := float64(t.LastFrame) / fps
+
+					// Filter short tracks (blips)
+					if (endSec - startSec) < blipDuration.Seconds() {
+						continue
+					}
+
 					if err := db.InsertInterval(context.Background(), videoID, startSec, endSec, t.Count, t.MeanVec); err != nil {
 						utils.Die(fmt.Sprintf("Failed to persist track %d", t.ID), err, nil)
 					}
 					summary[t.ID] = append(summary[t.ID], timeRange{Start: startSec, End: endSec})
+
+					// Update Long-Term Memory (History)
+					for _, hist := range knownIdentities {
+						if hist.ID == t.ID {
+							hist.Count += t.Count
+							for k := 0; k < embeddingDim; k++ {
+								hist.SumVec[k] += t.SumVec[k]
+								hist.MeanVec[k] = hist.SumVec[k] / float64(hist.Count)
+							}
+							break
+						}
+					}
 				} else {
 					active = append(active, t)
 				}
@@ -331,10 +388,27 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 	for _, t := range tracks {
 		startSec := float64(t.StartFrame) / fps
 		endSec := float64(t.LastFrame) / fps
+
+		// Filter short tracks (blips)
+		if (endSec - startSec) < blipDuration.Seconds() {
+			continue
+		}
+
 		if err := db.InsertInterval(context.Background(), videoID, startSec, endSec, t.Count, t.MeanVec); err != nil {
 			utils.Die(fmt.Sprintf("Failed to persist track %d", t.ID), err, nil)
 		}
 		summary[t.ID] = append(summary[t.ID], timeRange{Start: startSec, End: endSec})
+		// Update history (though strictly not needed as scan is ending)
+		for _, hist := range knownIdentities {
+			if hist.ID == t.ID {
+				hist.Count += t.Count
+				for k := 0; k < embeddingDim; k++ {
+					hist.SumVec[k] += t.SumVec[k]
+					hist.MeanVec[k] = hist.SumVec[k] / float64(hist.Count)
+				}
+				break
+			}
+		}
 	}
 
 	fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
@@ -359,13 +433,32 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 }
 
-func euclideanDist(a, b []float64) float64 {
-	var sum float64
-	for i := range a {
-		diff := a[i] - b[i]
-		sum += diff * diff
+func newActiveTrack(id, frameIndex int, vec []float64) *activeTrack {
+	t := &activeTrack{
+		ID:         id,
+		StartFrame: frameIndex,
+		LastFrame:  frameIndex,
+		SumVec:     make([]float64, embeddingDim),
+		MeanVec:    make([]float64, embeddingDim),
+		Count:      1,
 	}
-	return math.Sqrt(sum)
+	copy(t.SumVec, vec)
+	copy(t.MeanVec, vec)
+	return t
+}
+
+func cosineDist(a, b []float64) float64 {
+	var dot, sumA, sumB float64
+	for i := range a {
+		dot += a[i] * b[i]
+		sumA += a[i] * a[i]
+		sumB += b[i] * b[i]
+	}
+	// Return 1.0 (max distance) if a vector is zero to avoid division by zero
+	if sumA == 0 || sumB == 0 {
+		return 1.0
+	}
+	return 1.0 - (dot / (math.Sqrt(sumA) * math.Sqrt(sumB)))
 }
 
 // validateScanFlags ensures all CLI arguments are valid before starting heavy processes.

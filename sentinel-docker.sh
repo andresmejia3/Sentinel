@@ -60,7 +60,7 @@ BUILD_FLAG=""
 
 for arg in "$@"; do
     if [[ "$arg" == "--build" ]]; then
-        BUILD_FLAG="--build"
+        BUILD_FLAG="true"
         continue
     fi
 
@@ -72,12 +72,17 @@ for arg in "$@"; do
     fi
 done
 
+if [ "$BUILD_FLAG" == "true" ]; then
+    echo "🔨 Rebuilding Docker image..."
+    $DOCKER_COMPOSE $COMPOSE_FILES build app || exit 1
+fi
+
 echo "🐳 Running Sentinel..."
 echo "   (Note: Local files are mounted at /data/. Use '-i /data/your_video.mp4')"
-$DOCKER_COMPOSE $COMPOSE_FILES run --rm $BUILD_FLAG app "${docker_args[@]}"
+$DOCKER_COMPOSE $COMPOSE_FILES run --rm app "${docker_args[@]}"
 
 # 4. Cleanup (Only if we built)
-if [ -n "$BUILD_FLAG" ]; then
+if [ "$BUILD_FLAG" == "true" ]; then
     echo "🧹 Pruning old image layers..."
     docker image prune -f > /dev/null
 fi

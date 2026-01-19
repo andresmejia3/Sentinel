@@ -19,6 +19,8 @@ type Options struct {
 	MatchThreshold   float64
 	DisableSafetyNet bool
 	BlurStrength     int
+	BlipDuration     string
+	DebugScreenshots bool
 }
 
 var (
