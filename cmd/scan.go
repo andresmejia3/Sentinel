@@ -38,10 +38,7 @@ func init() {
 	scanCmd.Flags().IntVarP(&scanOpts.NthFrame, "nth-frame", "n", 10, "AI keyframe interval (e.g. scan every 10th frame)")
 	scanCmd.Flags().IntVarP(&scanOpts.NumEngines, "engines", "e", runtime.NumCPU(), "Number of parallel engine workers")
 	scanCmd.Flags().StringVarP(&scanOpts.GracePeriod, "grace-period", "g", "2s", "The longest period where a face can be missing before Sentinel declares they are out of frame and logs it to the database")
-	scanCmd.Flags().StringVarP(&scanOpts.Linger, "linger", "l", "2s", "How long to keep blurring after a face is lost")
 	scanCmd.Flags().Float64Var(&scanOpts.MatchThreshold, "threshold", 0.6, "Face matching threshold (lower is stricter)")
-	scanCmd.Flags().BoolVar(&scanOpts.DisableSafetyNet, "disable-safety-net", false, "Disable the \"blur all\" safety net (blur everything if we lost the targets face)")
-	scanCmd.Flags().IntVarP(&scanOpts.BlurStrength, "strength", "s", 99, "Strength of the Gaussian blur kernel")
 
 	scanCmd.MarkFlagRequired("input")
 	rootCmd.AddCommand(scanCmd)
@@ -76,12 +73,6 @@ func runScan(opts Options) {
 		utils.Die("Failed to determine video FPS", err, nil)
 	}
 
-	// 4. Parse Gap Duration
-	gap, err := time.ParseDuration(opts.GracePeriod)
-	if err != nil {
-		utils.Die("Invalid gap duration format (use '2s', '500ms')", err, nil)
-	}
-
 	// 5. Get total frames for progress bar
 	totalVideoFrames := utils.GetTotalFrames(opts.InputPath)
 
@@ -104,7 +95,7 @@ func runScan(opts Options) {
 	// Must run concurrently to prevent deadlock on resultsChan
 	aggDone := make(chan struct{})
 	go func() {
-		processResults(resultsChan, DB, videoID, fps, gap, opts)
+		processResults(resultsChan, DB, videoID, fps, opts)
 		close(aggDone)
 	}()
 
@@ -243,7 +234,7 @@ type activeTrack struct {
 	Count      int
 }
 
-func processResults(results <-chan scanResult, db *store.Store, videoID string, fps float64, gap time.Duration, opts Options) {
+func processResults(results <-chan scanResult, db *store.Store, videoID string, fps float64, opts Options) {
 	// Buffer for re-ordering frames (Worker 2 might finish before Worker 1)
 	buffer := make(map[int]scanResult)
 	nextFrame := opts.NthFrame // Assuming first frame is nthFrame based on loop logic
@@ -251,7 +242,8 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 	// Tracking state
 	var tracks []*activeTrack
 	nextTrackID := 1
-	maxGapFrames := int(gap.Seconds() * fps)
+	gracePeriod, _ := time.ParseDuration(opts.GracePeriod)
+	maxGapFrames := int(gracePeriod.Seconds() * fps)
 	if maxGapFrames < 1 {
 		maxGapFrames = 1 // Ensure at least 1 frame gap to prevent instant closing
 	}
@@ -364,5 +356,8 @@ func validateScanFlags(opts *Options) {
 	}
 	if opts.MatchThreshold <= 0 || opts.MatchThreshold > 1.0 {
 		utils.Die("Invalid match threshold", fmt.Errorf("must be between 0.0 and 1.0, got %f", opts.MatchThreshold), nil)
+	}
+	if _, err := time.ParseDuration(opts.GracePeriod); err != nil {
+		utils.Die("Invalid grace-period format (use '2s', '500ms')", err, nil)
 	}
 }

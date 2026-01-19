@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -153,18 +154,29 @@ func GenerateVideoID(path string) (string, error) {
 		return "", err
 	}
 
-	// Read first 32KB (sufficient for unique headers in most video formats)
-	buf := make([]byte, 32*1024)
-	n, err := f.Read(buf)
+	// Read first 32KB (Header)
+	headBuf := make([]byte, 32*1024)
+	nHead, err := f.Read(headBuf)
 	if err != nil && err != io.EOF {
 		return "", err
 	}
 
-	// Hash: Size + Header Bytes
-	// We ignore path and modtime to allow moving/renaming without re-indexing.
+	// Read last 32KB (Footer/Metadata)
+	// Useful because some formats put critical unique info at the end
+	tailBuf := make([]byte, 32*1024)
+	var nTail int
+	if info.Size() > 64*1024 {
+		if _, err := f.Seek(-32*1024, io.SeekEnd); err == nil {
+			nTail, _ = f.Read(tailBuf)
+		}
+	}
+
+	// Hash: Filename + Size + Header + Footer
+	// We use filepath.Base to allow moving the file without changing ID
 	hash := sha256.New()
-	fmt.Fprintf(hash, "%d|", info.Size())
-	hash.Write(buf[:n])
+	fmt.Fprintf(hash, "%s|%d|", filepath.Base(path), info.Size())
+	hash.Write(headBuf[:nHead])
+	hash.Write(tailBuf[:nTail])
 
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
