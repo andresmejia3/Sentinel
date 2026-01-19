@@ -44,6 +44,11 @@ class TestWorkerLogic(unittest.TestCase):
         mock_image_obj = MagicMock()
         self.mock_pil.Image.open.return_value.convert.return_value = mock_image_obj
 
+        # Mock numpy array shape for thumbnail cropping
+        mock_frame_array = MagicMock()
+        mock_frame_array.shape = (100, 100, 3) # Height, Width, Channels
+        self.mock_np.array.return_value = mock_frame_array
+
         # Simulate InsightFace returning one face object
         mock_face = MagicMock()
         # InsightFace returns a bbox as a numpy array, we mock the astype().tolist() chain
