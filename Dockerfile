@@ -15,27 +15,26 @@ COPY . .
 RUN go build -o /bin/sentinel ./cmd/sentinel
 
 # Stage 2: Runtime Environment (Python + FFmpeg)
-FROM python:3.11-slim-bookworm
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 # Install system dependencies
+# - python3.11, pip: For our application runtime
 # - ffmpeg: Required for video processing
-# - cmake, build-essential: Required to compile dlib
 RUN apt-get update && apt-get install -y \
+    python3.11 \
+    python3-pip \
     ffmpeg \
-    cmake \
-    build-essential \
-    libopenblas-dev \
-    liblapack-dev \
-    libx11-dev \
-    libgtk-3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Install Python dependencies
-# Note: dlib compilation can take several minutes
-RUN pip install --no-cache-dir numpy && \
-    pip install --no-cache-dir dlib face_recognition opencv-python-headless Pillow
+# - onnxruntime-gpu: For GPU-accelerated inference
+# - insightface: For state-of-the-art face detection & recognition
+RUN pip3 install --no-cache-dir \
+    onnxruntime-gpu \
+    insightface \
+    opencv-python-headless Pillow numpy
 
 # Copy the compiled Go binary from the builder stage
 COPY --from=builder /bin/sentinel /usr/local/bin/sentinel

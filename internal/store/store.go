@@ -44,7 +44,7 @@ func initSchema(ctx context.Context, conn *pgx.Conn) error {
 			start_time DOUBLE PRECISION NOT NULL,
 			end_time DOUBLE PRECISION NOT NULL,
 			face_count INT NOT NULL,
-			embedding VECTOR(128) NOT NULL
+			embedding VECTOR(512) NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS face_intervals_embedding_idx ON face_intervals USING hnsw (embedding vector_cosine_ops);
 		CREATE INDEX IF NOT EXISTS face_intervals_video_id_idx ON face_intervals (video_id);

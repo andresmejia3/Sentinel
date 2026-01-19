@@ -3,11 +3,18 @@ import os
 import io
 import json
 import face_recognition
+import insightface
 import numpy as np
 import struct
 from PIL import Image
 
-# read_exactly reads n bytes from the stream, handling partial reads from OS pipes.
+# --- Global InsightFace App Initialization ---
+# This is done once when the worker starts to load the models into memory (and GPU VRAM).
+app = insightface.app.FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+app.prepare(ctx_id=0, det_size=(640, 640))
+# ---
+
+# read_exactly reads n bytes from the stream, handling partial reads from OS pipes
 def read_exactly(stream, n):
     chunks = []
     bytes_read = 0
@@ -28,14 +35,14 @@ def process_frame(image_bytes):
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         frame_array = np.array(image)
 
-        face_locations = face_recognition.face_locations(frame_array)
-        face_encodings = face_recognition.face_encodings(frame_array, face_locations)
+        # Use InsightFace to get all face data in one call
+        faces = app.get(frame_array)
 
         results = []
-        for loc, enc in zip(face_locations, face_encodings):
+        for face in faces:
             results.append({
-                "loc": loc,
-                "vec": enc.tolist()
+                "loc": face.bbox.astype(int).tolist(), # Bounding box
+                "vec": face.embedding.tolist()         # 512-d vector
             })
         return json.dumps(results)
     except Exception as e:

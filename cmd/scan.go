@@ -21,6 +21,7 @@ import (
 )
 
 const megabyte = 1024 * 1024
+const embeddingDim = 512
 
 var scanOpts Options
 
@@ -280,7 +281,7 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 					t := tracks[bestMatch]
 					t.LastFrame = frame.Index
 					t.Count++
-					for j := 0; j < 128; j++ {
+					for j := 0; j < embeddingDim; j++ {
 						t.SumVec[j] += face.Vec[j]
 						t.MeanVec[j] = t.SumVec[j] / float64(t.Count)
 					}
@@ -290,8 +291,8 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 						ID:         nextTrackID,
 						StartFrame: frame.Index,
 						LastFrame:  frame.Index,
-						SumVec:     make([]float64, 128),
-						MeanVec:    make([]float64, 128),
+						SumVec:     make([]float64, embeddingDim),
+						MeanVec:    make([]float64, embeddingDim),
 						Count:      1,
 					}
 					copy(newT.SumVec, face.Vec)
