@@ -41,6 +41,20 @@ func Die(context string, err error, s *SafeCommand) {
 		fmt.Fprintf(os.Stderr, "DETAILS: %v\n", err)
 	}
 
+	if s != nil && s.ProcessState != nil {
+		fmt.Fprintf(os.Stderr, "EXIT CODE: %d (%s)\n", s.ProcessState.ExitCode(), s.ProcessState.String())
+
+		// Detect OOM Kill (Exit Code -1 + "killed" on Unix, or 137)
+		exitCode := s.ProcessState.ExitCode()
+		status := strings.ToLower(s.ProcessState.String())
+		if (exitCode == -1 && strings.Contains(status, "killed")) || exitCode == 137 {
+			fmt.Fprintf(os.Stderr, "\n📉 MEMORY ERROR: The worker was killed by the OS (OOM).\n")
+			fmt.Fprintf(os.Stderr, "   Your Docker container ran out of RAM spawning multiple AI models.\n")
+			fmt.Fprintf(os.Stderr, "   👉 SOLUTION: Run with fewer engines using the '-e' flag.\n")
+			fmt.Fprintf(os.Stderr, "      Example: ./sentinel-docker.sh scan -i ... -e 1\n")
+		}
+	}
+
 	// If we have a SafeCommand and it captured logs, print them.
 	if s != nil && s.Stderr.Len() > 0 {
 		fmt.Fprintf(os.Stderr, "\nPYTHON CRASH LOGS:\n%s\n", s.Stderr.String())

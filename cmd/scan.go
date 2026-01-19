@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"runtime"
+	"sort"
 	"sync"
 	"time"
 
@@ -36,7 +36,7 @@ var scanCmd = &cobra.Command{
 func init() {
 	scanCmd.Flags().StringVarP(&scanOpts.InputPath, "input", "i", "", "Path to video")
 	scanCmd.Flags().IntVarP(&scanOpts.NthFrame, "nth-frame", "n", 10, "AI keyframe interval (e.g. scan every 10th frame)")
-	scanCmd.Flags().IntVarP(&scanOpts.NumEngines, "engines", "e", runtime.NumCPU(), "Number of parallel engine workers")
+	scanCmd.Flags().IntVarP(&scanOpts.NumEngines, "engines", "e", 1, "Number of parallel engine workers")
 	scanCmd.Flags().StringVarP(&scanOpts.GracePeriod, "grace-period", "g", "2s", "The longest period where a face can be missing before Sentinel declares they are out of frame and logs it to the database")
 	scanCmd.Flags().Float64Var(&scanOpts.MatchThreshold, "threshold", 0.6, "Face matching threshold (lower is stricter)")
 
@@ -66,6 +66,7 @@ func runScan(opts Options) {
 		utils.Die("Failed to register video metadata", err, nil)
 	}
 	fmt.Fprintf(os.Stderr, "📼 Processing Video ID: %s\n", videoID[:12])
+	fmt.Fprintf(os.Stderr, "⚙️  Spawning %d Worker Engines...\n", opts.NumEngines)
 
 	// 3. Get FPS for Time Calculations
 	fps, err := utils.GetVideoFPS(opts.InputPath)
@@ -234,6 +235,11 @@ type activeTrack struct {
 	Count      int
 }
 
+type timeRange struct {
+	Start float64
+	End   float64
+}
+
 func processResults(results <-chan scanResult, db *store.Store, videoID string, fps float64, opts Options) {
 	// Buffer for re-ordering frames (Worker 2 might finish before Worker 1)
 	buffer := make(map[int]scanResult)
@@ -242,6 +248,8 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 	// Tracking state
 	var tracks []*activeTrack
 	nextTrackID := 1
+	summary := make(map[int][]timeRange)
+	totalDetections := 0
 	gracePeriod, _ := time.ParseDuration(opts.GracePeriod)
 	maxGapFrames := int(gracePeriod.Seconds() * fps)
 	if maxGapFrames < 1 {
@@ -261,6 +269,7 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 
 			// 1. Match faces to tracks
 			for _, face := range frame.Faces {
+				totalDetections++
 				bestMatch := -1
 				minDist := opts.MatchThreshold
 
@@ -308,6 +317,7 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 					if err := db.InsertInterval(context.Background(), videoID, startSec, endSec, t.Count, t.MeanVec); err != nil {
 						utils.Die(fmt.Sprintf("Failed to persist track %d", t.ID), err, nil)
 					}
+					summary[t.ID] = append(summary[t.ID], timeRange{Start: startSec, End: endSec})
 				} else {
 					active = append(active, t)
 				}
@@ -324,7 +334,29 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 		if err := db.InsertInterval(context.Background(), videoID, startSec, endSec, t.Count, t.MeanVec); err != nil {
 			utils.Die(fmt.Sprintf("Failed to persist track %d", t.ID), err, nil)
 		}
+		summary[t.ID] = append(summary[t.ID], timeRange{Start: startSec, End: endSec})
 	}
+
+	fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
+	fmt.Fprintf(os.Stderr, "📊 SCAN SUMMARY\n")
+	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
+
+	var ids []int
+	for id := range summary {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+
+	for _, id := range ids {
+		fmt.Fprintf(os.Stderr, "\n👤 Identity %d Found:\n", id)
+		for _, r := range summary[id] {
+			fmt.Fprintf(os.Stderr, "   %s -> %s\n", fmtTime(r.Start), fmtTime(r.End))
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
+	fmt.Fprintf(os.Stderr, "👁️  Total Face Detections:   %d\n", totalDetections)
+	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 }
 
 func euclideanDist(a, b []float64) float64 {
@@ -360,4 +392,12 @@ func validateScanFlags(opts *Options) {
 	if _, err := time.ParseDuration(opts.GracePeriod); err != nil {
 		utils.Die("Invalid grace-period format (use '2s', '500ms')", err, nil)
 	}
+}
+
+func fmtTime(seconds float64) string {
+	duration := time.Duration(seconds * float64(time.Second))
+	h := int(duration.Hours())
+	m := int(duration.Minutes()) % 60
+	s := int(duration.Seconds()) % 60
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }

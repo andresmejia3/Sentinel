@@ -24,7 +24,7 @@ func TestProcessFrame(t *testing.T) {
 
 	// 2. Pre-fill dataPipeMock with a fake response from "Python"
 	// We simulate the protocol: [4-byte Length Header] + [JSON Payload]
-	fakePayload := []byte(`[{"loc": [10,10,20,20], "vec": [0.1, 0.2]}]`)
+	fakePayload := []byte(`[{"loc": [10,10,20,20], "vec": [0.1, 0.2, 0.3, 0.4]}]`)
 
 	// Write the length header (Big Endian uint32)
 	binary.Write(dataPipeMock, binary.BigEndian, uint32(len(fakePayload)))

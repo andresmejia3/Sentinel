@@ -11,6 +11,7 @@ services:
       # Mount the current directory to /data so you can scan local files
       # Usage: sentinel scan -i /data/myvideo.mp4
       - .:/data
+      - ./python:/app/python # Hot-reload Python code without rebuilding
     # Keep the container alive or override with a command
     entrypoint: ["sentinel"]
     command: ["--help"]
@@ -19,13 +20,6 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_HOST: ${POSTGRES_HOST}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all # Use all available GPUs
-              capabilities: [gpu]
 
   # PostgreSQL with pgvector extension
   db:

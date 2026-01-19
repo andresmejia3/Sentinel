@@ -62,7 +62,7 @@ Sentinel exposes a robust CLI interface for tuning performance and privacy param
 | Flag | Name | Description | Default |
 | :--- | :--- | :--- | :--- |
 | `-n` | `--nth-frame` | AI keyframe interval (e.g., scan every 10th frame). | `10` |
-| `-e` | `--engines` | Number of parallel engine worker processes. | `CPU_CORES` |
+| `-e` | `--engines` | Number of parallel engine worker processes. | `1` |
 | `-t` | `--threshold` | Face matching threshold (lower is stricter). | `0.6` |
 
 ### Privacy & Redaction
