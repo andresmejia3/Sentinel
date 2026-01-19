@@ -2,8 +2,8 @@
 
 **A High-Performance, Privacy-First Biometric Video Indexing & Redaction Engine.**
 
-[![Version](https://img.shields.io/badge/version-1.2-blue.svg)](https://github.com/yourusername/sentinel)
-[![Status](https://img.shields.io/badge/status-Architecture%20Finalized-green.svg)](https://github.com/yourusername/sentinel)
+[![Version](https://img.shields.io/badge/version-1.2-blue.svg)](https://github.com/andresmejia3/sentinel)
+[![Status](https://img.shields.io/badge/status-Architecture%20Finalized-green.svg)](https://github.com/andresmejia3/sentinel)
 
 Sentinel is an enterprise-grade biometric tool designed to transform unstructured "Dark Data" (raw video) into searchable mathematical vectors. By bridging high-concurrency systems engineering in **Go** with state-of-the-art neural inference in **Python**, Sentinel solves the tension between security monitoring and data privacy compliance (GDPR/CCPA).
 
@@ -126,6 +126,17 @@ Sentinel's power lies in its automated pipelines. Below are the three primary ex
 
 ```
 ---
+
+## 8. Testing Strategy & CI/CD
+
+Sentinel employs a **Mock-Heavy Testing Strategy** to ensure rapid CI feedback without the overhead of compiling heavy AI dependencies (dlib, numpy) in every build.
+
+*   **Scope of Testing:** We explicitly do **not** test "Does the AI recognize a face?"—that is the responsibility of the underlying `dlib` library.
+*   **Contract Verification:** Instead, tests focus on **Glue Code Verification**: ensuring the Python worker correctly formats AI outputs into the strict JSON schema expected by the Go orchestrator.
+*   **Protocol Isolation:** Go unit tests verify the binary IPC protocol (4-byte headers) using `io.Reader` mocks, proving the system handles stream fragmentation and endianness correctly without spawning real processes.
+
+---
+
 ## Future Features
 
 ### Explainable Search Results

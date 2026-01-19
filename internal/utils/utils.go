@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -141,17 +142,39 @@ func NewFFmpegCmd(inputPath string) *exec.Cmd {
 // GenerateVideoID creates a deterministic hash for the video file
 // based on its path, size, and modification time.
 func GenerateVideoID(path string) (string, error) {
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	input := fmt.Sprintf("%s-%d-%d", path, info.Size(), info.ModTime().UnixNano())
-	hash := sha256.Sum256([]byte(input))
-	return hex.EncodeToString(hash[:]), nil
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+
+	// Read first 32KB (sufficient for unique headers in most video formats)
+	buf := make([]byte, 32*1024)
+	n, err := f.Read(buf)
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+
+	// Hash: Size + Header Bytes
+	// We ignore path and modtime to allow moving/renaming without re-indexing.
+	hash := sha256.New()
+	fmt.Fprintf(hash, "%d|", info.Size())
+	hash.Write(buf[:n])
+
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // GetVideoFPS returns the average frame rate of the video.
 func GetVideoFPS(path string) (float64, error) {
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️  ffprobe not found. It is required for processing.\n")
+		return 0, err
+	}
 	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", path)
 	out, err := cmd.Output()
 	if err != nil {

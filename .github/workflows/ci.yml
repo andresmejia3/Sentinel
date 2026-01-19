@@ -1,0 +1,59 @@
+name: Sentinel CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  # Job 1: Validate Go Architecture (Orchestrator)
+  build-go:
+    name: Go Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Static Analysis (go vet)
+        run: go vet ./...
+
+      - name: Run Unit Tests
+        run: go test -v ./...
+
+      - name: Compile Binary
+        # Ensures the code compiles for the target architecture
+        run: go build -v ./...
+
+  # Job 2: Validate Python Logic (Inference Engine)
+  test-python:
+    name: Python Test & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        # We install pytest and flake8. 
+        # Note: We do NOT install face_recognition here to keep CI fast (we mocked it).
+        run: pip install flake8 pytest
+
+      - name: Lint with flake8
+        # Checks for syntax errors (E9, F63, etc.) in the python/ directory
+        run: flake8 python/ --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Run Unit Tests
+        run: pytest python/test_worker.py

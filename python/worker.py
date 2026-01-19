@@ -19,6 +19,28 @@ def read_exactly(stream, n):
         bytes_read += len(chunk)
     return b''.join(chunks)
 
+def process_frame(image_bytes):
+    """
+    Decodes an image and returns a JSON string of face vectors.
+    Isolated for testing purposes.
+    """
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        frame_array = np.array(image)
+
+        face_locations = face_recognition.face_locations(frame_array)
+        face_encodings = face_recognition.face_encodings(frame_array, face_locations)
+
+        results = []
+        for loc, enc in zip(face_locations, face_encodings):
+            results.append({
+                "loc": loc,
+                "vec": enc.tolist()
+            })
+        return json.dumps(results)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
 def main():
     """Main loop for the Python Inference Worker."""
     # Logging to stderr is SAFE (Go ignores it or logs it separately)
@@ -41,27 +63,7 @@ def main():
             if len(image_bytes) != frame_size:
                 break
 
-            try:
-                # 3. Process Image
-                image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                frame_array = np.array(image)
-
-                # 4. Run AI
-                face_locations = face_recognition.face_locations(frame_array)
-                face_encodings = face_recognition.face_encodings(frame_array, face_locations)
-
-                # 5. Build Result
-                results = []
-                for loc, enc in zip(face_locations, face_encodings):
-                    results.append({
-                        "loc": loc, # (top, right, bottom, left)
-                        "vec": enc.tolist()
-                    })
-                
-                response_data = json.dumps(results)
-                
-            except Exception as e:
-                response_data = json.dumps({"error": str(e)})
+            response_data = process_frame(image_bytes)
 
             # 6. Strict Output Protocol
             resp_bytes = response_data.encode('utf-8')

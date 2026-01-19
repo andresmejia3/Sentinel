@@ -47,6 +47,7 @@ func initSchema(ctx context.Context, conn *pgx.Conn) error {
 			embedding VECTOR(128) NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS face_intervals_embedding_idx ON face_intervals USING hnsw (embedding vector_cosine_ops);
+		CREATE INDEX IF NOT EXISTS face_intervals_video_id_idx ON face_intervals (video_id);
 	`
 	_, err := conn.Exec(ctx, query)
 	return err
@@ -59,10 +60,15 @@ func (s *Store) Close(ctx context.Context) {
 
 // EnsureVideoMetadata registers the video in the database. If it exists, it updates the timestamp.
 func (s *Store) EnsureVideoMetadata(ctx context.Context, videoID, path string) error {
+	// 1. Clean up old data to ensure idempotency (prevent duplicate intervals on re-scan)
+	if _, err := s.conn.Exec(ctx, "DELETE FROM face_intervals WHERE video_id = $1", videoID); err != nil {
+		return err
+	}
+
 	_, err := s.conn.Exec(ctx, `
 		INSERT INTO video_metadata (id, path, indexed_at)
 		VALUES ($1, $2, NOW())
-		ON CONFLICT (id) DO UPDATE SET indexed_at = NOW()
+		ON CONFLICT (id) DO UPDATE SET indexed_at = NOW(), path = EXCLUDED.path
 	`, videoID, path)
 	return err
 }
