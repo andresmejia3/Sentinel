@@ -28,8 +28,7 @@ type SafeCommand struct {
 func NewSafeCommand(name string, args ...string) *SafeCommand {
 	cmd := exec.Command(name, args...)
 	stderr := &bytes.Buffer{}
-	cmd.Stderr = stderr    // Capture stderr for crash logs, but don't print to terminal
-	cmd.Stdout = os.Stdout // Forward stdout to terminal since data uses FD 3
+	cmd.Stderr = stderr // Capture stderr for crash logs, but don't print to terminal
 	return &SafeCommand{Cmd: cmd, Stderr: stderr}
 }
 

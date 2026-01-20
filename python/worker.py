@@ -100,8 +100,9 @@ def process_frame(image_bytes, debug=False):
 
 def main():
     """Main loop for the Python Inference Worker."""
-    # We use FD 3 for data, so stdout is free for logging.
-    print("Worker Engine Warm. Awaiting frames...", flush=True)
+    # Logging to stderr is SAFE (Go ignores it or logs it separately)
+    # printing to stdout will BREAK the program.
+    sys.stderr.write("Worker Engine Warm. Awaiting frames...\n")
 
     debug_mode = "--debug" in sys.argv
 

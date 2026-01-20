@@ -54,11 +54,7 @@ func NewPythonWorker(id int, debug bool) (*PythonWorker, error) {
 	readyBuf := make([]byte, 5)
 	if _, err := io.ReadFull(r, readyBuf); err != nil {
 		r.Close()
-		// If initialization failed, the worker likely crashed.
-		// We need to return the captured stderr from the SafeCommand to see why.
-		// We wait briefly for the process to exit and flush buffers.
-		py.Cmd.Wait()
-		return nil, fmt.Errorf("worker %d failed to initialize: %w\nLogs:\n%s", id, err, py.Stderr.String())
+		return nil, fmt.Errorf("worker %d failed to initialize: %w", id, err)
 	}
 	if string(readyBuf) != "READY" {
 		r.Close()
