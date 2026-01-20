@@ -17,7 +17,8 @@ os.environ["ORT_LOGGING_LEVEL"] = "3" # 3 = Error only
 
 # --- Global InsightFace App Initialization ---
 # This is done once when the worker starts to load the models into memory (and GPU VRAM).
-app = insightface.app.FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+# We only load detection and recognition models to save VRAM (skipping gender/age/landmarks)
+app = insightface.app.FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'], allowed_modules=['detection', 'recognition'])
 app.prepare(ctx_id=0, det_size=(640, 640))
 # ---
 

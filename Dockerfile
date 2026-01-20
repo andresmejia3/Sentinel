@@ -38,7 +38,7 @@ RUN pip3 install --no-cache-dir \
 
 # Pre-download the InsightFace models during the build to prevent race conditions at runtime.
 # We use CPU provider here as the build environment may not have a GPU.
-RUN python3 -c "import insightface; insightface.app.FaceAnalysis(providers=['CPUExecutionProvider']).prepare(ctx_id=0, det_size=(640, 640))"
+RUN python3 -c "import insightface; insightface.app.FaceAnalysis(providers=['CPUExecutionProvider'], allowed_modules=['detection', 'recognition']).prepare(ctx_id=0, det_size=(640, 640))"
 
 # Copy the compiled Go binary from the builder stage
 COPY --from=builder /bin/sentinel /usr/local/bin/sentinel
