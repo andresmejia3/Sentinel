@@ -1,5 +1,10 @@
 import sys
 import os
+
+# --- Suppress ONNX Runtime Logging (Must be before importing insightface/onnxruntime) ---
+os.environ["ORT_LOGGING_LEVEL"] = "3" # 3 = Error only
+# ----------------------------------------------------------------------------------------
+
 import io
 import json
 import insightface
@@ -10,10 +15,9 @@ import time
 import base64
 from PIL import Image, ImageDraw
 
-# --- Suppress ONNX Runtime / InsightFace Logging ---
+# --- Suppress InsightFace Logging ---
 import logging
 logging.getLogger('insightface').setLevel(logging.ERROR)
-os.environ["ORT_LOGGING_LEVEL"] = "3" # 3 = Error only
 
 # --- Global InsightFace App Initialization ---
 # This is done once when the worker starts to load the models into memory (and GPU VRAM).
