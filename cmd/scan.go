@@ -327,7 +327,6 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 					if matchID != -1 {
 						// Re-ID Successful: Resurrect existing Identity
 						newT := newActiveTrack(matchID, frame.Index, face.Vec, face.ThumbB64, face.Quality, matchName)
-						fmt.Fprintf(os.Stderr, "DEBUG: Matched ID %d Name '%s'\n", matchID, matchName)
 						tracks = append(tracks, newT)
 						idNames[matchID] = matchName
 					} else {

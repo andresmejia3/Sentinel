@@ -78,7 +78,7 @@ if [ "$BUILD_FLAG" == "true" ]; then
 fi
 
 echo "🐳 Running Sentinel..."
-echo "   (Note: Local files are mounted at /data/. Use '-i /data/your_video.mp4')"
+echo "   (Note: Local files are mounted at /data/. Use -i /data/your_video.mp4)"
 $DOCKER_COMPOSE $COMPOSE_FILES run --rm app "${docker_args[@]}"
 
 # 4. Cleanup (Only if we built)
