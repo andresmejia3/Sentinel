@@ -129,7 +129,6 @@ def main():
             # Write payload
             out_pipe.write(resp_bytes)
             out_pipe.flush()
-            sys.stderr.flush()
 
 if __name__ == "__main__":
     main()

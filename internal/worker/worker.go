@@ -50,6 +50,21 @@ func NewPythonWorker(id int, debug bool) (*PythonWorker, error) {
 	// Close the write-end in the parent so only the child holds it
 	w.Close()
 
+	// Handshake: Wait for worker to be ready (prevents buffering frames before init)
+	readyBuf := make([]byte, 5)
+	if _, err := io.ReadFull(r, readyBuf); err != nil {
+		r.Close()
+		// If initialization failed, the worker likely crashed.
+		// We need to return the captured stderr from the SafeCommand to see why.
+		// We wait briefly for the process to exit and flush buffers.
+		py.Cmd.Wait()
+		return nil, fmt.Errorf("worker %d failed to initialize: %w\nLogs:\n%s", id, err, py.Stderr.String())
+	}
+	if string(readyBuf) != "READY" {
+		r.Close()
+		return nil, fmt.Errorf("worker %d bad handshake: %s", id, string(readyBuf))
+	}
+
 	return &PythonWorker{
 		ID:       id,
 		Cmd:      py,
