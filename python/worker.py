@@ -24,6 +24,9 @@ logging.getLogger('insightface').setLevel(logging.ERROR)
 # We only load detection and recognition models to save VRAM (skipping gender/age/landmarks)
 app = insightface.app.FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'], allowed_modules=['detection', 'recognition'])
 app.prepare(ctx_id=0, det_size=(640, 640))
+# Warm up the engine with a dummy inference to force CUDA initialization
+# This prevents the "first frame lag" and ensures workers are truly ready.
+app.get(np.zeros((640, 640, 3), dtype=np.uint8))
 # ---
 
 # read_exactly reads n bytes from the stream, handling partial reads from OS pipes

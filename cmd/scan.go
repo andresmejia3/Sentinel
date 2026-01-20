@@ -61,6 +61,21 @@ func runScan(opts Options) {
 	// 1. Database is initialized in Root PersistentPreRun
 	ctx := context.Background()
 
+	// Initialize channels early so we can start workers immediately
+	taskChan := make(chan types.FrameTask, opts.NumEngines)
+	resultsChan := make(chan scanResult, opts.NumEngines*2)
+	var wg sync.WaitGroup
+
+	// Start Workers EARLY (Parallelize with FFprobe/DB checks)
+	fmt.Fprintf(os.Stderr, "⚙️  Spawning %d Worker Engines...\n", opts.NumEngines)
+	for i := 0; i < opts.NumEngines; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			startWorker(workerID, taskChan, resultsChan, opts.DebugScreenshots)
+		}(i)
+	}
+
 	// 2. Generate Video ID & Register
 	videoID, err := utils.GenerateVideoID(opts.InputPath)
 	if err != nil {
@@ -70,7 +85,6 @@ func runScan(opts Options) {
 		utils.Die("Failed to register video metadata", err, nil)
 	}
 	fmt.Fprintf(os.Stderr, "📼 Processing Video ID: %s\n", videoID[:12])
-	fmt.Fprintf(os.Stderr, "⚙️  Spawning %d Worker Engines...\n", opts.NumEngines)
 
 	// 3. Get FPS for Time Calculations
 	fps, err := utils.GetVideoFPS(opts.InputPath)
@@ -92,10 +106,6 @@ func runScan(opts Options) {
 		progressbar.OptionShowCount(),
 	)
 
-	taskChan := make(chan types.FrameTask, opts.NumEngines)
-	resultsChan := make(chan scanResult, opts.NumEngines*2)
-	var wg sync.WaitGroup
-
 	// 6. Start Aggregator (Consumer)
 	// Must run concurrently to prevent deadlock on resultsChan
 	aggDone := make(chan struct{})
@@ -103,15 +113,6 @@ func runScan(opts Options) {
 		processResults(resultsChan, DB, videoID, fps, opts)
 		close(aggDone)
 	}()
-
-	// 7. Spawn the Engine Pool
-	for i := 0; i < opts.NumEngines; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			startWorker(workerID, taskChan, resultsChan, opts.DebugScreenshots)
-		}(i)
-	}
 
 	// 8. Start FFmpeg
 	ffmpeg := utils.NewFFmpegCmd(opts.InputPath)
