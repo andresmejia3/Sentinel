@@ -10,6 +10,11 @@ import time
 import base64
 from PIL import Image, ImageDraw
 
+# --- Suppress ONNX Runtime / InsightFace Logging ---
+import logging
+logging.getLogger('insightface').setLevel(logging.ERROR)
+os.environ["ORT_LOGGING_LEVEL"] = "3" # 3 = Error only
+
 # --- Global InsightFace App Initialization ---
 # This is done once when the worker starts to load the models into memory (and GPU VRAM).
 app = insightface.app.FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
