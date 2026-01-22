@@ -66,13 +66,16 @@ func runScan(opts Options) {
 	resultsChan := make(chan scanResult, opts.NumEngines*2)
 	var wg sync.WaitGroup
 
+	estMemGB := 0.5 + (float64(opts.NumEngines) * 1.2)
+	fmt.Fprintf(os.Stderr, "⚙️  Spawning %d Worker Engines (Est. Memory: ~%.1f GB)...\n", opts.NumEngines, estMemGB)
+
 	// Start Workers EARLY (Parallelize with FFprobe/DB checks)
-	fmt.Fprintf(os.Stderr, "⚙️  Spawning %d Worker Engines...\n", opts.NumEngines)
+	readyChan := make(chan bool, opts.NumEngines) // Buffered: Workers drop message and keep going
 	for i := 0; i < opts.NumEngines; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			startWorker(workerID, taskChan, resultsChan, opts.DebugScreenshots)
+			startWorker(workerID, taskChan, resultsChan, opts.DebugScreenshots, readyChan)
 		}(i)
 	}
 
@@ -98,6 +101,20 @@ func runScan(opts Options) {
 	if totalVideoFrames <= 0 {
 		// Fallback to a spinner or unknown total if ffprobe fails
 		totalVideoFrames = -1
+	}
+
+	// Progress bar for worker startup
+	workerBar := progressbar.NewOptions(opts.NumEngines,
+		progressbar.OptionSetDescription("🚀 Warming Up AI Engines"),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionShowCount(),
+		progressbar.OptionClearOnFinish(),
+	)
+
+	// WAIT HERE: Ensure all workers are ready before starting the heavy scan
+	for i := 0; i < opts.NumEngines; i++ {
+		<-readyChan
+		workerBar.Add(1)
 	}
 
 	bar := progressbar.NewOptions(totalVideoFrames,
@@ -186,12 +203,15 @@ type scanResult struct {
 
 // startWorker manages the lifecycle of a single Python worker process.
 // It reads tasks from the channel, sends them to Python, and persists the results to the DB.
-func startWorker(id int, tasks <-chan types.FrameTask, results chan<- scanResult, debug bool) {
+func startWorker(id int, tasks <-chan types.FrameTask, results chan<- scanResult, debug bool, ready chan<- bool) {
 	worker, err := worker.NewPythonWorker(id, debug)
 	if err != nil {
 		utils.Die("Worker startup failed", err, nil)
 	}
 	defer worker.Close()
+
+	// Signal to the main thread that this worker is ready
+	ready <- true
 
 	for task := range tasks {
 		resp, err := worker.ProcessFrame(task.Data)

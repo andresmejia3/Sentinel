@@ -7,6 +7,7 @@ os.environ["ORT_LOGGING_LEVEL"] = "3" # 3 = Error only
 
 import io
 import json
+import cv2
 import insightface
 import numpy as np
 import struct
@@ -47,22 +48,27 @@ def process_frame(image_bytes, debug=False):
     Isolated for testing purposes.
     """
     try:
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        frame_array = np.array(image)
+        # Decode directly to BGR using OpenCV (faster, and native to InsightFace)
+        # This avoids the expensive Full-Frame RGB->BGR conversion.
+        frame_array = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if frame_array is None:
+            return json.dumps({"error": "Image decode failed"})
 
-        # Use InsightFace to get all face data in one call
+        # InsightFace expects BGR, so we pass it directly
         faces = app.get(frame_array)
 
         if debug and len(faces) > 0:
             try:
-                draw = ImageDraw.Draw(image)
+                # Convert BGR to RGB for PIL debug drawing
+                debug_img = Image.fromarray(cv2.cvtColor(frame_array, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(debug_img)
                 for face in faces:
                     bbox = face.bbox.astype(int)
                     draw.rectangle(bbox.tolist(), outline="red", width=3)
                 
                 # Save to /data/debug_frames (mounted volume)
                 os.makedirs("/data/debug_frames", exist_ok=True)
-                image.save(f"/data/debug_frames/debug_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}.jpg")
+                debug_img.save(f"/data/debug_frames/debug_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}.jpg")
             except Exception as e:
                 sys.stderr.write(f"Debug save failed: {e}\n")
 
@@ -74,16 +80,41 @@ def process_frame(image_bytes, debug=False):
             if norm > 0:
                 embedding = embedding / norm
 
-            # Calculate Quality Score (Confidence * Area)
-            # This helps us pick the "best" shot of a person later.
+            # --- Calculate Face Quality Score (ISO/IEC 29794-5 inspired) ---
             box = face.bbox.astype(int)
-            area = (box[2] - box[0]) * (box[3] - box[1])
-            quality = face.det_score * area
-
-            # Encode thumbnail to Base64 (In-Memory)
             h, w = frame_array.shape[:2]
             x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
-            face_img = Image.fromarray(frame_array[y1:y2, x1:x2])
+            area = (x2 - x1) * (y2 - y1)
+
+            # 1. Alignment Score (0.0 - 1.0)
+            # Penalize faces that are looking away (side profile)
+            alignment = 0.5 # Default fallback
+            if face.kps is not None:
+                # Calculate horizontal offset of the nose (idx 2) relative to the eyes (idx 0, 1)
+                eye_center_x = (face.kps[0][0] + face.kps[1][0]) / 2
+                eye_dist = np.linalg.norm(face.kps[1] - face.kps[0])
+                if eye_dist > 0:
+                    nose_offset = abs(face.kps[2][0] - eye_center_x)
+                    # Ideally nose is in the center. We penalize deviation relative to eye distance.
+                    alignment = max(0.0, 1.0 - (nose_offset / eye_dist))
+
+            # 2. Sharpness Score (Laplacian Variance)
+            # Standard metric for blur detection. Higher is sharper.
+            face_roi = frame_array[y1:y2, x1:x2]
+            sharpness = 0.0
+            if face_roi.size > 0:
+                gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+                sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+            # 3. Composite Quality Score
+            # We use log(sharpness) to dampen the effect of extremely textured backgrounds
+            # We use sqrt(area) to prevent massive blurry faces from winning just by size
+            quality = face.det_score * alignment * np.log(max(1.0, sharpness)) * np.sqrt(max(1.0, float(area)))
+
+            # Encode thumbnail to Base64 (In-Memory)
+            # Convert BGR crop to RGB for PIL
+            face_rgb = cv2.cvtColor(frame_array[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+            face_img = Image.fromarray(face_rgb)
             mem_file = io.BytesIO()
             face_img.save(mem_file, format="JPEG", quality=85)
             thumb_b64 = base64.b64encode(mem_file.getvalue()).decode('utf-8')
@@ -100,14 +131,16 @@ def process_frame(image_bytes, debug=False):
 
 def main():
     """Main loop for the Python Inference Worker."""
-    # Logging to stderr is SAFE (Go ignores it or logs it separately)
-    # printing to stdout will BREAK the program.
-    sys.stderr.write("Worker Engine Warm. Awaiting frames...\n")
+    # Stdout is now free for human-readable logs.
 
     debug_mode = "--debug" in sys.argv
 
     # Open File Descriptor 3 (passed from Go) for clean data output
     with os.fdopen(3, 'wb') as out_pipe:
+        # Handshake: Signal readiness to Go via the data pipe.
+        out_pipe.write(b'READY')
+        out_pipe.flush()
+
         while True:
             # 1. Read 4-byte header
             header = read_exactly(sys.stdin.buffer, 4)

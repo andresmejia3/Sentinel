@@ -4,5 +4,8 @@
 bin
 *.mp4
 *.mkv
+*.mov
+samples
+thumbnails
 postgres_data
 .env

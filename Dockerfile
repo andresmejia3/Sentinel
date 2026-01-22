@@ -3,16 +3,22 @@ FROM golang:1.25-bookworm AS builder
 
 WORKDIR /app
 
+# Disable CGO for faster builds (pure Go binary)
+ENV CGO_ENABLED=0
+
 # Copy dependency definitions
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 # Copy source code
 COPY . .
 
 # Build the binary. 
 # The entry point is in cmd/sentinel
-RUN go build -o /bin/sentinel ./cmd/sentinel
+# Use BuildKit cache to persist build artifacts across Docker runs
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    go build -v -o /bin/sentinel ./cmd/sentinel
 
 # Stage 2: Runtime Environment (Python + FFmpeg)
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04

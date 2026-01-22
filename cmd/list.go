@@ -39,7 +39,7 @@ func runList() {
 	fmt.Fprintln(w, "--\t----\t----------\t-------")
 
 	for _, id := range identities {
-		fmt.Fprintf(w, "%d\t%s\t%d\t%s\n", id.ID, id.Name, id.Count, id.CreatedAt.Format("2006-01-02 15:04"))
+		fmt.Fprintf(w, "%d\t%s\t%d\t%s\n", id.ID, id.Name, id.Count, id.CreatedAt.Local().Format("2006-01-02 15:04"))
 	}
 	w.Flush()
 }

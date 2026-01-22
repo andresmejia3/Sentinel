@@ -12,6 +12,7 @@ services:
       # Usage: sentinel scan -i /data/myvideo.mp4
       - .:/data
       - ./python:/app/python # Hot-reload Python code without rebuilding
+      - /etc/localtime:/etc/localtime:ro # Sync container timezone with host
     # Keep the container alive or override with a command
     entrypoint: ["sentinel"]
     command: ["--help"]

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -17,9 +18,25 @@ type Store struct {
 
 // New establishes a connection to the database and ensures the schema is initialized.
 func New(ctx context.Context, connString string) (*Store, error) {
-	conn, err := pgx.Connect(ctx, connString)
+	var conn *pgx.Conn
+	var err error
+
+	// Retry loop: Wait for DB to become ready (e.g. if in recovery mode)
+	for i := 0; i < 15; i++ {
+		conn, err = pgx.Connect(ctx, connString)
+		if err == nil {
+			break
+		}
+		fmt.Fprintf(os.Stderr, "⏳ Database not ready (Attempt %d/15). Retrying in 2s...\n", i+1)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Second):
+			continue
+		}
+	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("database connection failed after retries: %w", err)
 	}
 
 	// Initialize schema (Auto-Migration)

@@ -125,8 +125,8 @@ We employ a **Mock-Heavy** testing approach to ensure CI speed and reliability:
 3.  **Run with Docker:**
     Use the provided wrapper script for easy execution:
     ```bash
-    chmod +x sentinel-docker.sh
-    ./sentinel-docker.sh --help
+    chmod +x sentinel
+    ./sentinel --help
     ```
 
 ### Usage Examples
@@ -134,12 +134,12 @@ We employ a **Mock-Heavy** testing approach to ensure CI speed and reliability:
 **Index a Video:**
 ```bash
 # Note: The current directory is mounted to /data inside the container
-./sentinel-docker.sh scan -i /data/security_footage.mp4
+./sentinel scan -i /data/security_footage.mp4
 ```
 
 **Search for a Person:**
 ```bash
-./sentinel-docker.sh find /data/suspect_photo.jpg
+./sentinel find /data/suspect_photo.jpg
 ```
 
 ---

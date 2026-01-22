@@ -34,6 +34,9 @@ func NewPythonWorker(id int, debug bool) (*PythonWorker, error) {
 	// Pass the write-end to the child process. It will appear as FD 3.
 	py.Cmd.ExtraFiles = []*os.File{w}
 
+	py.Cmd.Stderr = py.Stderr // Capture stderr for crash logs
+	py.Cmd.Stdout = nil       // Discard stdout to silence library noise
+
 	stdin, err := py.StdinPipe()
 	if err != nil {
 		w.Close() // Prevent FD leak
@@ -49,6 +52,19 @@ func NewPythonWorker(id int, debug bool) (*PythonWorker, error) {
 
 	// Close the write-end in the parent so only the child holds it
 	w.Close()
+
+	// --- Handshake ---
+	// Wait for the "READY" signal from the worker's data pipe (FD 3).
+	readyBuf := make([]byte, 5)
+	if _, err := io.ReadFull(r, readyBuf); err != nil {
+		r.Close()
+		py.Cmd.Wait() // Wait for process to exit to get logs
+		return nil, fmt.Errorf("worker %d failed handshake: %w\nLogs:\n%s", id, err, py.Stderr.String())
+	}
+	if string(readyBuf) != "READY" {
+		r.Close()
+		return nil, fmt.Errorf("worker %d bad handshake: expected 'READY', got '%s'", id, string(readyBuf))
+	}
 
 	return &PythonWorker{
 		ID:       id,

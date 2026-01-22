@@ -28,7 +28,8 @@ type SafeCommand struct {
 func NewSafeCommand(name string, args ...string) *SafeCommand {
 	cmd := exec.Command(name, args...)
 	stderr := &bytes.Buffer{}
-	cmd.Stderr = stderr // Capture stderr for crash logs, but don't print to terminal
+	cmd.Stdout = os.Stdout // Forward stdout for live logging (if Python prints anything)
+	// The caller is responsible for assigning cmd.Stderr.
 	return &SafeCommand{Cmd: cmd, Stderr: stderr}
 }
 
@@ -51,7 +52,7 @@ func Die(context string, err error, s *SafeCommand) {
 			fmt.Fprintf(os.Stderr, "\n📉 MEMORY ERROR: The worker was killed by the OS (OOM).\n")
 			fmt.Fprintf(os.Stderr, "   Your Docker container ran out of RAM spawning multiple AI models.\n")
 			fmt.Fprintf(os.Stderr, "   👉 SOLUTION: Run with fewer engines using the '-e' flag.\n")
-			fmt.Fprintf(os.Stderr, "      Example: ./sentinel-docker.sh scan -i ... -e 1\n")
+			fmt.Fprintf(os.Stderr, "      Example: ./sentinel scan -i ... -e 1\n")
 		}
 	}
 
