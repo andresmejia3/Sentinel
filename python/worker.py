@@ -85,6 +85,11 @@ def process_frame(image_bytes, debug=False):
             h, w = frame_array.shape[:2]
             x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
             area = (x2 - x1) * (y2 - y1)
+            
+            # Filter small faces (noise/ghosts)
+            # If a face is smaller than 40x40 pixels, it's likely a false positive or too blurry to be useful.
+            # if (x2 - x1) < 40 or (y2 - y1) < 40:
+            #     continue
 
             # 1. Alignment Score (0.0 - 1.0)
             # Penalize faces that are looking away (side profile)
@@ -112,9 +117,14 @@ def process_frame(image_bytes, debug=False):
             quality = face.det_score * alignment * np.log(max(1.0, sharpness)) * np.sqrt(max(1.0, float(area)))
 
             # Encode thumbnail to Base64 (In-Memory)
-            # Convert BGR crop to RGB for PIL
-            face_rgb = cv2.cvtColor(frame_array[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
-            face_img = Image.fromarray(face_rgb)
+            # We now use the FULL FRAME with a bounding box drawn on it.
+            thumb_img = frame_array.copy()
+            # Draw Green Box (0, 255, 0) with thickness 2
+            cv2.rectangle(thumb_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # Convert BGR to RGB for PIL/JPEG encoding
+            thumb_rgb = cv2.cvtColor(thumb_img, cv2.COLOR_BGR2RGB)
+            face_img = Image.fromarray(thumb_rgb)
             mem_file = io.BytesIO()
             face_img.save(mem_file, format="JPEG", quality=85)
             thumb_b64 = base64.b64encode(mem_file.getvalue()).decode('utf-8')

@@ -447,10 +447,10 @@ func processResults(results <-chan scanResult, db *store.Store, videoID string, 
 		// Check session thumbs
 		if thumb, ok := sessionThumbs[id]; ok && len(thumb.Data) > 0 {
 			filename := fmt.Sprintf("identity_%d.jpg", id)
-			outDir := filepath.Join("/data", "thumbnails", videoID)
+			outDir := filepath.Join("/data", "unknown", videoID)
 			_ = os.MkdirAll(outDir, 0755)
 			_ = os.WriteFile(filepath.Join(outDir, filename), thumb.Data, 0644)
-			thumbNote = fmt.Sprintf("(See thumbnails/%s/%s)", videoID, filename)
+			thumbNote = fmt.Sprintf("(See unknown/%s/%s)", videoID, filename)
 		}
 
 		name := idNames[id]

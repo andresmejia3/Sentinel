@@ -4,7 +4,7 @@
 bin
 *.mp4
 *.mkv
-*.mov
+# *.mov
 samples
 thumbnails
 postgres_data
