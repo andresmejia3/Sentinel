@@ -189,7 +189,7 @@ func GenerateVideoID(path string) (string, error) {
 	// Hash: Filename + Size + Header + Footer
 	// We use filepath.Base to allow moving the file without changing ID
 	hash := sha256.New()
-	fmt.Fprintf(hash, "%s|%d|", filepath.Base(path), info.Size())
+	fmt.Fprintf(hash, "%s|%d|", strings.ToLower(filepath.Base(path)), info.Size())
 	hash.Write(headBuf[:nHead])
 	hash.Write(tailBuf[:nTail])
 
