@@ -48,7 +48,6 @@ jobs:
 
       - name: Install Dependencies
         # We install pytest and flake8. 
-        # Note: We do NOT install face_recognition here to keep CI fast (we mocked it).
         run: pip install flake8 pytest
 
       - name: Lint with flake8

@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"testing"
 )
 
@@ -77,7 +78,48 @@ func TestProcessFrame(t *testing.T) {
 	if len(resp) != 1 {
 		t.Fatalf("Expected 1 face, got %d", len(resp))
 	}
-	if resp[0].Vec[0] != 0.5 {
-		t.Errorf("Expected vector[0] == 0.5, got %f", resp[0].Vec[0])
+	// Use epsilon for float comparison
+	if math.Abs(resp[0].Vec[0]-0.5) > 1e-9 {
+		t.Errorf("Expected vector[0] approx 0.5, got %f", resp[0].Vec[0])
+	}
+}
+
+func TestProcessFrame_Error(t *testing.T) {
+	// 1. Setup Mocks
+	stdinMock := &MockCloser{Buffer: new(bytes.Buffer)}
+	dataPipeMock := &MockCloser{Buffer: new(bytes.Buffer)}
+
+	// 2. Pre-fill dataPipeMock with an ERROR response from "Python"
+	// Protocol: [Status:1] [MsgLen] [Msg]
+
+	payload := new(bytes.Buffer)
+	payload.WriteByte(1) // Status ERROR
+
+	errMsg := "Python Exception: Import Error"
+	binary.Write(payload, binary.BigEndian, uint32(len(errMsg)))
+	payload.WriteString(errMsg)
+
+	fakePayload := payload.Bytes()
+
+	// Write the length header
+	binary.Write(dataPipeMock, binary.BigEndian, uint32(len(fakePayload)))
+	dataPipeMock.Write(fakePayload)
+
+	// 3. Create Worker
+	w := &PythonWorker{
+		ID:       1,
+		Stdin:    stdinMock,
+		DataPipe: dataPipeMock,
+	}
+
+	// 4. Execute
+	_, err := w.ProcessFrame([]byte("frame"))
+
+	// 5. Assertions
+	if err == nil {
+		t.Fatal("Expected error, got nil")
+	}
+	if err.Error() != "python worker error: "+errMsg {
+		t.Errorf("Expected error message '%s', got '%v'", "python worker error: "+errMsg, err)
 	}
 }

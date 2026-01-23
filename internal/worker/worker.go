@@ -129,7 +129,6 @@ func (w *PythonWorker) ProcessFrame(data []byte) ([]types.FaceResult, error) {
 		defer f.SetReadDeadline(time.Time{})
 	}
 
-	var header [4]byte
 	if _, err := io.ReadFull(w.DataPipe, header[:]); err != nil {
 		return nil, err // This is where we catch the "ModuleNotFoundError" crash
 	}

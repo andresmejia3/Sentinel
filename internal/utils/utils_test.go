@@ -56,4 +56,20 @@ func TestGenerateVideoID(t *testing.T) {
 	if err != nil || id == "" {
 		t.Errorf("Failed to generate ID: %v", err)
 	}
+
+	// Verify Determinism
+	id2, _ := GenerateVideoID(tmp.Name())
+	if id != id2 {
+		t.Errorf("Hash is not deterministic. Got %s, then %s", id, id2)
+	}
+
+	// Verify Sensitivity (Change content -> Change ID)
+	f, _ := os.OpenFile(tmp.Name(), os.O_APPEND|os.O_WRONLY, 0644)
+	f.Write([]byte(" modification"))
+	f.Close()
+
+	id3, _ := GenerateVideoID(tmp.Name())
+	if id == id3 {
+		t.Error("Hash did not change after file modification")
+	}
 }

@@ -113,9 +113,6 @@ def process_frame(image_bytes, debug=False) -> bytes:
             if norm > 1e-6:
                 valid_faces.append((face, x1, y1, x2, y2, norm))
 
-        # Start Response: Status 0 (Success) + Num Faces (4 bytes)
-        response = [b'\x00', struct.pack('>I', len(valid_faces))]
-
         # OPTIMIZATION: Resize massive frames ONCE, not per-face.
         # This prevents resizing a 4K/8K image N times if N faces are found.
         max_dim = 1920
@@ -124,6 +121,8 @@ def process_frame(image_bytes, debug=False) -> bytes:
         if max(h_frame, w_frame) > max_dim:
             scale = max_dim / float(max(h_frame, w_frame))
             resized_frame = cv2.resize(frame_array, (0, 0), fx=scale, fy=scale)
+
+        face_payloads = []
 
         for face, x1, y1, x2, y2, norm in valid_faces:
             # Normalize embedding to unit length for Cosine Similarity
@@ -173,19 +172,23 @@ def process_frame(image_bytes, debug=False) -> bytes:
             # Encode directly using OpenCV (Faster, no PIL overhead)
             success, encoded_img = cv2.imencode('.jpg', thumb_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             if not success:
+                sys.stderr.write("Warning: Failed to encode thumbnail for a face, skipping.\n")
                 continue # Skip this face if encoding fails
             thumb_bytes = encoded_img.tobytes()
 
-            # Pack Binary Data
-            # >4i = 4 integers (x1, y1, x2, y2) -> 16 bytes
-            # >512f = 512 floats (embedding) -> 2048 bytes
-            # >f = 1 float (quality) -> 4 bytes
-            # >I = 1 uint (image length) -> 4 bytes
-            response.append(struct.pack('>4i', x1, y1, x2, y2))
-            response.append(embedding_bytes)
-            response.append(struct.pack('>f', float(quality)))
-            response.append(struct.pack('>I', len(thumb_bytes)))
-            response.append(thumb_bytes)
+            face_payloads.append(b''.join([
+                struct.pack('>4i', x1, y1, x2, y2),
+                embedding_bytes,
+                struct.pack('>f', float(quality)),
+                struct.pack('>I', len(thumb_bytes)),
+                thumb_bytes
+            ]))
+
+        # Now, construct the final response with the correct count
+        response = [
+            b'\x00', # Status OK
+            struct.pack('>I', len(face_payloads)) # Correct number of faces
+        ] + face_payloads
 
         return b''.join(response)
 

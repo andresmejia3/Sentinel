@@ -1,4 +1,5 @@
 import sys
+import os
 import unittest
 import struct
 import importlib
@@ -7,6 +8,12 @@ from unittest.mock import MagicMock, patch
 class TestWorkerLogic(unittest.TestCase):
     
     def setUp(self):
+        # Ensure the directory containing this test file is in sys.path
+        # This allows 'import worker' to work regardless of CWD
+        test_dir = os.path.dirname(os.path.abspath(__file__))
+        if test_dir not in sys.path:
+            sys.path.insert(0, test_dir)
+
         # 1. Create fresh mocks for every single test run
         self.mock_insightface = MagicMock()
         self.mock_np = MagicMock()
@@ -40,16 +47,22 @@ class TestWorkerLogic(unittest.TestCase):
         
         # 1. Setup Mock AI responses
         # cv2.imdecode returns a mock array
-        self.mock_cv2.imdecode.return_value = MagicMock()
+        # FIX: The frame comes from imdecode, so IT needs the shape, not np.array
+        mock_frame = MagicMock()
+        mock_frame.shape = (100, 100, 3) # Height, Width, Channels
 
-        # Mock numpy array shape for thumbnail cropping
-        mock_frame_array = MagicMock()
-        mock_frame_array.shape = (100, 100, 3) # Height, Width, Channels
-        self.mock_np.array.return_value = mock_frame_array
+        # FIX: Mock the ROI slice to have a numeric size for sharpness check (face_roi.size > 0)
+        mock_roi = MagicMock()
+        mock_roi.size = 100
+        mock_frame.__getitem__.return_value = mock_roi
+
+        self.mock_cv2.imdecode.return_value = mock_frame
 
         # Simulate InsightFace returning one face object
         mock_face = MagicMock()
         mock_face.det_score = 0.99 # Must be a float for quality calc
+        # FIX: Set kps to None to skip complex alignment math for this test
+        mock_face.kps = None
 
         # Mock bbox: Needs to support indexing (box[0]) AND .tolist()
         # box = [10, 20, 30, 40]
@@ -66,6 +79,11 @@ class TestWorkerLogic(unittest.TestCase):
         
         # Mock numpy linalg norm
         self.mock_np.linalg.norm.return_value = 1.0
+        
+        # FIX: Mock math functions used in quality score calculation
+        self.mock_np.log.return_value = 1.0
+        self.mock_np.sqrt.return_value = 1.0
+        self.mock_cv2.Laplacian.return_value.var.return_value = 100.0
         
         # Mock the result of division: (embedding / norm)
         mock_div_result = MagicMock()
@@ -120,6 +138,104 @@ class TestWorkerLogic(unittest.TestCase):
         msg = result_bytes[5:5+msg_len].decode('utf-8')
         
         self.assertEqual(msg, "Corrupt Data")
+
+    def test_process_frame_imdecode_returns_none(self):
+        """Test that a None from imdecode returns the correct binary error."""
+        self.mock_cv2.imdecode.return_value = None
+
+        result_bytes = self.worker.process_frame(b"garbage")
+
+        # Structure: [Status:1] [MsgLen:4] [Msg:N]
+        self.assertEqual(result_bytes[0], 0x01) # Status 1 = Error
+
+        msg_len = struct.unpack('>I', result_bytes[1:5])[0]
+        msg = result_bytes[5:5+msg_len].decode('utf-8')
+
+        self.assertEqual(msg_len, 19)
+        self.assertEqual(msg, "Image decode failed")
+
+    def test_process_frame_imencode_failure(self):
+        """Test that a face is skipped if thumbnail encoding fails, and the header is correct."""
+        # Setup mocks similar to success test, but for two faces
+        mock_frame = MagicMock()
+        mock_frame.shape = (100, 100, 3)
+
+        # FIX: Mock the ROI slice to have a numeric size
+        mock_roi = MagicMock()
+        mock_roi.size = 100
+        mock_frame.__getitem__.return_value = mock_roi
+        self.mock_cv2.imdecode.return_value = mock_frame
+
+        # Create two mock faces
+        face1 = MagicMock(det_score=0.99, kps=None, bbox=MagicMock(), embedding=MagicMock())
+        face1.bbox.astype.return_value.__getitem__.side_effect = lambda i: [10,10,20,20][i]
+        
+        # Mock embedding division and astype for face1
+        mock_div_result1 = MagicMock()
+        face1.embedding.__truediv__.return_value = mock_div_result1
+        mock_astype_result1 = MagicMock()
+        mock_div_result1.astype.return_value = mock_astype_result1
+        mock_astype_result1.tobytes.return_value = struct.pack('>512f', *([0.1]*512))
+
+        face2 = MagicMock(det_score=0.98, kps=None, bbox=MagicMock(), embedding=MagicMock())
+        face2.bbox.astype.return_value.__getitem__.side_effect = lambda i: [30,30,40,40][i]
+        
+        # Mock embedding division and astype for face2
+        mock_div_result2 = MagicMock()
+        face2.embedding.__truediv__.return_value = mock_div_result2
+        mock_astype_result2 = MagicMock()
+        mock_div_result2.astype.return_value = mock_astype_result2
+        mock_astype_result2.tobytes.return_value = struct.pack('>512f', *([0.2]*512))
+
+        self.mock_app_instance.get.return_value = [face1, face2]
+
+        # Mock np.linalg.norm to always return 1.0
+        self.mock_np.linalg.norm.return_value = 1.0
+        self.mock_np.log.return_value = 1.0
+        self.mock_np.sqrt.return_value = 1.0
+        self.mock_cv2.Laplacian.return_value.var.return_value = 100.0
+
+        # Mock cv2.imencode: Succeed for the first face, fail for the second
+        mock_encoded_success = MagicMock()
+        mock_encoded_success.tobytes.return_value = b'jpeg1'
+        self.mock_cv2.imencode.side_effect = [
+            (True, mock_encoded_success), # Success for face 1
+            (False, None)                 # Failure for face 2
+        ]
+
+        result_bytes = self.worker.process_frame(b"fake_image_bytes")
+
+        # Assertions
+        self.assertEqual(result_bytes[0], 0x00) # Status should be success
+
+        # Count should be 1, not 2, because the second face failed to encode
+        count = struct.unpack('>I', result_bytes[1:5])[0]
+        self.assertEqual(count, 1)
+
+        # Verify the total length is correct for one face
+        expected_len = 1 + 4 + 16 + 2048 + 4 + 4 + len(b'jpeg1')
+        self.assertEqual(len(result_bytes), expected_len)
+
+    def test_read_exactly(self):
+        """Test that read_exactly handles partial reads correctly."""
+        # Mock a stream that returns data in chunks
+        mock_stream = MagicMock()
+        # Side effect returns chunks: b'12', b'34', b'5', empty (EOF)
+        mock_stream.read.side_effect = [b'12', b'34', b'5', b'']
+        
+        # We want 5 bytes. 
+        data = self.worker.read_exactly(mock_stream, 5)
+        self.assertEqual(data, b'12345')
+        
+        # Verify calls: 5-0=5, 5-2=3, 5-4=1
+        self.assertEqual(mock_stream.read.call_count, 3)
+
+    def test_read_exactly_short(self):
+        """Test that read_exactly handles EOF before N bytes."""
+        mock_stream = MagicMock()
+        mock_stream.read.side_effect = [b'12', b''] # EOF after 2 bytes
+        data = self.worker.read_exactly(mock_stream, 5)
+        self.assertEqual(data, b'12')
 
 if __name__ == '__main__':
     unittest.main()
