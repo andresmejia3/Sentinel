@@ -21,6 +21,7 @@ logging.getLogger('insightface').setLevel(logging.ERROR)
 parser = argparse.ArgumentParser()
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--detection-threshold', type=float, default=0.5, help='Face detection confidence threshold')
+parser.add_argument('--quality-strategy', type=str, default='clarity', choices=['clarity', 'portrait', 'confidence', 'legacy'], help='Quality scoring strategy')
 args, _ = parser.parse_known_args()
 
 DETECTION_THRESHOLD = args.detection_threshold
@@ -161,9 +162,7 @@ def process_frame(image_bytes, debug=False) -> bytes:
 
             # 3. Composite Quality Score
             # A/B Testing Strategy:
-            # Change this variable to 'portrait', 'clarity', or 'confidence' to test different metrics.
-            quality_strategy = 'legacy'
-
+            quality_strategy = args.quality_strategy
             if quality_strategy == 'portrait':
                 # Prioritizes looking at the camera (Alignment^2).
                 # Log-Area reduces the bias towards massive faces.
@@ -182,6 +181,9 @@ def process_frame(image_bytes, debug=False) -> bytes:
             else:
                 # Legacy (Size Biased)
                 quality = face.det_score * alignment * np.log(max(1.0, sharpness)) * np.sqrt(max(1.0, float(area)))
+
+            if debug:
+                sys.stderr.write(f"Face: Score={face.det_score:.2f} Align={alignment:.2f} Sharp={sharpness:.1f} Area={area:.0f} -> Quality ({quality_strategy})={quality:.4f}\n")
 
             # Prepare thumbnail (Raw JPEG bytes)
             # We now use the FULL FRAME with a bounding box drawn on it.
@@ -227,6 +229,7 @@ def main():
     # Open File Descriptor 3 (passed from Go) for clean data output
     with os.fdopen(3, 'wb') as out_pipe:
         # Handshake: Signal readiness to Go via the data pipe.
+        sys.stderr.write(f"🐍 Python Worker Started. Strategy: {args.quality_strategy}\n")
         out_pipe.write(b'READY')
         out_pipe.flush()
 

@@ -28,6 +28,7 @@ type Config struct {
 	Debug              bool
 	DetectionThreshold float64
 	ReadTimeout        time.Duration
+	QualityStrategy    string
 }
 
 // NewPythonWorker spawns a new Python process and sets up the IPC pipes (Stdin + Side-channel).
@@ -37,6 +38,9 @@ func NewPythonWorker(ctx context.Context, id int, cfg Config) (*PythonWorker, er
 		args = append(args, "--debug")
 	}
 	args = append(args, "--detection-threshold", fmt.Sprintf("%f", cfg.DetectionThreshold))
+	if cfg.QualityStrategy != "" {
+		args = append(args, "--quality-strategy", cfg.QualityStrategy)
+	}
 	// 1. Initialize the SafeCommand we built
 	py := utils.NewSafeCommand(ctx, "python3", args...)
 

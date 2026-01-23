@@ -46,6 +46,7 @@ func init() {
 	scanCmd.Flags().Float64VarP(&scanOpts.DetectionThreshold, "detection-threshold", "D", 0.5, "Face detection confidence threshold (0.0 - 1.0)")
 
 	scanCmd.Flags().StringVar(&scanOpts.WorkerTimeout, "worker-timeout", "30s", "Timeout for a worker to process a single frame")
+	scanCmd.Flags().StringVar(&scanOpts.QualityStrategy, "quality-strategy", "clarity", "Strategy for calculating face quality (clarity, portrait, confidence)")
 
 	scanCmd.MarkFlagRequired("input")
 	rootCmd.AddCommand(scanCmd)
@@ -253,6 +254,7 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 	cfg := worker.Config{
 		Debug:              opts.DebugScreenshots,
 		DetectionThreshold: opts.DetectionThreshold,
+		QualityStrategy:    opts.QualityStrategy,
 	}
 	readTimeout, err := time.ParseDuration(opts.WorkerTimeout)
 	if err != nil {
@@ -720,6 +722,14 @@ func validateScanFlags(opts *Options) error {
 	}
 	if _, err := time.ParseDuration(opts.WorkerTimeout); err != nil {
 		utils.ShowError("Invalid worker-timeout format (use '30s', '1m')", err, nil)
+		return err
+	}
+	switch opts.QualityStrategy {
+	case "clarity", "portrait", "confidence", "legacy":
+		// Valid
+	default:
+		err := fmt.Errorf("must be one of: clarity, portrait, confidence")
+		utils.ShowError("Invalid quality-strategy", err, nil)
 		return err
 	}
 	return nil
