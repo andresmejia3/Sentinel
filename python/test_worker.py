@@ -83,6 +83,7 @@ class TestWorkerLogic(unittest.TestCase):
         # FIX: Mock math functions used in quality score calculation
         self.mock_np.log.return_value = 1.0
         self.mock_np.sqrt.return_value = 1.0
+        self.mock_np.exp.return_value = 0.5 # Mock for 'clarity' strategy
         self.mock_cv2.Laplacian.return_value.var.return_value = 100.0
         
         # Mock the result of division: (embedding / norm)
@@ -193,6 +194,7 @@ class TestWorkerLogic(unittest.TestCase):
         self.mock_np.linalg.norm.return_value = 1.0
         self.mock_np.log.return_value = 1.0
         self.mock_np.sqrt.return_value = 1.0
+        self.mock_np.exp.return_value = 0.5
         self.mock_cv2.Laplacian.return_value.var.return_value = 100.0
 
         # Mock cv2.imencode: Succeed for the first face, fail for the second

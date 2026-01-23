@@ -42,18 +42,24 @@ var resetCmd = &cobra.Command{
 			}
 		}
 
+		// Determine output base directory
+		outputBase := "data"
+		if _, err := os.Stat("/data"); err == nil {
+			outputBase = "/data"
+		}
+
 		if resetFiles {
 			if confirm(reader, "⚠️  Are you sure you want to delete all thumbnails and output videos?") {
 				fmt.Println("🗑️  Clearing Output Files (Thumbnails, Videos)...")
-				removeDir(filepath.Join("data", "unknown"))
-				removeDir(filepath.Join("data", "output"))
+				removeDir(filepath.Join(outputBase, "unknown"))
+				removeDir(filepath.Join(outputBase, "output"))
 			}
 		}
 
 		if resetDebug {
 			if confirm(reader, "⚠️  Are you sure you want to delete all debug frames?") {
 				fmt.Println("🗑️  Clearing Debug Frames...")
-				removeDir(filepath.Join("data", "debug_frames"))
+				removeDir(filepath.Join(outputBase, "debug_frames"))
 			}
 		}
 

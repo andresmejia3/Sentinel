@@ -92,8 +92,13 @@ def process_frame(image_bytes, debug=False) -> bytes:
                     cv2.rectangle(debug_img, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 0, 255), 3)
                 
                 # Save to /data/debug_frames (mounted volume)
-                os.makedirs("/data/debug_frames", exist_ok=True)
-                cv2.imwrite(f"/data/debug_frames/debug_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}.jpg", debug_img)
+                base_dir = "data"
+                if os.path.exists("/data"):
+                    base_dir = "/data"
+                
+                debug_dir = os.path.join(base_dir, "debug_frames")
+                os.makedirs(debug_dir, exist_ok=True)
+                cv2.imwrite(f"{debug_dir}/debug_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}.jpg", debug_img)
             except Exception as e:
                 sys.stderr.write(f"Debug save failed: {e}\n")
 
@@ -155,9 +160,28 @@ def process_frame(image_bytes, debug=False) -> bytes:
                 sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
 
             # 3. Composite Quality Score
-            # We use log(sharpness) to dampen the effect of extremely textured backgrounds
-            # We use sqrt(area) to prevent massive blurry faces from winning just by size
-            quality = face.det_score * alignment * np.log(max(1.0, sharpness)) * np.sqrt(max(1.0, float(area)))
+            # A/B Testing Strategy:
+            # Change this variable to 'portrait', 'clarity', or 'confidence' to test different metrics.
+            quality_strategy = 'legacy'
+
+            if quality_strategy == 'portrait':
+                # Prioritizes looking at the camera (Alignment^2).
+                # Log-Area reduces the bias towards massive faces.
+                quality = face.det_score * (alignment ** 2) * np.log(max(1.0, sharpness)) * np.log(max(1.0, float(area)))
+
+            elif quality_strategy == 'clarity':
+                # Prioritizes sharpness and caps the size benefit.
+                # 1 - exp(-area/40000) means size score saturates at ~200x200px.
+                # This prevents a huge blurry face from beating a sharp medium face.
+                size_score = 1.0 - np.exp(-float(area) / 40000.0)
+                quality = face.det_score * alignment * np.log(max(1.0, sharpness)) * size_score
+
+            elif quality_strategy == 'confidence':
+                # Prioritizes the AI's detection confidence (good lighting/occlusion).
+                quality = (face.det_score ** 2) * alignment * np.log(max(1.0, sharpness)) * np.log(max(1.0, float(area)))
+            else:
+                # Legacy (Size Biased)
+                quality = face.det_score * alignment * np.log(max(1.0, sharpness)) * np.sqrt(max(1.0, float(area)))
 
             # Prepare thumbnail (Raw JPEG bytes)
             # We now use the FULL FRAME with a bounding box drawn on it.

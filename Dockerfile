@@ -49,6 +49,9 @@ RUN python3 -c "import insightface; insightface.app.FaceAnalysis(providers=['CPU
 # Copy the compiled Go binary from the builder stage
 COPY --from=builder /bin/sentinel /usr/local/bin/sentinel
 
+# Invalidate cache for Python code changes when --build is used
+ARG CACHEBUST=1
+
 # Copy the Python worker scripts
 # The Go app expects "python/worker.py" to exist relative to the working directory
 COPY python/ ./python/

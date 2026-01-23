@@ -356,8 +356,14 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		maxGapFrames = 1 // Ensure at least 1 frame gap to prevent instant closing
 	}
 
+	// Determine output directory base
+	// If /data exists (Docker volume), use it. Otherwise use relative "data" (Local).
+	outputBase := "data"
+	if _, err := os.Stat("/data"); err == nil {
+		outputBase = "/data"
+	}
 	// Optimization: Ensure output directory exists ONCE, not per-track
-	unknownDir := filepath.Join("data", "unknown", videoID)
+	unknownDir := filepath.Join(outputBase, "unknown", videoID)
 	if err := os.MkdirAll(unknownDir, 0755); err != nil {
 		utils.ShowError("Failed to create output directory", err, nil)
 		select {
@@ -366,6 +372,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		}
 		return
 	}
+	// Log the location so the user knows where to look
+	fmt.Fprintf(os.Stderr, "📂 Output Directory: %s\n", unknownDir)
 
 	// Async Thumbnail Writer (Sequential to prevent race conditions)
 	// We use a buffered channel to offload disk I/O without blocking the main loop,
