@@ -1,30 +1,35 @@
 import sys
 import os
+import argparse
 
 # --- Suppress ONNX Runtime Logging (Must be before importing insightface/onnxruntime) ---
 os.environ["ORT_LOGGING_LEVEL"] = "3" # 3 = Error only
 # ----------------------------------------------------------------------------------------
 
-import io
-import json
 import cv2
 import insightface
 import numpy as np
 import struct
 import uuid
 import time
-import base64
-from PIL import Image, ImageDraw
 
 # --- Suppress InsightFace Logging ---
 import logging
 logging.getLogger('insightface').setLevel(logging.ERROR)
 
+# --- Parse CLI Arguments ---
+parser = argparse.ArgumentParser()
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--detection-threshold', type=float, default=0.5, help='Face detection confidence threshold')
+args, _ = parser.parse_known_args()
+
+DETECTION_THRESHOLD = args.detection_threshold
+
 # --- Global InsightFace App Initialization ---
 # This is done once when the worker starts to load the models into memory (and GPU VRAM).
 # We only load detection and recognition models to save VRAM (skipping gender/age/landmarks)
 app = insightface.app.FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'], allowed_modules=['detection', 'recognition'])
-app.prepare(ctx_id=0, det_size=(640, 640))
+app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=DETECTION_THRESHOLD)
 # Warm up the engine with a dummy inference to force CUDA initialization
 # This prevents the "first frame lag" and ensures workers are truly ready.
 app.get(np.zeros((640, 640, 3), dtype=np.uint8))
@@ -42,55 +47,94 @@ def read_exactly(stream, n):
         bytes_read += len(chunk)
     return b''.join(chunks)
 
-def process_frame(image_bytes, debug=False):
+def process_frame(image_bytes, debug=False) -> bytes:
     """
-    Decodes an image and returns a JSON string of face vectors.
-    Isolated for testing purposes.
+    Decodes an image and returns a BINARY payload of face vectors.
+
+    Protocol Definition (Big Endian):
+    -----------------------------------------------------------------------
+    [Envelope Header] (4 Bytes) : Total Length of the following payload
+
+    Payload Structure:
+    [Status] (1 Byte)           : 0x00 = Success, 0x01 = Error
+
+    If Status == 0x00 (Success):
+      [Count] (4 Bytes)         : Number of faces detected (N)
+      
+      For each face (Repeat N times):
+        [Box]     (16 Bytes)    : 4x int32 (x1, y1, x2, y2)
+        [Vector]  (2048 Bytes)  : 512x float32 embeddings
+        [Quality] (4 Bytes)     : 1x float32 quality score
+        [ImgLen]  (4 Bytes)     : Length of the JPEG thumbnail (M)
+        [ImgData] (M Bytes)     : Raw JPEG bytes
+
+    If Status == 0x01 (Error):
+      [MsgLen]  (4 Bytes)       : Length of error message
+      [Message] (N Bytes)       : UTF-8 Error string
+    -----------------------------------------------------------------------
     """
     try:
         # Decode directly to BGR using OpenCV (faster, and native to InsightFace)
         # This avoids the expensive Full-Frame RGB->BGR conversion.
         frame_array = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
         if frame_array is None:
-            return json.dumps({"error": "Image decode failed"})
+            return b'\x01' + struct.pack('>I', 19) + b"Image decode failed" # Status 1 = Error
 
         # InsightFace expects BGR, so we pass it directly
         faces = app.get(frame_array)
 
         if debug and len(faces) > 0:
             try:
-                # Convert BGR to RGB for PIL debug drawing
-                debug_img = Image.fromarray(cv2.cvtColor(frame_array, cv2.COLOR_BGR2RGB))
-                draw = ImageDraw.Draw(debug_img)
+                # Draw directly on the BGR frame using OpenCV
+                debug_img = frame_array.copy()
                 for face in faces:
                     bbox = face.bbox.astype(int)
-                    draw.rectangle(bbox.tolist(), outline="red", width=3)
+                    cv2.rectangle(debug_img, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 0, 255), 3)
                 
                 # Save to /data/debug_frames (mounted volume)
                 os.makedirs("/data/debug_frames", exist_ok=True)
-                debug_img.save(f"/data/debug_frames/debug_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}.jpg")
+                cv2.imwrite(f"/data/debug_frames/debug_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}.jpg", debug_img)
             except Exception as e:
                 sys.stderr.write(f"Debug save failed: {e}\n")
 
-        results = []
+        # --- PRE-FILTER FACES ---
+        # CRITICAL: We must filter faces BEFORE writing the header count.
+        # If we filter inside the loop, we send fewer faces than promised, causing Go to hang.
+        valid_faces = []
+        h_frame, w_frame = frame_array.shape[:2]
+        
         for face in faces:
+            box = face.bbox.astype(int)
+            x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w_frame, box[2]), min(h_frame, box[3])
+            
+            # 1. Filter invalid embeddings (Zero Norm)
+            # This prevents Division-By-Zero and DB corruption (pgvector cosine ops fail on zero vectors)
+            norm = np.linalg.norm(face.embedding)
+            if norm > 1e-6:
+                valid_faces.append((face, x1, y1, x2, y2, norm))
+
+        # Start Response: Status 0 (Success) + Num Faces (4 bytes)
+        response = [b'\x00', struct.pack('>I', len(valid_faces))]
+
+        # OPTIMIZATION: Resize massive frames ONCE, not per-face.
+        # This prevents resizing a 4K/8K image N times if N faces are found.
+        max_dim = 1920
+        scale = 1.0
+        resized_frame = frame_array
+        if max(h_frame, w_frame) > max_dim:
+            scale = max_dim / float(max(h_frame, w_frame))
+            resized_frame = cv2.resize(frame_array, (0, 0), fx=scale, fy=scale)
+
+        for face, x1, y1, x2, y2, norm in valid_faces:
             # Normalize embedding to unit length for Cosine Similarity
-            embedding = face.embedding
-            norm = np.linalg.norm(embedding)
-            if norm > 0:
-                embedding = embedding / norm
+            # We already calculated norm in the filter loop
+            # OPTIMIZATION: Convert to Big-Endian Float32 (>f4) and get raw bytes directly
+            # This avoids the overhead of struct.pack unpacking 512 arguments
+            embedding_bytes = (face.embedding / norm).astype('>f4').tobytes()
 
             # --- Calculate Face Quality Score (ISO/IEC 29794-5 inspired) ---
-            box = face.bbox.astype(int)
-            h, w = frame_array.shape[:2]
-            x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
             area = (x2 - x1) * (y2 - y1)
             
-            # Filter small faces (noise/ghosts)
-            # If a face is smaller than 40x40 pixels, it's likely a false positive or too blurry to be useful.
-            # if (x2 - x1) < 40 or (y2 - y1) < 40:
-            #     continue
-
             # 1. Alignment Score (0.0 - 1.0)
             # Penalize faces that are looking away (side profile)
             alignment = 0.5 # Default fallback
@@ -116,34 +160,42 @@ def process_frame(image_bytes, debug=False):
             # We use sqrt(area) to prevent massive blurry faces from winning just by size
             quality = face.det_score * alignment * np.log(max(1.0, sharpness)) * np.sqrt(max(1.0, float(area)))
 
-            # Encode thumbnail to Base64 (In-Memory)
+            # Prepare thumbnail (Raw JPEG bytes)
             # We now use the FULL FRAME with a bounding box drawn on it.
-            thumb_img = frame_array.copy()
-            # Draw Green Box (0, 255, 0) with thickness 2
-            cv2.rectangle(thumb_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            thumb_img = resized_frame.copy()
             
-            # Convert BGR to RGB for PIL/JPEG encoding
-            thumb_rgb = cv2.cvtColor(thumb_img, cv2.COLOR_BGR2RGB)
-            face_img = Image.fromarray(thumb_rgb)
-            mem_file = io.BytesIO()
-            face_img.save(mem_file, format="JPEG", quality=85)
-            thumb_b64 = base64.b64encode(mem_file.getvalue()).decode('utf-8')
+            # Calculate scaled coordinates for drawing
+            draw_x1, draw_y1, draw_x2, draw_y2 = int(x1*scale), int(y1*scale), int(x2*scale), int(y2*scale)
 
-            results.append({
-                "loc": face.bbox.astype(int).tolist(), # Bounding box
-                "vec": embedding.tolist(),        # 512-d vector
-                "thumb_b64": thumb_b64,
-                "quality": float(quality)
-            })
-        return json.dumps(results)
+            # Draw Green Box (0, 255, 0) with thickness 2
+            cv2.rectangle(thumb_img, (draw_x1, draw_y1), (draw_x2, draw_y2), (0, 255, 0), 2)
+            
+            # Encode directly using OpenCV (Faster, no PIL overhead)
+            success, encoded_img = cv2.imencode('.jpg', thumb_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if not success:
+                continue # Skip this face if encoding fails
+            thumb_bytes = encoded_img.tobytes()
+
+            # Pack Binary Data
+            # >4i = 4 integers (x1, y1, x2, y2) -> 16 bytes
+            # >512f = 512 floats (embedding) -> 2048 bytes
+            # >f = 1 float (quality) -> 4 bytes
+            # >I = 1 uint (image length) -> 4 bytes
+            response.append(struct.pack('>4i', x1, y1, x2, y2))
+            response.append(embedding_bytes)
+            response.append(struct.pack('>f', float(quality)))
+            response.append(struct.pack('>I', len(thumb_bytes)))
+            response.append(thumb_bytes)
+
+        return b''.join(response)
+
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        err_msg = str(e).encode('utf-8')
+        return b'\x01' + struct.pack('>I', len(err_msg)) + err_msg
 
 def main():
     """Main loop for the Python Inference Worker."""
     # Stdout is now free for human-readable logs.
-
-    debug_mode = "--debug" in sys.argv
 
     # Open File Descriptor 3 (passed from Go) for clean data output
     with os.fdopen(3, 'wb') as out_pipe:
@@ -164,14 +216,13 @@ def main():
             if len(image_bytes) != frame_size:
                 break
 
-            response_data = process_frame(image_bytes, debug=debug_mode)
+            response_data = process_frame(image_bytes, debug=args.debug)
 
             # 6. Strict Output Protocol
-            resp_bytes = response_data.encode('utf-8')
             # Write 4-byte BigEndian length
-            out_pipe.write(struct.pack('>I', len(resp_bytes)))
+            out_pipe.write(struct.pack('>I', len(response_data)))
             # Write payload
-            out_pipe.write(resp_bytes)
+            out_pipe.write(response_data)
             out_pipe.flush()
 
 if __name__ == "__main__":

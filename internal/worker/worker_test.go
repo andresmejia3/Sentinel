@@ -23,8 +23,26 @@ func TestProcessFrame(t *testing.T) {
 	dataPipeMock := &MockCloser{Buffer: new(bytes.Buffer)}
 
 	// 2. Pre-fill dataPipeMock with a fake response from "Python"
-	// We simulate the protocol: [4-byte Length Header] + [JSON Payload]
-	fakePayload := []byte(`[{"loc": [10,10,20,20], "vec": [0.1, 0.2, 0.3, 0.4]}]`)
+	// Protocol: [Status:0] [NumFaces:1] [Box] [Vec] [Qual] [ImgLen] [Img]
+
+	payload := new(bytes.Buffer)
+	payload.WriteByte(0)                               // Status OK
+	binary.Write(payload, binary.BigEndian, uint32(1)) // 1 Face
+
+	// Face Data
+	binary.Write(payload, binary.BigEndian, [4]int32{10, 10, 20, 20}) // Box
+
+	vec := [512]float32{}
+	vec[0] = 0.5                                 // Set one value to verify
+	binary.Write(payload, binary.BigEndian, vec) // Vec
+
+	binary.Write(payload, binary.BigEndian, float32(0.99)) // Quality
+
+	imgData := []byte{0xCA, 0xFE}
+	binary.Write(payload, binary.BigEndian, uint32(len(imgData))) // ImgLen
+	payload.Write(imgData)                                        // ImgData
+
+	fakePayload := payload.Bytes()
 
 	// Write the length header (Big Endian uint32)
 	binary.Write(dataPipeMock, binary.BigEndian, uint32(len(fakePayload)))
@@ -56,7 +74,10 @@ func TestProcessFrame(t *testing.T) {
 	}
 
 	// Verify Go read the correct data FROM Python
-	if !bytes.Equal(resp, fakePayload) {
-		t.Errorf("Expected response %s, got %s", fakePayload, resp)
+	if len(resp) != 1 {
+		t.Fatalf("Expected 1 face, got %d", len(resp))
+	}
+	if resp[0].Vec[0] != 0.5 {
+		t.Errorf("Expected vector[0] == 0.5, got %f", resp[0].Vec[0])
 	}
 }

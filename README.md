@@ -133,8 +133,8 @@ We employ a **Mock-Heavy** testing approach to ensure CI speed and reliability:
 
 **Index a Video:**
 ```bash
-# Note: The current directory is mounted to /data inside the container
-./sentinel scan -i /data/security_footage.mp4
+# Local files are automatically mapped into the container
+./sentinel scan -i security_footage.mp4
 ```
 
 **Search for a Person:**

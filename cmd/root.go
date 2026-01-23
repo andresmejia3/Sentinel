@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/andresmejia3/sentinel/internal/store"
 	"github.com/spf13/cobra"
@@ -11,16 +13,18 @@ import (
 
 // Options holds shared configuration for scan, find, and redact commands
 type Options struct {
-	InputPath        string
-	NthFrame         int
-	NumEngines       int
-	GracePeriod      string
-	Linger           string
-	MatchThreshold   float64
-	DisableSafetyNet bool
-	BlurStrength     int
-	BlipDuration     string
-	DebugScreenshots bool
+	InputPath          string
+	NthFrame           int
+	NumEngines         int
+	GracePeriod        string
+	Linger             string
+	MatchThreshold     float64
+	DisableSafetyNet   bool
+	BlurStrength       int
+	BlipDuration       string
+	DebugScreenshots   bool
+	DetectionThreshold float64
+	WorkerTimeout      string
 }
 
 var (
@@ -57,8 +61,8 @@ var rootCmd = &cobra.Command{
 
 		// Initialize DB connection
 		var err error
-		// We use a background context for the connection
-		DB, err = store.New(context.Background(), dbURL)
+		// Use the command's context (which will be cancellable) for the connection
+		DB, err = store.New(cmd.Context(), dbURL)
 		if err != nil {
 			return fmt.Errorf("failed to connect to database: %w", err)
 		}
@@ -66,16 +70,22 @@ var rootCmd = &cobra.Command{
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
 		if DB != nil {
+			// Use Background here because the main context might be cancelled already (due to Ctrl+C)
+			// and we still need to send the "Close" command to the DB.
 			DB.Close(context.Background())
 		}
 	},
 }
 
 func Execute() {
+	// Create a context that listens for Ctrl+C (SIGINT) or Kill (SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// This tells Cobra not to print the version in the help text, which is cleaner.
 	rootCmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
 
-	if err := rootCmd.Execute(); err != nil {
+	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

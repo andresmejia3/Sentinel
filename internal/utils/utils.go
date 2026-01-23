@@ -2,6 +2,7 @@ package utils
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -25,17 +26,17 @@ type SafeCommand struct {
 
 // NewSafeCommand initializes a command and attaches a buffer to its Stderr pipe
 // It prepares the command for execution but does not start it.
-func NewSafeCommand(name string, args ...string) *SafeCommand {
-	cmd := exec.Command(name, args...)
+func NewSafeCommand(ctx context.Context, name string, args ...string) *SafeCommand {
+	cmd := exec.CommandContext(ctx, name, args...)
 	stderr := &bytes.Buffer{}
 	cmd.Stdout = os.Stdout // Forward stdout for live logging (if Python prints anything)
 	// The caller is responsible for assigning cmd.Stderr.
 	return &SafeCommand{Cmd: cmd, Stderr: stderr}
 }
 
-// Die is the unified exit strategy for Sentinel.
-// It prints a formatted error box and dumps Python logs if a SafeCommand is provided.
-func Die(context string, err error, s *SafeCommand) {
+// ShowError prints the formatted error box but DOES NOT exit the program.
+// Use this when you want to return an error to main() for graceful shutdown.
+func ShowError(context string, err error, s *SafeCommand) {
 	fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
 	fmt.Fprintf(os.Stderr, "🚨 SENTINEL ERROR: %s\n", context)
 	if err != nil {
@@ -61,7 +62,6 @@ func Die(context string, err error, s *SafeCommand) {
 		fmt.Fprintf(os.Stderr, "\nPYTHON CRASH LOGS:\n%s\n", s.Stderr.String())
 	}
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
-	os.Exit(1)
 }
 
 // --- 2. Video Engine (Shared by Scan & Redact) ---
@@ -73,7 +73,7 @@ var (
 
 // GetTotalFrames uses ffprobe to count packets for the progress bar
 // It returns 0 if the count fails, allowing the scanner to fallback to a spinner.
-func GetTotalFrames(path string) int {
+func GetTotalFrames(ctx context.Context, path string) int {
 	// 0. Check dependency
 	if _, err := exec.LookPath("ffprobe"); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠️  ffprobe not found. Cannot provide a progress bar estimation because of this.\n")
@@ -90,7 +90,7 @@ func GetTotalFrames(path string) int {
 
 	// 1. Fast Path: Check Container Metadata
 	// This is instant but might return "N/A" or be inaccurate for VFR.
-	cmdFast := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames", "-of", "json", path)
+	cmdFast := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames", "-of", "json", path)
 	if out, err := cmdFast.Output(); err == nil {
 		var res ffprobeOutput
 		if json.Unmarshal(out, &res) == nil && len(res.Streams) > 0 {
@@ -100,34 +100,11 @@ func GetTotalFrames(path string) int {
 		}
 	}
 
-	// 2. Slow Path: Count Packets (Fallback)
-	fmt.Fprintf(os.Stderr, "⏳ Metadata missing. Counting frames (this may take a moment)...\n")
-	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
-		"-show_entries", "stream=nb_read_packets", "-of", "json", path)
-
-	cmd.Stderr = os.Stderr
-	out, err := cmd.Output()
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ffprobe failed: %v\n", err)
-		return 0
-	}
-
-	var res ffprobeOutput
-	if err := json.Unmarshal(out, &res); err != nil {
-		fmt.Fprintf(os.Stderr, "ffprobe JSON parse error: %v\n", err)
-		return 0
-	}
-	if len(res.Streams) == 0 {
-		return 0
-	}
-
-	count, err := strconv.Atoi(res.Streams[0].NbReadPackets)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ffprobe integer parse error: %v\n", err)
-		return 0
-	}
-	return count
+	// Optimization: Skip the slow packet count.
+	// Reading the entire file to count packets delays startup significantly for large videos.
+	// We return 0 to signal "Unknown Total", which causes the progress bar to use a spinner.
+	fmt.Fprintf(os.Stderr, "⚠️  Video metadata missing frame count. Defaulting to spinner...\n")
+	return 0
 }
 
 // SplitJpeg is the custom splitter for bufio.Scanner
@@ -149,10 +126,10 @@ func SplitJpeg(data []byte, atEOF bool) (advance int, token []byte, err error) {
 
 // NewFFmpegCmd creates a standard decoder pipe
 // It configures FFmpeg to output raw MJPEG frames to Stdout for ingestion.
-func NewFFmpegCmd(inputPath string) *exec.Cmd {
+func NewFFmpegCmd(ctx context.Context, inputPath string) *exec.Cmd {
 	// Using -vcodec mjpeg ensures we get JPEGs Go can split
 	// Added -hide_banner and -loglevel error to prevent memory bloat in stderr buffer
-	return exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-i", inputPath, "-f", "image2pipe", "-vcodec", "mjpeg", "-")
+	return exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", inputPath, "-f", "image2pipe", "-vcodec", "mjpeg", "-")
 }
 
 // GenerateVideoID creates a deterministic hash for the video file
@@ -197,12 +174,12 @@ func GenerateVideoID(path string) (string, error) {
 }
 
 // GetVideoFPS returns the average frame rate of the video.
-func GetVideoFPS(path string) (float64, error) {
+func GetVideoFPS(ctx context.Context, path string) (float64, error) {
 	if _, err := exec.LookPath("ffprobe"); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠️  ffprobe not found. It is required for processing.\n")
 		return 0, err
 	}
-	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", path)
+	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", path)
 	out, err := cmd.Output()
 	if err != nil {
 		return 0, err

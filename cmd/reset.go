@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/andresmejia3/sentinel/internal/utils"
@@ -20,7 +21,8 @@ var resetCmd = &cobra.Command{
 	Use:   "reset",
 	Short: "Reset system state (Database, Thumbnails, Debug Frames)",
 	Long:  "Clears all data. By default, it resets everything. Use flags to clear specific components.",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cmd.SilenceUsage = true
 		// If no flags are set, default to clearing EVERYTHING
 		if !resetDB && !resetFiles && !resetDebug {
 			resetDB = true
@@ -34,7 +36,8 @@ var resetCmd = &cobra.Command{
 			if confirm(reader, "⚠️  Are you sure you want to DROP all database tables?") {
 				fmt.Println("🗑️  Clearing Database...")
 				if err := DB.Reset(cmd.Context()); err != nil {
-					utils.Die("Failed to reset database", err, nil)
+					utils.ShowError("Failed to reset database", err, nil)
+					return err
 				}
 			}
 		}
@@ -42,19 +45,20 @@ var resetCmd = &cobra.Command{
 		if resetFiles {
 			if confirm(reader, "⚠️  Are you sure you want to delete all thumbnails and output videos?") {
 				fmt.Println("🗑️  Clearing Output Files (Thumbnails, Videos)...")
-				removeDir("/data/thumbnails")
-				removeDir("/data/output")
+				removeDir(filepath.Join("data", "unknown"))
+				removeDir(filepath.Join("data", "output"))
 			}
 		}
 
 		if resetDebug {
 			if confirm(reader, "⚠️  Are you sure you want to delete all debug frames?") {
 				fmt.Println("🗑️  Clearing Debug Frames...")
-				removeDir("/data/debug_frames")
+				removeDir(filepath.Join("data", "debug_frames"))
 			}
 		}
 
 		fmt.Println("✨ System Reset Complete.")
+		return nil
 	},
 }
 
