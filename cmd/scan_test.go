@@ -167,6 +167,7 @@ func TestValidateScanFlags(t *testing.T) {
 				MatchThreshold: 0.5,
 				GracePeriod:    "1s",
 				WorkerTimeout:  "30s",
+				QualityStrategy: "clarity",
 			},
 			wantErr: false,
 		},
