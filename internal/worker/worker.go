@@ -128,7 +128,7 @@ func (w *PythonWorker) ProcessFrame(data []byte) ([]types.FaceResult, error) {
 	// Read Result
 	// Now we read from our clean DataPipe, so no Magic Byte is needed.
 	// Set a deadline to prevent hanging forever if Python freezes.
-	if f, ok := w.DataPipe.(*os.File); ok {
+	if f, ok := w.DataPipe.(*os.File); ok && w.readTimeout > 0 {
 		f.SetReadDeadline(time.Now().Add(w.readTimeout))
 		defer f.SetReadDeadline(time.Time{})
 	}

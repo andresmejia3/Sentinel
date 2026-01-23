@@ -247,3 +247,37 @@ func (s *Store) ListIdentities(ctx context.Context) ([]IdentityMetadata, error) 
 	}
 	return results, nil
 }
+
+// IntervalResult holds metadata about a specific appearance of an identity in a video.
+type IntervalResult struct {
+	VideoID   string
+	VideoPath string
+	Start     float64
+	End       float64
+}
+
+// GetIdentityIntervals retrieves all time intervals for a specific identity ID.
+func (s *Store) GetIdentityIntervals(ctx context.Context, identityID int) ([]IntervalResult, error) {
+	query := `
+		SELECT f.video_id, v.path, f.start_time, f.end_time
+		FROM face_intervals f
+		JOIN video_metadata v ON f.video_id = v.id
+		WHERE f.known_identity_id = $1
+		ORDER BY v.path, f.start_time
+	`
+	rows, err := s.pool.Query(ctx, query, identityID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []IntervalResult
+	for rows.Next() {
+		var r IntervalResult
+		if err := rows.Scan(&r.VideoID, &r.VideoPath, &r.Start, &r.End); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, nil
+}
