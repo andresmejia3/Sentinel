@@ -103,20 +103,27 @@ func TestStoreIntegration(t *testing.T) {
 		t.Fatalf("UpdateIdentity failed: %v", err)
 	}
 
-	// Verify the update by checking if the new vector is "between" A and B
-	// We can't easily fetch the vector directly without adding a GetIdentity method,
-	// so we verify by searching with the expected average vector.
-	vecAvg := make([]float64, 512)
-	vecAvg[0] = 0.5
-	vecAvg[1] = 0.5
-	// Normalize for search (FindClosestIdentity expects normalized input usually, but pgvector handles unnormalized too)
-	// But let's just search. The distance from Avg to Avg is 0.
-	foundID, _, err := s.FindClosestIdentity(ctx, vecAvg, 0.01)
+	// Verify the update directly by fetching the vector
+	vectors, err := s.GetIdentityVectors(ctx, []int{idA})
 	if err != nil {
-		t.Fatalf("FindClosestIdentity (after update) failed: %v", err)
+		t.Fatalf("GetIdentityVectors failed: %v", err)
 	}
-	if foundID != idA {
-		t.Errorf("Expected to find updated identity %d, got %d", idA, foundID)
+	updatedVec, ok := vectors[idA]
+	if !ok {
+		t.Fatalf("Updated vector for ID %d not found", idA)
+	}
+
+	// Check the math
+	// Expected average is [0.5, 0.5, 0.0, ...]
+	if len(updatedVec) != 512 {
+		t.Fatalf("Expected vector of length 512, got %d", len(updatedVec))
+	}
+	epsilon := 1e-6
+	if updatedVec[0] < 0.5-epsilon || updatedVec[0] > 0.5+epsilon {
+		t.Errorf("Expected updatedVec[0] to be ~0.5, got %f", updatedVec[0])
+	}
+	if updatedVec[1] < 0.5-epsilon || updatedVec[1] > 0.5+epsilon {
+		t.Errorf("Expected updatedVec[1] to be ~0.5, got %f", updatedVec[1])
 	}
 
 	// E. Insert Interval
