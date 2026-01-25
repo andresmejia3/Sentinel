@@ -51,16 +51,18 @@ func TestProcessFrame(t *testing.T) {
 	dataPipeMock.Write(fakePayload)
 
 	// 3. Create Worker with mocks injected
-	w := &PythonWorker{
-		ID:       1,
-		Stdin:    stdinMock,
-		DataPipe: dataPipeMock,
-		// Cmd is nil because we aren't testing process management, just the protocol
+	// We manually construct ScanWorker since we are bypassing the constructor to inject mocks
+	w := &ScanWorker{
+		baseWorker: &baseWorker{
+			ID:       1,
+			Stdin:    stdinMock,
+			DataPipe: dataPipeMock,
+		},
 	}
 
 	// 4. Execute the function under test
 	inputFrame := []byte{0xDE, 0xAD, 0xBE, 0xEF} // Fake image bytes
-	resp, err := w.ProcessFrame(inputFrame)
+	resp, err := w.ProcessScanFrame(inputFrame)
 	if err != nil {
 		t.Fatalf("ProcessFrame failed: %v", err)
 	}
@@ -106,14 +108,16 @@ func TestProcessFrame_Error(t *testing.T) {
 	dataPipeMock.Write(fakePayload)
 
 	// 3. Create Worker
-	w := &PythonWorker{
-		ID:       1,
-		Stdin:    stdinMock,
-		DataPipe: dataPipeMock,
+	w := &ScanWorker{
+		baseWorker: &baseWorker{
+			ID:       1,
+			Stdin:    stdinMock,
+			DataPipe: dataPipeMock,
+		},
 	}
 
 	// 4. Execute
-	_, err := w.ProcessFrame([]byte("frame"))
+	_, err := w.ProcessScanFrame([]byte("frame"))
 
 	// 5. Assertions
 	if err == nil {

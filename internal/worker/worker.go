@@ -13,8 +13,8 @@ import (
 	"github.com/andresmejia3/sentinel/internal/utils" // Using the SafeCommand wrapper
 )
 
-// PythonWorker manages the external Python process for neural inference.
-type PythonWorker struct {
+// baseWorker manages the common external Python process logic (pipes, handshake).
+type baseWorker struct {
 	ID          int
 	Cmd         *utils.SafeCommand
 	Stdin       io.WriteCloser
@@ -23,26 +23,40 @@ type PythonWorker struct {
 	readTimeout time.Duration
 }
 
-// Config holds the configuration for the Python worker process.
-type Config struct {
+// ScanWorker is a worker specialized for indexing (thumbnails, quality scores).
+type ScanWorker struct {
+	*baseWorker
+}
+
+// RedactWorker is a worker specialized for redaction (optimized protocol, no thumbnails).
+type RedactWorker struct {
+	*baseWorker
+}
+
+// ScanConfig holds configuration for the ScanWorker.
+type ScanConfig struct {
 	Debug              bool
 	DetectionThreshold float64
 	ReadTimeout        time.Duration
 	QualityStrategy    string
 }
 
-// NewPythonWorker spawns a new Python process and sets up the IPC pipes (Stdin + Side-channel).
-func NewPythonWorker(ctx context.Context, id int, cfg Config) (*PythonWorker, error) {
-	args := []string{"-u", "python/worker.py"}
-	if cfg.Debug {
-		args = append(args, "--debug")
-	}
-	args = append(args, "--detection-threshold", fmt.Sprintf("%f", cfg.DetectionThreshold))
-	if cfg.QualityStrategy != "" {
-		args = append(args, "--quality-strategy", cfg.QualityStrategy)
-	}
+// RedactConfig holds configuration for the RedactWorker.
+type RedactConfig struct {
+	Debug              bool
+	DetectionThreshold float64
+	ReadTimeout        time.Duration
+	InferenceMode      string // "full" or "detection-only"
+	RawWidth           int    // If > 0, input is raw RGBA
+	RawHeight          int
+}
+
+// newBaseWorker spawns a Python process and sets up the IPC pipes.
+func newBaseWorker(ctx context.Context, id int, script string, args []string, readTimeout time.Duration) (*baseWorker, error) {
+	fullArgs := append([]string{"-u", script}, args...)
+
 	// 1. Initialize the SafeCommand we built
-	py := utils.NewSafeCommand(ctx, "python3", args...)
+	py := utils.NewSafeCommand(ctx, "python3", fullArgs...)
 
 	// Create a side-channel pipe (FD 3) for clean data transfer
 	r, w, err := os.Pipe()
@@ -100,39 +114,77 @@ func NewPythonWorker(ctx context.Context, id int, cfg Config) (*PythonWorker, er
 		return nil, fmt.Errorf("worker %d handshake cancelled: %w", id, ctx.Err())
 	}
 
-	return &PythonWorker{
+	return &baseWorker{
 		ID:          id,
 		Cmd:         py,
 		Stdin:       stdin,
 		DataPipe:    r,
 		readBuf:     make([]byte, 0, 64*1024), // Pre-allocate 64KB to minimize initial resizing
-		readTimeout: cfg.ReadTimeout,
+		readTimeout: readTimeout,
 	}, nil
 }
 
-// ProcessFrame sends a frame to the worker via Stdin and waits for the JSON response via the DataPipe.
-// It handles the binary protocol: [4-byte Length][Payload].
-func (w *PythonWorker) ProcessFrame(data []byte) ([]types.FaceResult, error) {
-	// Protocol: [Length][Data]
-	// We perform two writes to avoid allocating a massive buffer just to prepend 4 bytes.
-	// The syscall overhead is negligible compared to the memory allocation/copy cost.
+// NewPythonScanWorker creates a worker using python/scan_worker.py
+func NewPythonScanWorker(ctx context.Context, id int, cfg ScanConfig) (*ScanWorker, error) {
+	args := []string{}
+	if cfg.Debug {
+		args = append(args, "--debug")
+	}
+	args = append(args, "--detection-threshold", fmt.Sprintf("%f", cfg.DetectionThreshold))
+	if cfg.QualityStrategy != "" {
+		args = append(args, "--quality-strategy", cfg.QualityStrategy)
+	}
+
+	base, err := newBaseWorker(ctx, id, "python/scan_worker.py", args, cfg.ReadTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return &ScanWorker{baseWorker: base}, nil
+}
+
+// NewPythonRedactWorker creates a worker using python/redact_worker.py
+func NewPythonRedactWorker(ctx context.Context, id int, cfg RedactConfig) (*RedactWorker, error) {
+	args := []string{}
+	if cfg.Debug {
+		args = append(args, "--debug")
+	}
+	args = append(args, "--detection-threshold", fmt.Sprintf("%f", cfg.DetectionThreshold))
+	if cfg.InferenceMode != "" {
+		args = append(args, "--inference-mode", cfg.InferenceMode)
+	}
+	if cfg.RawWidth > 0 && cfg.RawHeight > 0 {
+		args = append(args, "--raw-width", fmt.Sprintf("%d", cfg.RawWidth))
+		args = append(args, "--raw-height", fmt.Sprintf("%d", cfg.RawHeight))
+	}
+
+	base, err := newBaseWorker(ctx, id, "python/redact_worker.py", args, cfg.ReadTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return &RedactWorker{baseWorker: base}, nil
+}
+
+// sendFrame writes the frame data to the worker's stdin with a length header.
+func (w *baseWorker) sendFrame(data []byte) error {
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(data)))
 	if _, err := w.Stdin.Write(header[:]); err != nil {
-		return nil, err
+		return err
 	}
 	if _, err := w.Stdin.Write(data); err != nil {
-		return nil, err
+		return err
 	}
+	return nil
+}
 
-	// Read Result
-	// Now we read from our clean DataPipe, so no Magic Byte is needed.
-	// Set a deadline to prevent hanging forever if Python freezes.
+// readResponse reads the length-prefixed response from the worker.
+func (w *baseWorker) readResponse() ([]byte, error) {
 	if f, ok := w.DataPipe.(*os.File); ok && w.readTimeout > 0 {
 		f.SetReadDeadline(time.Now().Add(w.readTimeout))
 		defer f.SetReadDeadline(time.Time{})
 	}
 
+	var header [4]byte
 	if _, err := io.ReadFull(w.DataPipe, header[:]); err != nil {
 		return nil, err // This is where we catch the "ModuleNotFoundError" crash
 	}
@@ -167,27 +219,39 @@ func (w *PythonWorker) ProcessFrame(data []byte) ([]types.FaceResult, error) {
 		return nil, err
 	}
 
+	return w.readBuf, nil
+}
+
+// ProcessScanFrame handles the full protocol: [Box][Vec][Qual][ImgLen][Img]
+func (w *ScanWorker) ProcessScanFrame(data []byte) ([]types.FaceResult, error) {
+	if err := w.sendFrame(data); err != nil {
+		return nil, err
+	}
+
+	resp, err := w.readResponse()
+	if err != nil {
+		return nil, err
+	}
+
 	// --- Parse Binary Payload ---
-	// We use a cursor and direct slice access to avoid the overhead of bytes.Reader and binary.Read (reflection)
 	cursor := 0
 
 	// 1. Status Byte
-	status := w.readBuf[cursor]
+	status := resp[cursor]
 	cursor++
 
 	if status == 1 { // Error from Python
-		msgLen := binary.BigEndian.Uint32(w.readBuf[cursor:])
+		msgLen := binary.BigEndian.Uint32(resp[cursor:])
 		cursor += 4
-
 		if msgLen > 1<<20 { // Safety check: Max 1MB error message
 			return nil, fmt.Errorf("python worker returned oversized error message: %d bytes", msgLen)
 		}
-		msg := w.readBuf[cursor : cursor+int(msgLen)]
+		msg := resp[cursor : cursor+int(msgLen)]
 		return nil, fmt.Errorf("python worker error: %s", string(msg))
 	}
 
 	// 2. Num Faces
-	numFaces := binary.BigEndian.Uint32(w.readBuf[cursor:])
+	numFaces := binary.BigEndian.Uint32(resp[cursor:])
 	cursor += 4
 
 	results := make([]types.FaceResult, numFaces)
@@ -199,33 +263,33 @@ func (w *PythonWorker) ProcessFrame(data []byte) ([]types.FaceResult, error) {
 
 	for i := 0; i < int(numFaces); i++ {
 		// [Box: 16B]
-		x1 := int32(binary.BigEndian.Uint32(w.readBuf[cursor:]))
-		y1 := int32(binary.BigEndian.Uint32(w.readBuf[cursor+4:]))
-		x2 := int32(binary.BigEndian.Uint32(w.readBuf[cursor+8:]))
-		y2 := int32(binary.BigEndian.Uint32(w.readBuf[cursor+12:]))
+		x1 := int32(binary.BigEndian.Uint32(resp[cursor:]))
+		y1 := int32(binary.BigEndian.Uint32(resp[cursor+4:]))
+		x2 := int32(binary.BigEndian.Uint32(resp[cursor+8:]))
+		y2 := int32(binary.BigEndian.Uint32(resp[cursor+12:]))
 		cursor += 16
 
 		// [Vec: 2048B]
 		// Slice from our pre-allocated backing array
 		vec64 := allVecs[i*512 : (i+1)*512]
 		for j := 0; j < 512; j++ {
-			bits := binary.BigEndian.Uint32(w.readBuf[cursor:])
+			bits := binary.BigEndian.Uint32(resp[cursor:])
 			vec64[j] = float64(math.Float32frombits(bits))
 			cursor += 4
 		}
 
 		// [Quality: 4B]
-		qualityBits := binary.BigEndian.Uint32(w.readBuf[cursor:])
+		qualityBits := binary.BigEndian.Uint32(resp[cursor:])
 		quality := math.Float32frombits(qualityBits)
 		cursor += 4
 
 		// [ImgLen: 4B] + [ImgData]
-		imgLen := binary.BigEndian.Uint32(w.readBuf[cursor:])
+		imgLen := binary.BigEndian.Uint32(resp[cursor:])
 		cursor += 4
 
 		// Copy image data to a new slice to prevent corruption when readBuf is reused
 		imgData := make([]byte, imgLen)
-		copy(imgData, w.readBuf[cursor:cursor+int(imgLen)])
+		copy(imgData, resp[cursor:cursor+int(imgLen)])
 		cursor += int(imgLen)
 
 		results[i] = types.FaceResult{
@@ -239,8 +303,70 @@ func (w *PythonWorker) ProcessFrame(data []byte) ([]types.FaceResult, error) {
 	return results, nil
 }
 
+// ProcessRedactFrame handles the optimized protocol: [Box][Vec]
+func (w *RedactWorker) ProcessRedactFrame(data []byte) ([]types.FaceResult, error) {
+	if err := w.sendFrame(data); err != nil {
+		return nil, err
+	}
+
+	resp, err := w.readResponse()
+	if err != nil {
+		return nil, err
+	}
+
+	cursor := 0
+
+	// 1. Status Byte
+	status := resp[cursor]
+	cursor++
+
+	if status == 1 {
+		msgLen := binary.BigEndian.Uint32(resp[cursor:])
+		cursor += 4
+		if msgLen > 1<<20 {
+			return nil, fmt.Errorf("python worker returned oversized error message: %d bytes", msgLen)
+		}
+		msg := resp[cursor : cursor+int(msgLen)]
+		return nil, fmt.Errorf("python worker error: %s", string(msg))
+	}
+
+	// 2. Num Faces
+	numFaces := binary.BigEndian.Uint32(resp[cursor:])
+	cursor += 4
+
+	results := make([]types.FaceResult, numFaces)
+	allVecs := make([]float64, int(numFaces)*512)
+
+	for i := 0; i < int(numFaces); i++ {
+		// [Box: 16B]
+		x1 := int32(binary.BigEndian.Uint32(resp[cursor:]))
+		y1 := int32(binary.BigEndian.Uint32(resp[cursor+4:]))
+		x2 := int32(binary.BigEndian.Uint32(resp[cursor+8:]))
+		y2 := int32(binary.BigEndian.Uint32(resp[cursor+12:]))
+		cursor += 16
+
+		// [Vec: 2048B]
+		vec64 := allVecs[i*512 : (i+1)*512]
+		for j := 0; j < 512; j++ {
+			bits := binary.BigEndian.Uint32(resp[cursor:])
+			vec64[j] = float64(math.Float32frombits(bits))
+			cursor += 4
+		}
+
+		// No Quality, No Thumb
+		results[i] = types.FaceResult{
+			Loc:     []int{int(x1), int(y1), int(x2), int(y2)},
+			Vec:     vec64,
+			Quality: 0,
+			Thumb:   nil,
+		}
+	}
+
+	return results, nil
+}
+
 // Close cleans up the worker resources, closing pipes and waiting for the process to exit.
-func (w *PythonWorker) Close() {
+func (w *baseWorker) Close() {
 	w.Stdin.Close()
 	w.DataPipe.Close()
 	w.Cmd.Wait()

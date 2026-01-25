@@ -251,7 +251,7 @@ type scanResult struct {
 // startWorker manages the lifecycle of a single Python worker process.
 // It reads tasks from the channel, sends them to Python, and persists the results to the DB.
 func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, results chan<- scanResult, ready chan<- bool, opts Options, errChan chan<- error) {
-	cfg := worker.Config{
+	cfg := worker.ScanConfig{
 		Debug:              opts.DebugScreenshots,
 		DetectionThreshold: opts.DetectionThreshold,
 		QualityStrategy:    opts.QualityStrategy,
@@ -262,7 +262,7 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 		readTimeout = 30 * time.Second
 	}
 	cfg.ReadTimeout = readTimeout
-	worker, err := worker.NewPythonWorker(ctx, id, cfg)
+	worker, err := worker.NewPythonScanWorker(ctx, id, cfg)
 	if err != nil {
 		utils.ShowError("Worker startup failed", err, nil)
 		select {
@@ -284,7 +284,7 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 			if !ok {
 				return
 			}
-			faces, err := worker.ProcessFrame(task.Data)
+			faces, err := worker.ProcessScanFrame(task.Data)
 
 			// Return buffer to pool immediately after sending
 			frameBufferPool.Put(task.Data)

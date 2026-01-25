@@ -41,14 +41,14 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 
 	// 2. Start AI Worker
 	fmt.Fprintln(os.Stderr, "🚀 Starting AI Engine...")
-	cfg := worker.Config{
+	cfg := worker.ScanConfig{
 		Debug:              opts.DebugScreenshots,
 		DetectionThreshold: opts.DetectionThreshold,
 		ReadTimeout:        60 * time.Second,
 	}
 
 	// We use ID 0 for this ad-hoc worker
-	w, err := worker.NewPythonWorker(ctx, 0, cfg)
+	w, err := worker.NewPythonScanWorker(ctx, 0, cfg)
 	if err != nil {
 		utils.ShowError("Failed to start AI worker", err, nil)
 		return err
@@ -64,7 +64,7 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 
 	// 4. Process Frame
 	fmt.Fprintln(os.Stderr, "🔍 Analyzing face...")
-	faces, err := w.ProcessFrame(imgData)
+	faces, err := w.ProcessScanFrame(imgData)
 	if err != nil {
 		utils.ShowError("AI processing failed", err, w.Cmd)
 		return err

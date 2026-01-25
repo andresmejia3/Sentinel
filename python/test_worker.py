@@ -32,15 +32,15 @@ class TestWorkerLogic(unittest.TestCase):
         self.mock_app_instance = MagicMock()
         self.mock_insightface.app.FaceAnalysis.return_value = self.mock_app_instance
 
-        # Since we clean up in tearDown, we can simply import fresh every time.
-        self.worker = importlib.import_module('worker')
+        # FIX: Import 'scan_worker' instead of the unused 'worker.py'
+        self.worker = importlib.import_module('scan_worker')
 
     def tearDown(self):
         # Stop patching to clean up
         self.modules_patcher.stop()
         # Remove worker from sys.modules so it doesn't pollute other tests
-        if 'worker' in sys.modules:
-            del sys.modules['worker']
+        if 'scan_worker' in sys.modules:
+            del sys.modules['scan_worker']
 
     def test_process_frame_success(self):
         """Test that valid image data returns correct JSON structure."""

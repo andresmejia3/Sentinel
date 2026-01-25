@@ -132,6 +132,33 @@ func NewFFmpegCmd(ctx context.Context, inputPath string) *exec.Cmd {
 	return exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", inputPath, "-f", "image2pipe", "-vcodec", "mjpeg", "-")
 }
 
+// NewFFmpegRawDecoder creates a command to output raw RGBA frames to Stdout.
+func NewFFmpegRawDecoder(ctx context.Context, inputPath string) *exec.Cmd {
+	return exec.CommandContext(ctx, "ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-i", inputPath,
+		"-f", "image2pipe",
+		"-pix_fmt", "rgba",
+		"-vcodec", "rawvideo", "-")
+}
+
+// NewFFmpegEncoder creates a command to encode raw JPEG frames from Stdin into a video file.
+func NewFFmpegEncoder(ctx context.Context, outputPath string, fps float64, width, height int) *exec.Cmd {
+	return exec.CommandContext(ctx, "ffmpeg",
+		"-y", // Overwrite output
+		"-f", "rawvideo",
+		"-pix_fmt", "rgba",
+		"-s", fmt.Sprintf("%dx%d", width, height),
+		"-r", fmt.Sprintf("%f", fps),
+		"-i", "-", // Read from Stdin
+		"-c:v", "libx264",
+		"-preset", "fast",
+		"-crf", "23",
+		"-pix_fmt", "yuv420p",
+		outputPath,
+	)
+}
+
 // GenerateVideoID creates a deterministic hash for the video file
 // based on its path, size, and modification time.
 func GenerateVideoID(path string) (string, error) {
@@ -198,4 +225,27 @@ func GetVideoFPS(ctx context.Context, path string) (float64, error) {
 		return num / den, nil
 	}
 	return 0, fmt.Errorf("unknown framerate format: %s", string(out))
+}
+
+// GetVideoDimensions returns the width and height of the video stream.
+func GetVideoDimensions(ctx context.Context, path string) (int, int, error) {
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		return 0, 0, err
+	}
+	// ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 input.mp4
+	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, 0, err
+	}
+	parts := strings.Split(strings.TrimSpace(string(out)), "x")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid dimension format: %s", string(out))
+	}
+	w, err1 := strconv.Atoi(parts[0])
+	h, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return 0, 0, fmt.Errorf("invalid dimensions: %s", string(out))
+	}
+	return w, h, nil
 }
