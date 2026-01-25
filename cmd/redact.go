@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"image"
@@ -40,7 +41,7 @@ var redactCmd = &cobra.Command{
 
 func init() {
 	redactCmd.Flags().StringVarP(&redactOpts.InputPath, "input", "i", "", "Path to input video")
-	redactCmd.Flags().StringVarP(&redactOutput, "output", "o", "redacted.mp4", "Path to output video")
+	redactCmd.Flags().StringVarP(&redactOutput, "output", "o", "output/redacted.mp4", "Path to output video")
 	redactCmd.Flags().StringVarP(&redactMode, "mode", "m", "blur-all", "Redaction mode: blur-all, targeted")
 	redactCmd.Flags().StringVar(&redactTargets, "target", "", "Comma-separated list of Identity IDs to redact (for targeted mode)")
 	redactCmd.Flags().StringVar(&redactStyle, "style", "black", "Redaction style: pixel, black, gauss, secure")
@@ -60,11 +61,6 @@ func init() {
 // blurBufferPool recycles scratch buffers for the Gaussian blur.
 var blurBufferPool = sync.Pool{
 	New: func() interface{} { return make([]uint8, 0, 1024*1024) }, // Start with 1MB capacity
-}
-
-// colSumsPool recycles column accumulators for the Gaussian blur.
-var colSumsPool = sync.Pool{
-	New: func() interface{} { return make([]uint32, 0, 1024) },
 }
 
 type redactResult struct {
@@ -112,6 +108,12 @@ func runRedact(ctx context.Context, opts Options) error {
 				targetIDs = append(targetIDs, id)
 			}
 		}
+	}
+
+	// Ensure output directory exists to prevent FFmpeg failure
+	if err := os.MkdirAll(filepath.Dir(redactOutput), 0755); err != nil {
+		utils.ShowError("Failed to create output directory", err, nil)
+		return err
 	}
 
 	fps, err := utils.GetVideoFPS(ctx, opts.InputPath)
@@ -210,7 +212,9 @@ func runRedact(ctx context.Context, opts Options) error {
 		}
 	}
 
+	var decoderStderr bytes.Buffer
 	decoder := utils.NewFFmpegRawDecoder(ctx, opts.InputPath)
+	decoder.Stderr = &decoderStderr
 	decoderOut, err := decoder.StdoutPipe()
 	if err != nil {
 		utils.ShowError("Failed to create decoder pipe", err, nil)
@@ -221,7 +225,9 @@ func runRedact(ctx context.Context, opts Options) error {
 		return err
 	}
 
+	var encoderStderr bytes.Buffer
 	encoder := utils.NewFFmpegEncoder(ctx, redactOutput, fps, width, height)
+	encoder.Stderr = &encoderStderr
 	encoderIn, err := encoder.StdinPipe()
 	if err != nil {
 		utils.ShowError("Failed to create encoder pipe", err, nil)
@@ -277,6 +283,28 @@ func runRedact(ctx context.Context, opts Options) error {
 		close(resultsChan)
 	}()
 
+	// Decoupled writer to prevent deadlock
+	writeChan := make(chan []byte, opts.NumEngines*2)
+	writeErrChan := make(chan error, 1)
+	var writerWg sync.WaitGroup
+	writerWg.Add(1)
+	go func() {
+		defer writerWg.Done()
+		var writeError error
+		for data := range writeChan {
+			if writeError == nil {
+				if _, err := encoderIn.Write(data); err != nil {
+					writeError = err
+					select {
+					case writeErrChan <- err:
+					default:
+					}
+				}
+			}
+			frameBufferPool.Put(data)
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -301,12 +329,14 @@ func runRedact(ctx context.Context, opts Options) error {
 					utils.ShowError("Redaction failed", err, nil)
 					return err
 				}
-				if _, err := encoderIn.Write(outData); err != nil {
-					return err
-				}
 
-				// Release buffer back to pool
-				frameBufferPool.Put(frame.Data)
+				select {
+				case writeChan <- outData:
+				case err := <-writeErrChan:
+					return err
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 
 				bar.Add(1)
 				nextFrame++
@@ -315,12 +345,21 @@ func runRedact(ctx context.Context, opts Options) error {
 	}
 
 Flush:
+	close(writeChan)
+	writerWg.Wait()
+
 	encoderIn.Close()
 	if err := encoder.Wait(); err != nil {
+		if encoderStderr.Len() > 0 {
+			fmt.Fprintf(os.Stderr, "\nFFmpeg Encoder Logs:\n%s\n", encoderStderr.String())
+		}
 		utils.ShowError("Encoder process failed", err, nil)
 		return err
 	}
 	if err := decoder.Wait(); err != nil {
+		if decoderStderr.Len() > 0 {
+			fmt.Fprintf(os.Stderr, "\nFFmpeg Decoder Logs:\n%s\n", decoderStderr.String())
+		}
 		utils.ShowError("Decoder process failed", err, nil)
 		return err
 	}
@@ -359,7 +398,7 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 
 			// Check against loaded targets
 			for tID, tVec := range p.targetVecs {
-				dist := cosineDist(face.Vec, tVec)
+				dist := utils.CosineDist(face.Vec, tVec)
 				if dist < minDist {
 					minDist = dist
 					bestID = tID
@@ -527,32 +566,22 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 		}
 
 	case "gauss":
-		// Separable Box Blur
-		// Strength = Kernel Radius. This allows for strong blurs (e.g. radius 20)
-		// without the O(N^2) cost of a naive convolution.
+		// A correct, if naive, implementation of a separable box blur.
+		// The previous sliding-window optimization was flawed at the edges, creating artifacts.
+		// Given that the radius is typically small, this O(N*R) approach is acceptable for correctness.
 		radius := strength
 		if radius < 1 {
 			radius = 1
 		}
 
 		w, h := rect.Dx(), rect.Dy()
-		// Clamp radius to prevent looking outside the face bounds
-		if radius > w/2 {
-			radius = w / 2
-		}
-		if radius > h/2 {
-			radius = h / 2
-		}
 
-		// Intermediate buffer for the horizontal pass
-		// Optimization: Use a pooled buffer to avoid allocating per-face
 		neededSize := w * h * 4
 		bufPtr := blurBufferPool.Get().([]uint8)
 		if cap(bufPtr) < neededSize {
 			bufPtr = make([]uint8, neededSize)
 		}
 		buf := bufPtr[:neededSize]
-		// Ensure we return the buffer to the pool when done
 		defer blurBufferPool.Put(bufPtr)
 
 		stride := img.Stride
@@ -564,117 +593,49 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 		for y := 0; y < h; y++ {
 			rowStart := (minY + y - imgMinY) * stride
 			bufRowStart := y * w * 4
-
-			// Initialize Accumulator
-			var rSum, gSum, bSum uint32
-			for k := -radius; k <= radius; k++ {
-				px := k
-				if px < 0 {
-					px = 0
-				}
-				if px >= w {
-					px = w - 1
-				}
-				off := rowStart + (minX+px-imgMinX)*4
-				rSum += uint32(pix[off])
-				gSum += uint32(pix[off+1])
-				bSum += uint32(pix[off+2])
-			}
-
-			count := uint32(2*radius + 1)
-
 			for x := 0; x < w; x++ {
+				var rSum, gSum, bSum uint32
+				var count int
+				for k := -radius; k <= radius; k++ {
+					px := x + k
+					if px >= 0 && px < w {
+						off := rowStart + (minX+px-imgMinX)*4
+						rSum += uint32(pix[off])
+						gSum += uint32(pix[off+1])
+						bSum += uint32(pix[off+2])
+						count++
+					}
+				}
+
 				bufOff := bufRowStart + x*4
-				buf[bufOff] = uint8(rSum / count)
-				buf[bufOff+1] = uint8(gSum / count)
-				buf[bufOff+2] = uint8(bSum / count)
+				buf[bufOff] = uint8(rSum / uint32(count))
+				buf[bufOff+1] = uint8(gSum / uint32(count))
+				buf[bufOff+2] = uint8(bSum / uint32(count))
 				buf[bufOff+3] = 255
-
-				// Slide Window: Subtract leaving pixel, Add entering pixel
-				pRemove := x - radius
-				if pRemove < 0 {
-					pRemove = 0
-				}
-
-				pAdd := x + radius + 1
-				if pAdd >= w {
-					pAdd = w - 1
-				}
-
-				offRemove := rowStart + (minX+pRemove-imgMinX)*4
-				offAdd := rowStart + (minX+pAdd-imgMinX)*4
-
-				rSum = rSum - uint32(pix[offRemove]) + uint32(pix[offAdd])
-				gSum = gSum - uint32(pix[offRemove+1]) + uint32(pix[offAdd+1])
-				bSum = bSum - uint32(pix[offRemove+2]) + uint32(pix[offAdd+2])
 			}
 		}
 
 		// 2. Vertical Pass: Read from Buffer -> Write to Image
-		// Optimization: Process ROW-BY-ROW instead of COLUMN-BY-COLUMN to improve CPU cache locality.
-		// We maintain running sums for every column in parallel.
-
-		// Use pool to reduce allocation
-		neededCols := w * 3
-		csPtr := colSumsPool.Get().([]uint32)
-		if cap(csPtr) < neededCols {
-			csPtr = make([]uint32, neededCols)
-		}
-		colSums := csPtr[:neededCols]
-		// Must zero out recycled buffer
-		for i := range colSums {
-			colSums[i] = 0
-		}
-		defer colSumsPool.Put(csPtr)
-
-		// Initialize accumulators for all columns (Kernel centered at y=0)
-		for k := -radius; k <= radius; k++ {
-			py := k
-			if py < 0 {
-				py = 0
-			}
-			if py >= h {
-				py = h - 1
-			}
-
-			rowOffset := py * w * 4
-			for x := 0; x < w; x++ {
-				off := rowOffset + x*4
-				colSums[x*3] += uint32(buf[off])
-				colSums[x*3+1] += uint32(buf[off+1])
-				colSums[x*3+2] += uint32(buf[off+2])
-			}
-		}
-
-		count := uint32(2*radius + 1)
-
 		for y := 0; y < h; y++ {
 			dstRowOff := (minY + y - imgMinY) * stride
-
 			for x := 0; x < w; x++ {
-				// Apply Blur to current pixel
+				var rSum, gSum, bSum uint32
+				var count int
+				for k := -radius; k <= radius; k++ {
+					py := y + k
+					if py >= 0 && py < h {
+						off := py*w*4 + x*4
+						rSum += uint32(buf[off])
+						gSum += uint32(buf[off+1])
+						bSum += uint32(buf[off+2])
+						count++
+					}
+				}
+
 				dstOff := dstRowOff + (minX+x-imgMinX)*4
-				pix[dstOff] = uint8(colSums[x*3] / count)
-				pix[dstOff+1] = uint8(colSums[x*3+1] / count)
-				pix[dstOff+2] = uint8(colSums[x*3+2] / count)
-
-				// Update Accumulator for next row (y+1)
-				pRemove := y - radius
-				if pRemove < 0 {
-					pRemove = 0
-				}
-
-				pAdd := y + radius + 1
-				if pAdd >= h {
-					pAdd = h - 1
-				}
-
-				offRemove := pRemove*w*4 + x*4
-				offAdd := pAdd*w*4 + x*4
-
-				colSums[x*3] = colSums[x*3] - uint32(buf[offRemove]) + uint32(buf[offAdd])
-				colSums[x*3+1] = colSums[x*3+1] - uint32(buf[offRemove+1]) + uint32(buf[offAdd+1])
-				colSums[x*3+2] = colSums[x*3+2] - uint32(buf[offRemove+2]) + uint32(buf[offAdd+2])
+				pix[dstOff] = uint8(rSum / uint32(count))
+				pix[dstOff+1] = uint8(gSum / uint32(count))
+				pix[dstOff+2] = uint8(bSum / uint32(count))
 			}
 		}
 

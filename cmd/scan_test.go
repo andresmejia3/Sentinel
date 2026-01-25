@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/andresmejia3/sentinel/internal/store"
+	"github.com/andresmejia3/sentinel/internal/utils"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -54,10 +55,10 @@ func TestCosineDist(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := cosineDist(tt.a, tt.b)
+			got := utils.CosineDist(tt.a, tt.b)
 			// Use epsilon for float comparison
 			if math.Abs(got-tt.want) > 1e-9 {
-				t.Errorf("cosineDist() = %v, want %v", got, tt.want)
+				t.Errorf("CosineDist() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -117,13 +118,21 @@ func TestScanPersistence(t *testing.T) {
 	}
 
 	// Insert Interval
-	err = db.InsertInterval(ctx, videoID, 0.0, 5.0, 10, id)
-	if err != nil {
+	if err = db.InsertInterval(ctx, videoID, 0.0, 5.0, 10, id); err != nil {
 		t.Fatalf("Failed to insert interval: %v", err)
 	}
 
 	// 4. Verify
-	// (Verification logic is covered by store_test.go, here we just ensure the flow works)
+	intervals, err := db.GetIdentityIntervals(ctx, id)
+	if err != nil {
+		t.Fatalf("Failed to get intervals for verification: %v", err)
+	}
+	if len(intervals) != 1 {
+		t.Fatalf("Expected 1 interval for identity %d, got %d", id, len(intervals))
+	}
+	if intervals[0].VideoID != videoID || intervals[0].Start != 0.0 || intervals[0].End != 5.0 {
+		t.Errorf("Mismatch in persisted interval data. Got %+v", intervals[0])
+	}
 }
 
 func TestFmtTime(t *testing.T) {
@@ -167,11 +176,11 @@ func TestValidateScanFlags(t *testing.T) {
 		{
 			name: "Valid options",
 			opts: Options{
-				InputPath:      tmpFile.Name(),
-				NthFrame:       1,
-				MatchThreshold: 0.5,
-				GracePeriod:    "1s",
-				WorkerTimeout:  "30s",
+				InputPath:       tmpFile.Name(),
+				NthFrame:        1,
+				MatchThreshold:  0.5,
+				GracePeriod:     "1s",
+				WorkerTimeout:   "30s",
 				QualityStrategy: "clarity",
 			},
 			wantErr: false,
@@ -210,21 +219,21 @@ func TestValidateScanFlags(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		// Redirect stderr to discard output during test
-		oldStderr := os.Stderr
-		r, w, _ := os.Pipe()
-		os.Stderr = w
-
 		t.Run(tt.name, func(t *testing.T) {
+			// Redirect stderr to discard output during this specific sub-test
+			oldStderr := os.Stderr
+			r, w, _ := os.Pipe()
+			os.Stderr = w
+
 			if err := validateScanFlags(&tt.opts); (err != nil) != tt.wantErr {
 				t.Errorf("validateScanFlags() error = %v, wantErr %v", err, tt.wantErr)
 			}
-		})
 
-		// Restore stderr
-		w.Close()
-		os.Stderr = oldStderr
-		r.Close()
+			// Restore stderr and close the pipe
+			w.Close()
+			os.Stderr = oldStderr
+			r.Close()
+		})
 	}
 }
 

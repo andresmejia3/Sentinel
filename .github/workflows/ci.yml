@@ -77,3 +77,30 @@ jobs:
           # Use GitHub Actions cache to speed up dlib compilation
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Job 4: End-to-End Smoke Test
+  smoke-test:
+    name: E2E Smoke Test
+    runs-on: ubuntu-latest
+    needs: [build-docker] # Run only after the image is successfully built
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create Dummy .env file
+        run: |
+          echo "POSTGRES_USER=sentinel" > .env
+          echo "POSTGRES_PASSWORD=secret" >> .env
+          echo "POSTGRES_DB=sentinel" >> .env
+          echo "POSTGRES_HOST=db" >> .env
+
+      - name: Start services with Docker Compose
+        run: docker compose up -d
+
+      - name: Wait for DB to be healthy
+        # This simple wait is sufficient for a smoke test
+        run: sleep 10
+
+      - name: Run Sentinel --help command
+        # This verifies the container starts, the entrypoint works, and the binary is executable.
+        run: docker compose run --rm app --help

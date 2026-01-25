@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -256,4 +257,29 @@ func GetVideoDimensions(ctx context.Context, path string) (int, int, error) {
 		return 0, 0, fmt.Errorf("invalid dimensions: %s", string(out))
 	}
 	return w, h, nil
+}
+
+// CosineDist calculates the cosine distance between two vectors.
+// It returns a value between 0.0 (identical) and 2.0 (opposite).
+// A result of 1.0 means the vectors are orthogonal.
+func CosineDist(a, b []float64) float64 {
+	// BCE (Bounds Check Elimination) Hint:
+	// Proves to the compiler that a and b are large enough, removing checks inside the loop.
+	if len(a) != len(b) || len(a) == 0 {
+		return 1.0 // Return neutral distance for invalid input
+	}
+	_ = a[len(a)-1] // BCE
+	_ = b[len(b)-1] // BCE
+
+	var dot, sumA, sumB float64
+	for i := range a {
+		dot += a[i] * b[i]
+		sumA += a[i] * a[i]
+		sumB += b[i] * b[i]
+	}
+
+	if sumA == 0 || sumB == 0 {
+		return 1.0
+	}
+	return 1.0 - (dot / (math.Sqrt(sumA) * math.Sqrt(sumB)))
 }

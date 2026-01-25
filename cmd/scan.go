@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -375,6 +374,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 	// Cache of the best quality score seen for each identity to avoid overwriting good thumbnails with bad ones.
 	// Maps IdentityID -> MaxQuality
 	bestQuality := make(map[int]float64)
+
 	idNames := make(map[int]string)
 	newlyCreated := make(map[int]bool) // Track which IDs were generated in this session
 	tempIDCounter := -1                // Negative IDs for pending tracks
@@ -424,19 +424,20 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 	go func() {
 		defer consumerWg.Done()
 		for op := range thumbChan {
-			filename := fmt.Sprintf("identity_%d.jpg", op.id)
-			path := filepath.Join(unknownDir, filename)
+			finalPath := filepath.Join(unknownDir, fmt.Sprintf("identity_%d.jpg", op.id))
+			tempPath := finalPath + ".tmp"
 
-			// Retry logic: Attempt write 3 times to handle transient errors (e.g. file locks)
 			var err error
-			for i := 0; i < 3; i++ {
-				if err = os.WriteFile(path, op.data, 0644); err == nil {
-					break
+			// Write to a temporary file first to prevent corruption
+			if err = os.WriteFile(tempPath, op.data, 0644); err == nil {
+				// Atomically rename the temp file to its final destination
+				if err = os.Rename(tempPath, finalPath); err != nil {
+					os.Remove(tempPath) // Clean up temp file on rename failure
 				}
-				time.Sleep(10 * time.Millisecond)
 			}
+
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "⚠️  Failed to write thumbnail for ID %d: %v\n", op.id, err)
+				fmt.Fprintf(os.Stderr, "⚠️  Failed to save thumbnail for ID %d: %v\n", op.id, err)
 			}
 		}
 	}()
@@ -570,7 +571,7 @@ Loop:
 					minDist := opts.MatchThreshold
 
 					for i, t := range tracks {
-						dist := cosineDist(face.Vec, t.MeanVec)
+						dist := utils.CosineDist(face.Vec, t.MeanVec)
 						if dist < minDist {
 							minDist = dist
 							bestMatch = i
@@ -699,29 +700,6 @@ func newActiveTrack(id, frameIndex int, vec []float64, thumb []byte, quality flo
 	}
 	copy(t.MeanVec, vec)
 	return t
-}
-
-// cosineDist calculates the cosine distance between two vectors.
-// It assumes vector 'a' is already normalized to unit length (a performance optimization).
-func cosineDist(a, b []float64) float64 {
-	// BCE (Bounds Check Elimination) Hint:
-	// Proves to the compiler that a and b are large enough, removing checks inside the loop.
-	if len(a) != len(b) || len(a) == 0 {
-		return 1.0
-	}
-	_ = a[len(a)-1]
-	_ = b[len(b)-1]
-
-	var dot, sumB float64
-	for i := range a {
-		dot += a[i] * b[i]
-		sumB += b[i] * b[i]
-	}
-	// 'a' is normalized from Python, so sumA is approx 1.0. We skip calculating it.
-	if sumB == 0 {
-		return 1.0
-	}
-	return 1.0 - (dot / math.Sqrt(sumB))
 }
 
 // validateScanFlags ensures all CLI arguments are valid before starting heavy processes.
