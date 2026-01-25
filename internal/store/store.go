@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -88,11 +86,6 @@ func (s *Store) Close(ctx context.Context) {
 
 // EnsureVideoMetadata registers the video in the database. If it exists, it updates the timestamp.
 func (s *Store) EnsureVideoMetadata(ctx context.Context, videoID, path string) error {
-	// 1. Clean up old data to ensure idempotency (prevent duplicate intervals on re-scan)
-	if _, err := s.pool.Exec(ctx, "DELETE FROM face_intervals WHERE video_id = $1", videoID); err != nil {
-		return err
-	}
-
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO video_metadata (id, path, indexed_at)
 		VALUES ($1, $2, NOW())
@@ -110,32 +103,63 @@ func (s *Store) InsertInterval(ctx context.Context, videoID string, start, end f
 	return err
 }
 
-// vecToString formats a float slice into a PostgreSQL vector string format "[1.0,2.0,...]"
-func vecToString(vec []float64) string {
-	var b strings.Builder
-	b.Grow(2 + len(vec)*12) // Pre-allocate approx size to avoid re-allocations
-	b.WriteByte('[')
-	for i, v := range vec {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(strconv.FormatFloat(v, 'f', -1, 64))
+// IntervalData holds the data for a single face interval to be committed.
+type IntervalData struct {
+	Start           float64
+	End             float64
+	FaceCount       int
+	KnownIdentityID int
+}
+
+// CommitScan transactionally replaces all intervals for a given video ID.
+// This makes the scan operation atomic: it either completes fully or leaves the old data untouched.
+func (s *Store) CommitScan(ctx context.Context, videoID string, intervals []IntervalData) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
 	}
-	b.WriteByte(']')
-	return b.String()
+	defer tx.Rollback(ctx)
+
+	// 1. Delete old intervals for this video
+	if _, err := tx.Exec(ctx, "DELETE FROM face_intervals WHERE video_id = $1", videoID); err != nil {
+		return fmt.Errorf("failed to delete old intervals: %w", err)
+	}
+
+	// 2. Batch insert new intervals
+	if len(intervals) > 0 {
+		batch := &pgx.Batch{}
+		for _, i := range intervals {
+			batch.Queue(`INSERT INTO face_intervals (video_id, start_time, end_time, face_count, known_identity_id) VALUES ($1, $2, $3, $4, $5)`, videoID, i.Start, i.End, i.FaceCount, i.KnownIdentityID)
+		}
+
+		br := tx.SendBatch(ctx, batch)
+		defer br.Close()
+
+		for i := 0; i < len(intervals); i++ {
+			if _, err := br.Exec(); err != nil {
+				return fmt.Errorf("batch insert failed on interval %d: %w", i, err)
+			}
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // FindClosestIdentity searches for the nearest neighbor in the database using cosine distance.
 // Returns -1 if no match is found within the threshold.
 func (s *Store) FindClosestIdentity(ctx context.Context, vec []float64, threshold float64) (int, string, error) {
-	vecStr := vecToString(vec)
+	// Optimization: Use binary protocol (pass []float32) to avoid string parsing overhead.
+	vec32 := make([]float32, len(vec))
+	for i, v := range vec {
+		vec32[i] = float32(v)
+	}
+
 	// <=> is the cosine distance operator in pgvector
 	// We order by distance and limit to 1 to find the nearest neighbor
-	query := `SELECT id, COALESCE(name, '') FROM known_identities WHERE embedding <=> $1::vector < $2 ORDER BY embedding <=> $1::vector ASC LIMIT 1`
+	query := `SELECT id, COALESCE(name, '') FROM known_identities WHERE embedding <=> $1::real[]::vector < $2 ORDER BY embedding <=> $1::real[]::vector ASC LIMIT 1`
 
 	var id int
 	var name string
-	err := s.pool.QueryRow(ctx, query, vecStr, threshold).Scan(&id, &name)
+	err := s.pool.QueryRow(ctx, query, vec32, threshold).Scan(&id, &name)
 	if err == pgx.ErrNoRows {
 		return -1, "", nil // No match found
 	}
@@ -148,11 +172,16 @@ func (s *Store) FindClosestIdentity(ctx context.Context, vec []float64, threshol
 
 // CreateIdentity inserts a new unknown identity and returns its ID.
 func (s *Store) CreateIdentity(ctx context.Context, vec []float64, count int) (int, error) {
-	vecStr := vecToString(vec)
+	// Optimization: Use binary protocol (pass []float32) to avoid string parsing overhead.
+	vec32 := make([]float32, len(vec))
+	for i, v := range vec {
+		vec32[i] = float32(v)
+	}
+
 	var id int
 	// Optimization: We insert with a NULL name (Unknown).
 	// The application layer handles formatting "Identity <ID>" when displaying.
-	err := s.pool.QueryRow(ctx, "INSERT INTO known_identities (embedding, face_count) VALUES ($1::vector, $2) RETURNING id", vecStr, count).Scan(&id)
+	err := s.pool.QueryRow(ctx, "INSERT INTO known_identities (embedding, face_count) VALUES ($1::real[]::vector, $2) RETURNING id", vec32, count).Scan(&id)
 	return id, err
 }
 

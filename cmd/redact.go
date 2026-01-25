@@ -6,6 +6,7 @@ import (
 	"image"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,6 +78,13 @@ func runRedact(ctx context.Context, opts Options) error {
 
 	if err := validateRedactFlags(&opts); err != nil {
 		return err
+	}
+
+	// Safety Check: Prevent overwriting input file which causes corruption
+	inAbs, _ := filepath.Abs(opts.InputPath)
+	outAbs, _ := filepath.Abs(redactOutput)
+	if inAbs == outAbs {
+		return fmt.Errorf("input and output paths must be different to prevent file corruption")
 	}
 
 	targetIDs := make(map[int]bool)

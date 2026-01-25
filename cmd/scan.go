@@ -145,8 +145,9 @@ func runScan(ctx context.Context, opts Options) error {
 	// 6. Start Aggregator (Consumer)
 	// Must run concurrently to prevent deadlock on resultsChan
 	aggDone := make(chan struct{})
+	finalIntervalsChan := make(chan []store.IntervalData, 1)
 	go func() {
-		processResults(ctx, resultsChan, DB, videoID, fps, opts, errChan)
+		processResults(ctx, resultsChan, DB, videoID, fps, opts, errChan, finalIntervalsChan)
 		close(aggDone)
 	}()
 
@@ -227,11 +228,39 @@ func runScan(ctx context.Context, opts Options) error {
 	}
 
 	close(taskChan)
-	wg.Wait()
+
+	// Fix: Avoid deadlock if aggregator fails while workers are still running.
+	// Instead of blocking on wg.Wait(), we wait in a goroutine and select on it.
+	wgDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(wgDone)
+	}()
+
+	select {
+	case <-wgDone:
+		// Workers finished normally
+	case err := <-errChan:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
 	close(resultsChan)
 
 	// Wait for aggregator to finish processing
 	<-aggDone
+
+	// Get final intervals from the aggregator
+	intervals := <-finalIntervalsChan
+
+	// ATOMIC COMMIT: All intervals are now inserted in a single transaction.
+	// If the scan had failed, the old data would have been preserved.
+	fmt.Fprintf(os.Stderr, "🗄️  Committing %d intervals to database...\n", len(intervals))
+	if err := DB.CommitScan(ctx, videoID, intervals); err != nil {
+		utils.ShowError("Failed to commit scan results", err, nil)
+		return err
+	}
 
 	// Final check for any errors that occurred during shutdown
 	select {
@@ -332,12 +361,15 @@ type timeRange struct {
 	End   float64
 }
 
-func processResults(ctx context.Context, results <-chan scanResult, db *store.Store, videoID string, fps float64, opts Options, errChan chan<- error) {
+func processResults(ctx context.Context, results <-chan scanResult, db *store.Store, videoID string, fps float64, opts Options, errChan chan<- error, finalIntervalsChan chan<- []store.IntervalData) {
 	// Buffer for re-ordering frames (Worker 2 might finish before Worker 1)
 	buffer := make(map[int]scanResult)
-	nextFrame := opts.NthFrame // Assuming first frame is nthFrame based on loop logic
+	nextFrame := 0
 
 	// Tracking state
+	// This slice will hold all the final interval data to be batch-inserted at the end.
+	var finalIntervals []store.IntervalData
+
 	var tracks []*activeTrack
 
 	// Cache of the best quality score seen for each identity to avoid overwriting good thumbnails with bad ones.
@@ -417,6 +449,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		close(thumbChan)
 		// 3. Wait for the consumer to finish draining the channel
 		consumerWg.Wait()
+		// 4. Send final results back to main goroutine
+		finalIntervalsChan <- finalIntervals
 	}()
 
 	fmt.Fprintf(os.Stderr, "⚙️  Tracker initialized with Cosine Distance (Threshold: %.2f)\n", opts.MatchThreshold)
@@ -424,7 +458,9 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 	// Helper closure to persist a track (DRY: Used in loop and at flush)
 	persistTrack := func(t *activeTrack) {
 		startSec := float64(t.StartFrame) / fps
-		endSec := float64(t.LastFrame) / fps
+		// Fix: Include the duration of the last frame slice in the interval.
+		// Otherwise, single-frame detections have duration 0 and get dropped.
+		endSec := float64(t.LastFrame+opts.NthFrame) / fps
 
 		// Filter short tracks (blips)
 		if (endSec - startSec) < blipDuration.Seconds() {
@@ -479,7 +515,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 
 		// 2. Offload I/O to Background (Async)
 		producerWg.Add(1)
-		go func(id int, vec []float64, count int, start, end float64, isNew bool) {
+		go func(id int, vec []float64, count int, isNew bool) {
 			defer producerWg.Done()
 
 			if !isNew {
@@ -495,16 +531,14 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 				}
 			}
 
-			if err := db.InsertInterval(ctx, videoID, start, end, count, id); err != nil {
-				utils.ShowError(fmt.Sprintf("Failed to persist interval for %d", id), err, nil)
-				select {
-				case errChan <- err:
-				default:
-				}
-				return
-			}
-		}(finalID, t.MeanVec, t.Count, startSec, endSec, isNewIdentity)
+		}(finalID, t.MeanVec, t.Count, isNewIdentity)
 
+		finalIntervals = append(finalIntervals, store.IntervalData{
+			Start:           startSec,
+			End:             endSec,
+			FaceCount:       t.Count,
+			KnownIdentityID: finalID,
+		})
 		// Update summary with the final ID.
 		// Since we resolved the ID synchronously above, this is guaranteed to be the correct DB ID.
 		summary[t.ID] = append(summary[t.ID], timeRange{Start: startSec, End: endSec})
