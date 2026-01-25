@@ -46,7 +46,7 @@ func init() {
 	scanCmd.Flags().Float64VarP(&scanOpts.DetectionThreshold, "detection-threshold", "D", 0.5, "Face detection confidence threshold (0.0 - 1.0)")
 
 	scanCmd.Flags().StringVar(&scanOpts.WorkerTimeout, "worker-timeout", "30s", "Timeout for a worker to process a single frame")
-	scanCmd.Flags().StringVar(&scanOpts.QualityStrategy, "quality-strategy", "clarity", "Strategy for calculating face quality (clarity, portrait, confidence)")
+	scanCmd.Flags().StringVar(&scanOpts.QualityStrategy, "quality-strategy", "clarity", "Strategy for calculating face quality (clarity, portrait, confidence, legacy)")
 
 	scanCmd.MarkFlagRequired("input")
 	rootCmd.AddCommand(scanCmd)
@@ -765,7 +765,7 @@ func validateScanFlags(opts *Options) error {
 	case "clarity", "portrait", "confidence", "legacy":
 		// Valid
 	default:
-		err := fmt.Errorf("must be one of: clarity, portrait, confidence")
+		err := fmt.Errorf("must be one of: clarity, portrait, confidence, legacy")
 		utils.ShowError("Invalid quality-strategy", err, nil)
 		return err
 	}
