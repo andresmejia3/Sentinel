@@ -117,12 +117,33 @@ func TestScanPersistence(t *testing.T) {
 		t.Fatalf("Failed to create identity: %v", err)
 	}
 
+	// Update Identity (Simulate finding the person again)
+	// Old: [1.0, 0.0...], Count: 10
+	// New: [0.0, 1.0...], Count: 10
+	// Expected Avg: [0.5, 0.5...], Total Count: 20
+	vecUpdate := make([]float64, 512)
+	vecUpdate[1] = 1.0
+	if err := db.UpdateIdentity(ctx, id, vecUpdate, 10); err != nil {
+		t.Fatalf("Failed to update identity: %v", err)
+	}
+
 	// Insert Interval
 	if err = db.InsertInterval(ctx, videoID, 0.0, 5.0, 10, id); err != nil {
 		t.Fatalf("Failed to insert interval: %v", err)
 	}
 
 	// 4. Verify
+	// A. Verify Vector Math
+	vecs, err := db.GetIdentityVectors(ctx, []int{id})
+	if err != nil {
+		t.Fatalf("Failed to retrieve vectors: %v", err)
+	}
+	gotVec := vecs[id]
+	if math.Abs(gotVec[0]-0.5) > 1e-5 || math.Abs(gotVec[1]-0.5) > 1e-5 {
+		t.Errorf("UpdateIdentity failed weighted average. Expected ~0.5 at indices 0&1, got %v", gotVec[:2])
+	}
+
+	// B. Verify Intervals
 	intervals, err := db.GetIdentityIntervals(ctx, id)
 	if err != nil {
 		t.Fatalf("Failed to get intervals for verification: %v", err)
