@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/andresmejia3/sentinel/internal/store"
 	"github.com/andresmejia3/sentinel/internal/types"
 	"github.com/andresmejia3/sentinel/internal/utils"
 	"github.com/andresmejia3/sentinel/internal/worker"
@@ -21,11 +20,13 @@ import (
 )
 
 var (
-	redactOpts    Options
-	redactOutput  string
-	redactMode    string
-	redactTargets string
-	redactStyle   string
+	redactOpts     Options
+	redactOutput   string
+	redactMode     string
+	redactTargets  string
+	redactStyle    string
+	redactLinger   string
+	redactParanoid bool
 )
 
 var redactCmd = &cobra.Command{
@@ -43,6 +44,8 @@ func init() {
 	redactCmd.Flags().StringVarP(&redactMode, "mode", "m", "blur-all", "Redaction mode: blur-all, targeted")
 	redactCmd.Flags().StringVar(&redactTargets, "target", "", "Comma-separated list of Identity IDs to redact (for targeted mode)")
 	redactCmd.Flags().StringVar(&redactStyle, "style", "black", "Redaction style: pixel, black, gauss, secure")
+	redactCmd.Flags().StringVar(&redactLinger, "linger", "1s", "How long to keep blurring after a targeted face is lost")
+	redactCmd.Flags().BoolVar(&redactParanoid, "paranoid", false, "Enable paranoid mode: blur ALL faces if a targeted face is lost")
 
 	redactCmd.Flags().IntVarP(&redactOpts.NumEngines, "engines", "e", 1, "Number of parallel engine workers")
 	redactCmd.Flags().Float64VarP(&redactOpts.MatchThreshold, "threshold", "t", 0.6, "Face matching threshold")
@@ -70,6 +73,20 @@ type redactResult struct {
 	Faces []types.FaceResult
 }
 
+// redactionTrack holds the state for a single targeted identity during redaction.
+type redactionTrack struct {
+	ID        int
+	LastSeen  int // Frame index
+	LastKnown image.Rectangle
+}
+
+// paranoidTracker manages the stateful redaction logic, including lingering and paranoid mode.
+type paranoidTracker struct {
+	targetVecs   map[int][]float64 // Optimization 1: In-memory embeddings
+	activeTracks []*redactionTrack
+	opts         *Options
+}
+
 func runRedact(ctx context.Context, opts Options) error {
 	// Create a cancellable context to ensure all child processes (FFmpeg, Python)
 	// are killed immediately if this function returns early (e.g. on error).
@@ -87,12 +104,12 @@ func runRedact(ctx context.Context, opts Options) error {
 		return fmt.Errorf("input and output paths must be different to prevent file corruption")
 	}
 
-	targetIDs := make(map[int]bool)
+	targetIDs := []int{}
 	if redactMode == "targeted" {
 		for _, s := range strings.Split(redactTargets, ",") {
 			id, err := strconv.Atoi(strings.TrimSpace(s))
 			if err == nil {
-				targetIDs[id] = true
+				targetIDs = append(targetIDs, id)
 			}
 		}
 	}
@@ -115,6 +132,21 @@ func runRedact(ctx context.Context, opts Options) error {
 
 	var wg sync.WaitGroup
 	readyChan := make(chan bool, opts.NumEngines)
+
+	// Optimization 1: Load target embeddings into memory
+	targetVecs, err := DB.GetIdentityVectors(ctx, targetIDs)
+	if err != nil {
+		utils.ShowError("Failed to load target embeddings", err, nil)
+		return err
+	}
+
+	lingerDuration, _ := time.ParseDuration(redactLinger)
+	lingerFrames := int(lingerDuration.Seconds() * fps)
+	tracker := &paranoidTracker{
+		targetVecs:   targetVecs,
+		activeTracks: make([]*redactionTrack, 0),
+		opts:         &opts,
+	}
 
 	workerTimeout, _ := time.ParseDuration(opts.WorkerTimeout)
 
@@ -264,7 +296,7 @@ func runRedact(ctx context.Context, opts Options) error {
 				}
 				delete(buffer, nextFrame)
 
-				outData, err := applyRedaction(ctx, frame.Data, width, height, frame.Faces, redactMode, redactStyle, targetIDs, DB, opts.MatchThreshold, opts.BlurStrength)
+				outData, err := tracker.apply(ctx, frame.Data, width, height, nextFrame, frame.Faces, redactMode, redactStyle, redactParanoid, lingerFrames)
 				if err != nil {
 					utils.ShowError("Redaction failed", err, nil)
 					return err
@@ -295,30 +327,121 @@ Flush:
 	return nil
 }
 
-func applyRedaction(ctx context.Context, imgData []byte, width, height int, faces []types.FaceResult, mode, style string, targets map[int]bool, db *store.Store, threshold float64, strength int) ([]byte, error) {
+func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, height, frameIndex int, faces []types.FaceResult, mode, style string, paranoid bool, lingerFrames int) ([]byte, error) {
 	// Zero-Copy: Wrap the raw bytes in an image.RGBA struct
 	m := &image.RGBA{
 		Pix:    imgData,
 		Stride: width * 4,
 		Rect:   image.Rect(0, 0, width, height),
 	}
+	strength := p.opts.BlurStrength
 
-	for _, face := range faces {
+	// Optimization 2: Copy master list to a "missing" set.
+	// We remove IDs as we find them. If any remain, paranoid mode triggers.
+	missingTargets := make(map[int]bool, len(p.targetVecs))
+	if mode == "targeted" {
+		for id := range p.targetVecs {
+			missingTargets[id] = true
+		}
+	}
+
+	// Map to track which face index corresponds to which target ID (for blurring later)
+	faceIdentities := make([]int, len(faces))
+	for i := range faceIdentities {
+		faceIdentities[i] = -1
+	}
+
+	// 1. Identify faces using In-Memory Embeddings
+	for i, face := range faces {
+		if mode == "targeted" {
+			bestID := -1
+			minDist := p.opts.MatchThreshold
+
+			// Check against loaded targets
+			for tID, tVec := range p.targetVecs {
+				dist := cosineDist(face.Vec, tVec)
+				if dist < minDist {
+					minDist = dist
+					bestID = tID
+				}
+			}
+
+			if bestID != -1 {
+				faceIdentities[i] = bestID
+				delete(missingTargets, bestID) // Found it! Remove from missing list.
+
+				// Update Linger Track
+				p.updateTrack(bestID, frameIndex, image.Rect(face.Loc[0], face.Loc[1], face.Loc[2], face.Loc[3]))
+			}
+		}
+	}
+
+	// 2. Paranoid Check
+	isParanoidActive := false
+	if paranoid && mode == "targeted" && len(missingTargets) > 0 {
+		isParanoidActive = true
+	}
+
+	// 3. Apply Redaction
+	for i, face := range faces {
 		shouldBlur := false
-		if mode == "blur-all" {
+		if mode == "blur-all" || isParanoidActive {
 			shouldBlur = true
 		} else if mode == "targeted" {
-			id, _, err := db.FindClosestIdentity(ctx, face.Vec, threshold)
-			if err == nil && id != -1 && targets[id] {
+			if faceIdentities[i] != -1 {
 				shouldBlur = true
 			}
 		}
+
 		if shouldBlur {
 			rect := image.Rect(face.Loc[0], face.Loc[1], face.Loc[2], face.Loc[3])
 			redactFace(m, rect, style, strength)
 		}
 	}
+
+	// 4. Apply Linger (only in targeted mode)
+	// If paranoid is active, we are blurring all detected faces.
+	// However, linger covers *undetected* faces (lost tracking), so we still apply it.
+	if mode == "targeted" {
+		// We iterate active tracks. If a track is in 'missingTargets', it means it wasn't found in this frame.
+		for _, track := range p.activeTracks {
+			if missingTargets[track.ID] {
+				if frameIndex-track.LastSeen <= lingerFrames {
+					redactFace(m, track.LastKnown, style, strength)
+				}
+			}
+		}
+	}
+
+	// 5. Prune old tracks
+	p.pruneTracks(frameIndex, lingerFrames)
+
 	return m.Pix, nil
+}
+
+func (p *paranoidTracker) updateTrack(id, frameIndex int, rect image.Rectangle) {
+	for _, t := range p.activeTracks {
+		if t.ID == id {
+			t.LastSeen = frameIndex
+			t.LastKnown = rect
+			return
+		}
+	}
+	p.activeTracks = append(p.activeTracks, &redactionTrack{
+		ID:        id,
+		LastSeen:  frameIndex,
+		LastKnown: rect,
+	})
+}
+
+func (p *paranoidTracker) pruneTracks(frameIndex, lingerFrames int) {
+	active := p.activeTracks[:0]
+	for _, t := range p.activeTracks {
+		if frameIndex-t.LastSeen <= lingerFrames {
+			active = append(active, t)
+		}
+	}
+	p.activeTracks = active
 }
 
 func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength int) {
@@ -630,6 +753,11 @@ func validateRedactFlags(opts *Options) error {
 	if redactMode == "targeted" && redactTargets == "" {
 		err := fmt.Errorf("targeted mode requires --target list of IDs")
 		utils.ShowError("Configuration Error", err, nil)
+		return err
+	}
+
+	if _, err := time.ParseDuration(redactLinger); err != nil {
+		utils.ShowError("Invalid linger format (use '1s', '500ms')", err, nil)
 		return err
 	}
 

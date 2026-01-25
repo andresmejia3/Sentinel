@@ -48,7 +48,8 @@ The system is built on a "Right Tool for the Job" philosophy. We use **Go 1.25**
 
 ## ⚡ Key Features
 
-*   **Hysteresis Redaction:** Implements a "safety net" temporal buffer. If a face is momentarily lost by the tracker, the system maintains the redaction mask to prevent privacy leaks (flicker).
+*   **Temporal Redaction (Linger):** Implements a temporal buffer for redaction. If a targeted face is momentarily lost by the tracker, the system continues to redact its last known position to prevent privacy leaks (flicker).
+*   **Paranoid Redaction:** An optional safety net that blurs *all* detected faces if a targeted identity is temporarily lost, ensuring maximum privacy at the cost of broader redaction.
 *   **Tracking by Detection:** Utilizes high-frequency re-identification (every $N$ frames) combined with temporal smoothing to maintain identity continuity without the drift associated with pure visual trackers.
 *   **Interval Debouncing:** Optimizes storage by merging contiguous detections into time intervals (e.g., "Person A: 00:01:05 - 00:01:10") rather than storing per-frame rows.
 
@@ -70,11 +71,10 @@ Sentinel exposes a robust CLI interface for tuning performance and privacy param
 ### Privacy & Redaction
 | Flag | Name | Description | Default |
 | :--- | :--- | :--- | :--- |
-| `-m` | `--mode` | `blur-all`, `selective`, `targeted`, or `none`. | `none` |
-| `-g` | `--grace-period` | The longest period where a face can be missing before Sentinel declares they are out of frame and logs it to the database. | `2.0s` |
-| `-l` | `--linger` | How long to keep blurring after a face is lost. | `2.0s` |
-| | `--disable-safety-net`| Disable the \"blur all\" safety net (blur everything if we lost the targets face). | `false` |
-| `-s` | `--strength`| Strength of the Gaussian blur kernel. | `99` |
+| `-m` | `--mode` | `blur-all` or `targeted`. | `blur-all` |
+| `-l` | `--linger` | How long to keep blurring after a targeted face is lost (e.g., '1s', '500ms'). | `1s` |
+| | `--paranoid` | Blurs ALL faces if a targeted identity is lost. | `false` |
+| `-s` | `--strength`| Strength of the pixelation or blur effect. | `15` |
 
 ---
 

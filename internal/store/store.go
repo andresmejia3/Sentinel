@@ -170,6 +170,38 @@ func (s *Store) FindClosestIdentity(ctx context.Context, vec []float64, threshol
 	return id, name, nil
 }
 
+// GetIdentityVectors retrieves the embeddings for a specific list of identity IDs.
+func (s *Store) GetIdentityVectors(ctx context.Context, ids []int) (map[int][]float64, error) {
+	if len(ids) == 0 {
+		return map[int][]float64{}, nil
+	}
+
+	// Use ANY($1) to match any ID in the list
+	query := `SELECT id, embedding::real[] FROM known_identities WHERE id = ANY($1)`
+
+	rows, err := s.pool.Query(ctx, query, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results := make(map[int][]float64)
+	for rows.Next() {
+		var id int
+		var vec32 []float32
+		if err := rows.Scan(&id, &vec32); err != nil {
+			return nil, err
+		}
+		// Convert float32 (db) to float64 (app)
+		vec64 := make([]float64, len(vec32))
+		for i, v := range vec32 {
+			vec64[i] = float64(v)
+		}
+		results[id] = vec64
+	}
+	return results, nil
+}
+
 // CreateIdentity inserts a new unknown identity and returns its ID.
 func (s *Store) CreateIdentity(ctx context.Context, vec []float64, count int) (int, error) {
 	// Optimization: Use binary protocol (pass []float32) to avoid string parsing overhead.
