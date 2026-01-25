@@ -72,6 +72,11 @@ func TestScanPersistence(t *testing.T) {
 
 	ctx := context.Background()
 
+	// Explicitly check for Docker availability and fail hard if missing
+	if _, err := testcontainers.NewDockerClientWithOpts(ctx); err != nil {
+		t.Fatalf("Docker not available, cannot run integration test: %v", err)
+	}
+
 	// 1. Start Postgres Container
 	pgContainer, err := postgres.RunContainer(ctx,
 		testcontainers.WithImage("pgvector/pgvector:pg16"),

@@ -19,6 +19,11 @@ func TestStoreIntegration(t *testing.T) {
 
 	ctx := context.Background()
 
+	// Explicitly check for Docker availability and fail hard if missing
+	if _, err := testcontainers.NewDockerClientWithOpts(ctx); err != nil {
+		t.Fatalf("Docker not available, cannot run integration test: %v", err)
+	}
+
 	// 1. Start Postgres Container with pgvector
 	// We use the official pgvector image to ensure the extension is available.
 	pgContainer, err := postgres.RunContainer(ctx,

@@ -151,7 +151,7 @@ func runScan(ctx context.Context, opts Options) error {
 	}()
 
 	// 8. Start FFmpeg
-	ffmpeg := utils.NewFFmpegCmd(ctx, opts.InputPath)
+	ffmpeg := utils.NewFFmpegCmd(ctx, opts.InputPath, opts.NthFrame)
 
 	var stderrBuf bytes.Buffer
 	ffmpeg.Stderr = &stderrBuf
@@ -173,7 +173,7 @@ func runScan(ctx context.Context, opts Options) error {
 	scanner.Buffer(make([]byte, megabyte), 64*megabyte)
 	scanner.Split(utils.SplitJpeg)
 
-	totalFrames := 0
+	scannedFrames := 0
 	sentFrames := 0
 	for scanner.Scan() {
 		// Non-blocking check for errors from workers
@@ -185,26 +185,29 @@ func runScan(ctx context.Context, opts Options) error {
 		default:
 		}
 
-		totalFrames++
-		bar.Add(1) // Update progress bar for every frame read
+		scannedFrames++
+		// Since FFmpeg is skipping frames, every frame we read is a "hit".
+		// We calculate the virtual index based on the count.
+		// e.g. 1st frame read -> Index 0 (if N=10, select=not(mod(n,10)))
+		virtualIndex := (scannedFrames - 1) * opts.NthFrame
 
-		if totalFrames%opts.NthFrame == 0 {
-			// Get buffer from pool
-			buf := frameBufferPool.Get().([]byte)
-			if cap(buf) < len(scanner.Bytes()) {
-				buf = make([]byte, len(scanner.Bytes()))
-			}
-			buf = buf[:len(scanner.Bytes())]
-			copy(buf, scanner.Bytes())
+		bar.Add(opts.NthFrame) // Advance bar by N for every 1 frame read
 
-			select {
-			case taskChan <- types.FrameTask{Index: totalFrames, Data: buf}:
-				sentFrames++
-			case err := <-errChan:
-				return err
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+		// Get buffer from pool
+		buf := frameBufferPool.Get().([]byte)
+		if cap(buf) < len(scanner.Bytes()) {
+			buf = make([]byte, len(scanner.Bytes()))
+		}
+		buf = buf[:len(scanner.Bytes())]
+		copy(buf, scanner.Bytes())
+
+		select {
+		case taskChan <- types.FrameTask{Index: virtualIndex, Data: buf}:
+			sentFrames++
+		case err := <-errChan:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 
@@ -238,7 +241,7 @@ func runScan(ctx context.Context, opts Options) error {
 	}
 
 	bar.Finish()
-	fmt.Fprintf(os.Stderr, "\n🏁 Scan Complete. Processed %d keyframes out of %d total.\n", sentFrames, totalFrames)
+	fmt.Fprintf(os.Stderr, "\n🏁 Scan Complete. Processed %d keyframes.\n", sentFrames)
 	return nil
 }
 

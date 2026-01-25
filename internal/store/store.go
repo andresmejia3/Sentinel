@@ -74,6 +74,8 @@ func initSchema(ctx context.Context, pool *pgxpool.Pool) error {
 			known_identity_id INT REFERENCES known_identities(id)
 		);
 		CREATE INDEX IF NOT EXISTS face_intervals_video_id_idx ON face_intervals (video_id);
+		CREATE INDEX IF NOT EXISTS face_intervals_known_identity_id_idx ON face_intervals (known_identity_id);
+		CREATE INDEX IF NOT EXISTS known_identities_embedding_idx ON known_identities USING hnsw (embedding vector_cosine_ops);
 	`
 	_, err := pool.Exec(ctx, query)
 	return err
@@ -164,33 +166,27 @@ func (s *Store) UpdateIdentity(ctx context.Context, id int, newVec []float64, ne
 	defer tx.Rollback(ctx)
 
 	// 1. Fetch current state
-	var oldVecStr string
+	// Optimization: Cast to real[] to let pgx scan directly into []float32 (Binary Protocol)
+	// This avoids the expensive string parsing of "[0.1, 0.2...]"
+	var oldVec []float32
 	var oldCount int
-	err = tx.QueryRow(ctx, "SELECT embedding::text, face_count FROM known_identities WHERE id = $1 FOR UPDATE", id).Scan(&oldVecStr, &oldCount)
+	err = tx.QueryRow(ctx, "SELECT embedding::real[], face_count FROM known_identities WHERE id = $1 FOR UPDATE", id).Scan(&oldVec, &oldCount)
 	if err != nil {
 		return err
 	}
 
 	// 2. Weighted Math
-	oldVecStr = strings.Trim(oldVecStr, "[]")
-	finalVec := make([]float64, 512)
 	totalCount := float64(oldCount + newCount)
+	finalVec := make([]float32, len(oldVec))
 
-	// Reverted manual parsing to strings.Split for robustness.
-	// The manual loop was brittle (failed on spaces) and ignored errors, risking data corruption.
-	parts := strings.Split(oldVecStr, ",")
-	for i, p := range parts {
-		if i < 512 {
-			oldVal, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
-			if err != nil {
-				return fmt.Errorf("failed to parse vector component at index %d: %w", i, err)
-			}
-			finalVec[i] = (oldVal*float64(oldCount) + newVec[i]*float64(newCount)) / totalCount
-		}
+	for i := range oldVec {
+		val := (float64(oldVec[i])*float64(oldCount) + newVec[i]*float64(newCount)) / totalCount
+		finalVec[i] = float32(val)
 	}
 
-	finalVecStr := vecToString(finalVec)
-	_, err = tx.Exec(ctx, "UPDATE known_identities SET embedding = $1::vector, face_count = $2 WHERE id = $3", finalVecStr, int(totalCount), id)
+	// 3. Update
+	// We pass the []float32 slice directly. pgx sends it as a float array, and Postgres casts it to vector.
+	_, err = tx.Exec(ctx, "UPDATE known_identities SET embedding = $1::real[]::vector, face_count = $2 WHERE id = $3", finalVec, int(totalCount), id)
 	if err != nil {
 		return err
 	}

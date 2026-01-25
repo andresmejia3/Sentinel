@@ -126,10 +126,18 @@ func SplitJpeg(data []byte, atEOF bool) (advance int, token []byte, err error) {
 
 // NewFFmpegCmd creates a standard decoder pipe
 // It configures FFmpeg to output raw MJPEG frames to Stdout for ingestion.
-func NewFFmpegCmd(ctx context.Context, inputPath string) *exec.Cmd {
+func NewFFmpegCmd(ctx context.Context, inputPath string, nthFrame int) *exec.Cmd {
 	// Using -vcodec mjpeg ensures we get JPEGs Go can split
 	// Added -hide_banner and -loglevel error to prevent memory bloat in stderr buffer
-	return exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", inputPath, "-f", "image2pipe", "-vcodec", "mjpeg", "-")
+	args := []string{"-hide_banner", "-loglevel", "error", "-i", inputPath}
+
+	if nthFrame > 1 {
+		// Optimization: Drop frames in FFmpeg before encoding to MJPEG
+		args = append(args, "-vf", fmt.Sprintf("select=not(mod(n\\,%d))", nthFrame), "-vsync", "0")
+	}
+
+	args = append(args, "-f", "image2pipe", "-vcodec", "mjpeg", "-")
+	return exec.CommandContext(ctx, "ffmpeg", args...)
 }
 
 // NewFFmpegRawDecoder creates a command to output raw RGBA frames to Stdout.

@@ -58,6 +58,11 @@ var blurBufferPool = sync.Pool{
 	New: func() interface{} { return make([]uint8, 0, 1024*1024) }, // Start with 1MB capacity
 }
 
+// colSumsPool recycles column accumulators for the Gaussian blur.
+var colSumsPool = sync.Pool{
+	New: func() interface{} { return make([]uint32, 0, 1024) },
+}
+
 type redactResult struct {
 	Index int
 	Data  []byte
@@ -217,7 +222,15 @@ func runRedact(ctx context.Context, opts Options) error {
 
 	buffer := make(map[int]redactResult)
 	nextFrame := 0
-	bar := progressbar.Default(int64(totalFrames), "Redacting")
+	var barTotal int64 = int64(totalFrames)
+	if barTotal <= 0 {
+		barTotal = -1 // Trigger spinner mode
+	}
+	bar := progressbar.NewOptions64(barTotal,
+		progressbar.OptionSetDescription("Redacting"),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionShowCount(),
+	)
 
 	go func() {
 		wg.Wait()
@@ -467,33 +480,54 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 		}
 
 		// 2. Vertical Pass: Read from Buffer -> Write to Image
-		for x := 0; x < w; x++ {
-			// Initialize Accumulator
-			var rSum, gSum, bSum uint32
-			for k := -radius; k <= radius; k++ {
-				py := k
-				if py < 0 {
-					py = 0
-				}
-				if py >= h {
-					py = h - 1
-				}
-				bufOff := py*w*4 + x*4
-				rSum += uint32(buf[bufOff])
-				gSum += uint32(buf[bufOff+1])
-				bSum += uint32(buf[bufOff+2])
+		// Optimization: Process ROW-BY-ROW instead of COLUMN-BY-COLUMN to improve CPU cache locality.
+		// We maintain running sums for every column in parallel.
+
+		// Use pool to reduce allocation
+		neededCols := w * 3
+		csPtr := colSumsPool.Get().([]uint32)
+		if cap(csPtr) < neededCols {
+			csPtr = make([]uint32, neededCols)
+		}
+		colSums := csPtr[:neededCols]
+		// Must zero out recycled buffer
+		for i := range colSums {
+			colSums[i] = 0
+		}
+		defer colSumsPool.Put(csPtr)
+
+		// Initialize accumulators for all columns (Kernel centered at y=0)
+		for k := -radius; k <= radius; k++ {
+			py := k
+			if py < 0 {
+				py = 0
+			}
+			if py >= h {
+				py = h - 1
 			}
 
-			count := uint32(2*radius + 1)
+			rowOffset := py * w * 4
+			for x := 0; x < w; x++ {
+				off := rowOffset + x*4
+				colSums[x*3] += uint32(buf[off])
+				colSums[x*3+1] += uint32(buf[off+1])
+				colSums[x*3+2] += uint32(buf[off+2])
+			}
+		}
 
-			for y := 0; y < h; y++ {
-				dstOff := (minY+y-imgMinY)*stride + (minX+x-imgMinX)*4
-				pix[dstOff] = uint8(rSum / count)
-				pix[dstOff+1] = uint8(gSum / count)
-				pix[dstOff+2] = uint8(bSum / count)
-				// Alpha is already 255 in image
+		count := uint32(2*radius + 1)
 
-				// Slide Window
+		for y := 0; y < h; y++ {
+			dstRowOff := (minY + y - imgMinY) * stride
+
+			for x := 0; x < w; x++ {
+				// Apply Blur to current pixel
+				dstOff := dstRowOff + (minX+x-imgMinX)*4
+				pix[dstOff] = uint8(colSums[x*3] / count)
+				pix[dstOff+1] = uint8(colSums[x*3+1] / count)
+				pix[dstOff+2] = uint8(colSums[x*3+2] / count)
+
+				// Update Accumulator for next row (y+1)
 				pRemove := y - radius
 				if pRemove < 0 {
 					pRemove = 0
@@ -507,9 +541,9 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 				offRemove := pRemove*w*4 + x*4
 				offAdd := pAdd*w*4 + x*4
 
-				rSum = rSum - uint32(buf[offRemove]) + uint32(buf[offAdd])
-				gSum = gSum - uint32(buf[offRemove+1]) + uint32(buf[offAdd+1])
-				bSum = bSum - uint32(buf[offRemove+2]) + uint32(buf[offAdd+2])
+				colSums[x*3] = colSums[x*3] - uint32(buf[offRemove]) + uint32(buf[offAdd])
+				colSums[x*3+1] = colSums[x*3+1] - uint32(buf[offRemove+1]) + uint32(buf[offAdd+1])
+				colSums[x*3+2] = colSums[x*3+2] - uint32(buf[offRemove+2]) + uint32(buf[offAdd+2])
 			}
 		}
 
