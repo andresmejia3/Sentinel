@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -20,11 +21,21 @@ func TestStoreIntegration(t *testing.T) {
 	ctx := context.Background()
 
 	// Explicitly check for Docker availability and fail hard if missing
-	if _, err := testcontainers.NewDockerClientWithOpts(ctx); err != nil {
+	// We wrap this in a function to recover from panics inside testcontainers (e.g. socket not found)
+	err := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("testcontainers panicked: %v", r)
+			}
+		}()
+		_, err = testcontainers.NewDockerClientWithOpts(ctx)
+		return
+	}()
+	if err != nil {
 		t.Fatalf("Docker not available, cannot run integration test: %v", err)
 	}
 
-	// 1. Start Postgres Container with pgvector
+	// Start Postgres Container with pgvector
 	// We use the official pgvector image to ensure the extension is available.
 	pgContainer, err := postgres.RunContainer(ctx,
 		testcontainers.WithImage("pgvector/pgvector:pg16"),
@@ -46,13 +57,13 @@ func TestStoreIntegration(t *testing.T) {
 		}
 	}()
 
-	// 2. Get Connection String
+	// Get Connection String
 	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		t.Fatalf("Failed to get connection string: %v", err)
 	}
 
-	// 3. Initialize Store (runs migrations)
+	// Initialize Store (runs migrations)
 	s, err := New(ctx, connStr)
 	if err != nil {
 		t.Fatalf("Failed to connect to store: %v", err)
@@ -61,7 +72,6 @@ func TestStoreIntegration(t *testing.T) {
 
 	// --- Test Scenarios ---
 
-	// A. Create Identity
 	vecA := make([]float64, 512)
 	vecA[0] = 1.0 // Vector A points along X axis
 	idA, err := s.CreateIdentity(ctx, vecA, 1)
@@ -72,7 +82,7 @@ func TestStoreIntegration(t *testing.T) {
 		t.Errorf("Expected positive ID, got %d", idA)
 	}
 
-	// B. Find Closest Identity (Exact Match)
+	// Find Closest Identity (Exact Match)
 	matchID, _, err := s.FindClosestIdentity(ctx, vecA, 0.1)
 	if err != nil {
 		t.Fatalf("FindClosestIdentity failed: %v", err)
@@ -81,7 +91,7 @@ func TestStoreIntegration(t *testing.T) {
 		t.Errorf("Expected match ID %d, got %d", idA, matchID)
 	}
 
-	// C. Find Closest Identity (No Match)
+	// Find Closest Identity (No Match)
 	vecB := make([]float64, 512)
 	vecB[1] = 1.0 // Vector B points along Y axis (Orthogonal to A)
 	// Distance should be ~1.0 (Cosine Dist). Threshold 0.1 should fail.
@@ -93,7 +103,7 @@ func TestStoreIntegration(t *testing.T) {
 		t.Errorf("Expected no match (-1), got %d", noMatchID)
 	}
 
-	// D. Update Identity (Weighted Average)
+	// Update Identity (Weighted Average)
 	// We update ID A with a new vector that is slightly different.
 	// Old: [1.0, 0.0...] (Count 1)
 	// New: [0.0, 1.0...] (Count 1)
@@ -126,7 +136,6 @@ func TestStoreIntegration(t *testing.T) {
 		t.Errorf("Expected updatedVec[1] to be ~0.5, got %f", updatedVec[1])
 	}
 
-	// E. Insert Interval
 	err = s.EnsureVideoMetadata(ctx, "vid_123", "/tmp/video.mp4")
 	if err != nil {
 		t.Fatalf("EnsureVideoMetadata failed: %v", err)
@@ -136,7 +145,6 @@ func TestStoreIntegration(t *testing.T) {
 		t.Fatalf("InsertInterval failed: %v", err)
 	}
 
-	// F. List Identities
 	identities, err := s.ListIdentities(ctx)
 	if err != nil {
 		t.Fatalf("ListIdentities failed: %v", err)

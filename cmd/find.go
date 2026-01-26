@@ -33,13 +33,11 @@ func init() {
 }
 
 func runFind(ctx context.Context, imagePath string, opts Options) error {
-	// 1. Validate Input
 	if _, err := os.Stat(imagePath); os.IsNotExist(err) {
 		utils.ShowError("Input file does not exist", err, nil)
 		return err
 	}
 
-	// 2. Start AI Worker
 	fmt.Fprintln(os.Stderr, "🚀 Starting AI Engine...")
 	cfg := worker.ScanConfig{
 		Debug:              opts.DebugScreenshots,
@@ -55,14 +53,12 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	}
 	defer w.Close()
 
-	// 3. Read Image
 	imgData, err := os.ReadFile(imagePath)
 	if err != nil {
 		utils.ShowError("Failed to read image file", err, nil)
 		return err
 	}
 
-	// 4. Process Frame
 	fmt.Fprintln(os.Stderr, "🔍 Analyzing face...")
 	faces, err := w.ProcessScanFrame(imgData)
 	if err != nil {
@@ -89,7 +85,6 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 		}
 	}
 
-	// 5. Search Database
 	fmt.Fprintln(os.Stderr, "🗄️  Searching database...")
 	id, name, err := DB.FindClosestIdentity(ctx, bestFace.Vec, opts.MatchThreshold)
 	if err != nil {
@@ -107,7 +102,6 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	}
 	fmt.Printf("✅ Found Match: %s (ID: %d)\n", name, id)
 
-	// 6. Retrieve Intervals
 	intervals, err := DB.GetIdentityIntervals(ctx, id)
 	if err != nil {
 		utils.ShowError("Failed to retrieve history", err, nil)
@@ -119,7 +113,6 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 		return nil
 	}
 
-	// 7. Display Results
 	wOut := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	fmt.Fprintln(wOut, "\nVIDEO\tTIME RANGE\tDURATION")
 	fmt.Fprintln(wOut, "-----\t----------\t--------")

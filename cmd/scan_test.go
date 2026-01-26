@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"os"
 	"testing"
@@ -74,11 +75,21 @@ func TestScanPersistence(t *testing.T) {
 	ctx := context.Background()
 
 	// Explicitly check for Docker availability and fail hard if missing
-	if _, err := testcontainers.NewDockerClientWithOpts(ctx); err != nil {
+	// We wrap this in a function to recover from panics inside testcontainers (e.g. socket not found)
+	err := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("testcontainers panicked: %v", r)
+			}
+		}()
+		_, err = testcontainers.NewDockerClientWithOpts(ctx)
+		return
+	}()
+	if err != nil {
 		t.Fatalf("Docker not available, cannot run integration test: %v", err)
 	}
 
-	// 1. Start Postgres Container
+	// Start Postgres Container
 	pgContainer, err := postgres.RunContainer(ctx,
 		testcontainers.WithImage("pgvector/pgvector:pg16"),
 		postgres.WithDatabase("sentinel_test"),
@@ -102,16 +113,15 @@ func TestScanPersistence(t *testing.T) {
 	}
 	defer db.Close(ctx)
 
-	// 2. Setup Test Data
+	// Setup Test Data
 	videoID := "vid_test_123"
 	db.EnsureVideoMetadata(ctx, videoID, "/tmp/test.mp4")
 
-	// 3. Simulate a Track Persistence
+	// Simulate a Track Persistence
 	// This mirrors the logic inside the persistTrack closure in scan.go
 	vec := make([]float64, 512)
 	vec[0] = 1.0
 
-	// Create Identity
 	id, err := db.CreateIdentity(ctx, vec, 10)
 	if err != nil {
 		t.Fatalf("Failed to create identity: %v", err)
@@ -127,13 +137,11 @@ func TestScanPersistence(t *testing.T) {
 		t.Fatalf("Failed to update identity: %v", err)
 	}
 
-	// Insert Interval
 	if err = db.InsertInterval(ctx, videoID, 0.0, 5.0, 10, id); err != nil {
 		t.Fatalf("Failed to insert interval: %v", err)
 	}
 
-	// 4. Verify
-	// A. Verify Vector Math
+	// Verify Vector Math
 	vecs, err := db.GetIdentityVectors(ctx, []int{id})
 	if err != nil {
 		t.Fatalf("Failed to retrieve vectors: %v", err)
@@ -143,7 +151,7 @@ func TestScanPersistence(t *testing.T) {
 		t.Errorf("UpdateIdentity failed weighted average. Expected ~0.5 at indices 0&1, got %v", gotVec[:2])
 	}
 
-	// B. Verify Intervals
+	// Verify Intervals
 	intervals, err := db.GetIdentityIntervals(ctx, id)
 	if err != nil {
 		t.Fatalf("Failed to get intervals for verification: %v", err)

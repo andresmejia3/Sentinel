@@ -7,7 +7,7 @@ on:
     branches: [ "main", "master" ]
 
 jobs:
-  # Job 1: Validate Go Architecture (Orchestrator)
+  # Validate Go Architecture (Orchestrator)
   build-go:
     name: Go Build & Test
     runs-on: ubuntu-latest
@@ -33,7 +33,7 @@ jobs:
         # Ensures the code compiles for the target architecture
         run: go build -v ./...
 
-  # Job 2: Validate Python Logic (Inference Engine)
+  # Validate Python Logic (Inference Engine)
   test-python:
     name: Python Test & Lint
     runs-on: ubuntu-latest
@@ -57,7 +57,7 @@ jobs:
       - name: Run Unit Tests
         run: pytest python/test_worker.py
 
-  # Job 3: Validate Docker Image Build
+  # Validate Docker Image Build
   build-docker:
     name: Docker Build
     runs-on: ubuntu-latest
@@ -78,7 +78,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Job 4: End-to-End Smoke Test
+  # End-to-End Smoke Test
   smoke-test:
     name: E2E Smoke Test
     runs-on: ubuntu-latest

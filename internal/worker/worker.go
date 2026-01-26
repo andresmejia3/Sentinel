@@ -55,7 +55,6 @@ type RedactConfig struct {
 func newBaseWorker(ctx context.Context, id int, script string, args []string, readTimeout time.Duration) (*baseWorker, error) {
 	fullArgs := append([]string{"-u", script}, args...)
 
-	// 1. Initialize the SafeCommand we built
 	py := utils.NewSafeCommand(ctx, "python3", fullArgs...)
 
 	// Create a side-channel pipe (FD 3) for clean data transfer
@@ -72,13 +71,13 @@ func newBaseWorker(ctx context.Context, id int, script string, args []string, re
 	stdin, err := py.StdinPipe()
 	if err != nil {
 		w.Close() // Prevent FD leak
-		r.Close() // Close read-end too!
+		r.Close()
 		return nil, fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
 
 	if err := py.Start(); err != nil {
 		w.Close() // Close write end if start fails
-		r.Close() // Close read-end too!
+		r.Close()
 		return nil, fmt.Errorf("worker %d failed to start: %w", id, err)
 	}
 
@@ -109,7 +108,7 @@ func newBaseWorker(ctx context.Context, id int, script string, args []string, re
 			return nil, fmt.Errorf("worker %d handshake failed: %w\nLogs:\n%s", id, err, py.Stderr.String())
 		}
 	case <-ctx.Done():
-		r.Close()     // Close the read pipe
+		r.Close()
 		py.Cmd.Wait() // Wait for the process to exit (cleaned up by CommandContext) to avoid zombies
 		return nil, fmt.Errorf("worker %d handshake cancelled: %w", id, ctx.Err())
 	}
@@ -124,7 +123,6 @@ func newBaseWorker(ctx context.Context, id int, script string, args []string, re
 	}, nil
 }
 
-// NewPythonScanWorker creates a worker using python/scan_worker.py
 func NewPythonScanWorker(ctx context.Context, id int, cfg ScanConfig) (*ScanWorker, error) {
 	args := []string{}
 	if cfg.Debug {
@@ -142,7 +140,6 @@ func NewPythonScanWorker(ctx context.Context, id int, cfg ScanConfig) (*ScanWork
 	return &ScanWorker{baseWorker: base}, nil
 }
 
-// NewPythonRedactWorker creates a worker using python/redact_worker.py
 func NewPythonRedactWorker(ctx context.Context, id int, cfg RedactConfig) (*RedactWorker, error) {
 	args := []string{}
 	if cfg.Debug {
@@ -196,10 +193,10 @@ func (w *baseWorker) readResponse() ([]byte, error) {
 		return nil, fmt.Errorf("worker returned oversized response: %d bytes", respLen)
 	}
 	if respLen < 5 {
+		// Minimum payload: Status (1 byte) + NumFaces (4 bytes)
 		return nil, fmt.Errorf("worker returned invalid response length: %d bytes (min 5)", respLen)
 	}
 
-	// Resize reusable buffer
 	// Optimization: Use a growth strategy (2x) to avoid frequent re-allocations when frame sizes fluctuate.
 	needed := int(respLen)
 	if cap(w.readBuf) < needed {
@@ -222,7 +219,6 @@ func (w *baseWorker) readResponse() ([]byte, error) {
 	return w.readBuf, nil
 }
 
-// ProcessScanFrame handles the full protocol: [Box][Vec][Qual][ImgLen][Img]
 func (w *ScanWorker) ProcessScanFrame(data []byte) ([]types.FaceResult, error) {
 	if err := w.sendFrame(data); err != nil {
 		return nil, err
@@ -233,14 +229,12 @@ func (w *ScanWorker) ProcessScanFrame(data []byte) ([]types.FaceResult, error) {
 		return nil, err
 	}
 
-	// --- Parse Binary Payload ---
 	cursor := 0
 
-	// 1. Status Byte
 	status := resp[cursor]
 	cursor++
 
-	if status == 1 { // Error from Python
+	if status == 1 {
 		msgLen := binary.BigEndian.Uint32(resp[cursor:])
 		cursor += 4
 		if msgLen > 1<<20 { // Safety check: Max 1MB error message
@@ -250,7 +244,6 @@ func (w *ScanWorker) ProcessScanFrame(data []byte) ([]types.FaceResult, error) {
 		return nil, fmt.Errorf("python worker error: %s", string(msg))
 	}
 
-	// 2. Num Faces
 	numFaces := binary.BigEndian.Uint32(resp[cursor:])
 	cursor += 4
 
@@ -303,7 +296,6 @@ func (w *ScanWorker) ProcessScanFrame(data []byte) ([]types.FaceResult, error) {
 	return results, nil
 }
 
-// ProcessRedactFrame handles the optimized protocol: [Box][Vec]
 func (w *RedactWorker) ProcessRedactFrame(data []byte) ([]types.FaceResult, error) {
 	if err := w.sendFrame(data); err != nil {
 		return nil, err
@@ -316,7 +308,6 @@ func (w *RedactWorker) ProcessRedactFrame(data []byte) ([]types.FaceResult, erro
 
 	cursor := 0
 
-	// 1. Status Byte
 	status := resp[cursor]
 	cursor++
 
@@ -330,7 +321,6 @@ func (w *RedactWorker) ProcessRedactFrame(data []byte) ([]types.FaceResult, erro
 		return nil, fmt.Errorf("python worker error: %s", string(msg))
 	}
 
-	// 2. Num Faces
 	numFaces := binary.BigEndian.Uint32(resp[cursor:])
 	cursor += 4
 

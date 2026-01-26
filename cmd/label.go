@@ -31,10 +31,9 @@ func init() {
 }
 
 func runLabel(id int, name string) error {
-	// 1. Database is initialized in Root PersistentPreRun
+	// Database is initialized in Root PersistentPreRun
 	ctx := context.Background()
 
-	// 2. Rename the existing identity
 	if err := DB.RenameIdentity(ctx, id, name); err != nil {
 		utils.ShowError("Failed to label identity", err, nil)
 		return err

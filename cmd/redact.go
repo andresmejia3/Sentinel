@@ -21,13 +21,14 @@ import (
 )
 
 var (
-	redactOpts     Options
-	redactOutput   string
-	redactMode     string
-	redactTargets  string
-	redactStyle    string
-	redactLinger   string
-	redactParanoid bool
+	redactOpts       Options
+	redactOutput     string
+	redactMode       string
+	redactTargets    string
+	redactStyle      string
+	redactLinger     string
+	redactParanoid   bool
+	redactBufferSize int
 )
 
 var redactCmd = &cobra.Command{
@@ -35,7 +36,7 @@ var redactCmd = &cobra.Command{
 	Short: "Redact faces in a video based on detection or identity",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
-		return runRedact(cmd.Context(), redactOpts)
+		return runRedact(cmd.Context(), cmd, redactOpts)
 	},
 }
 
@@ -53,6 +54,7 @@ func init() {
 	redactCmd.Flags().Float64VarP(&redactOpts.DetectionThreshold, "detection-threshold", "D", 0.5, "Face detection confidence threshold")
 	redactCmd.Flags().IntVarP(&redactOpts.BlurStrength, "strength", "s", 15, "Pixelation block size (higher = more blocky)")
 	redactCmd.Flags().StringVar(&redactOpts.WorkerTimeout, "worker-timeout", "30s", "Timeout for a worker to process a single frame")
+	redactCmd.Flags().IntVarP(&redactBufferSize, "buffer-size", "B", 35, "Max number of frames to buffer in memory (prevents OOM)")
 
 	redactCmd.MarkFlagRequired("input")
 	rootCmd.AddCommand(redactCmd)
@@ -78,12 +80,12 @@ type redactionTrack struct {
 
 // paranoidTracker manages the stateful redaction logic, including lingering and paranoid mode.
 type paranoidTracker struct {
-	targetVecs   map[int][]float64 // Optimization 1: In-memory embeddings
+	targetVecs   map[int][]float64 // Optimization: In-memory embeddings
 	activeTracks []*redactionTrack
 	opts         *Options
 }
 
-func runRedact(ctx context.Context, opts Options) error {
+func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	// Create a cancellable context to ensure all child processes (FFmpeg, Python)
 	// are killed immediately if this function returns early (e.g. on error).
 	ctx, cancel := context.WithCancel(ctx)
@@ -110,7 +112,6 @@ func runRedact(ctx context.Context, opts Options) error {
 		}
 	}
 
-	// Ensure output directory exists to prevent FFmpeg failure
 	if err := os.MkdirAll(filepath.Dir(redactOutput), 0755); err != nil {
 		utils.ShowError("Failed to create output directory", err, nil)
 		return err
@@ -135,7 +136,7 @@ func runRedact(ctx context.Context, opts Options) error {
 	var wg sync.WaitGroup
 	readyChan := make(chan bool, opts.NumEngines)
 
-	// Optimization 1: Load target embeddings into memory
+	// Optimization: Load target embeddings into memory
 	targetVecs, err := DB.GetIdentityVectors(ctx, targetIDs)
 	if err != nil {
 		utils.ShowError("Failed to load target embeddings", err, nil)
@@ -151,6 +152,37 @@ func runRedact(ctx context.Context, opts Options) error {
 	}
 
 	workerTimeout, _ := time.ParseDuration(opts.WorkerTimeout)
+
+	// Flow Control: Prevent OOM by limiting in-flight frames.
+	// This is a CAP (Semaphore), not an upfront allocation. However, since decoding is faster
+	// than inference, the buffer will typically fill up to this limit during operation.
+	if !cmd.Flags().Changed("buffer-size") {
+
+		totalPixels := width * height
+
+		if totalPixels <= 2048*1080 { //1080p
+			redactBufferSize = 200
+			fmt.Fprintf(os.Stderr, "⚡ Standard-Res Video detected. Auto-setting buffer to %d frames (Max ~1.5GB) for performance.\n", redactBufferSize)
+
+		} else if totalPixels <= 4096*2160 { // 4K (Cover DCI 4K)
+			redactBufferSize = 45
+			fmt.Fprintf(os.Stderr, "⚠️  4K High-Res Video detected. Auto-setting buffer to %d frames (Max ~1.5GB) to prevent OOM.\n", redactBufferSize)
+
+		} else if totalPixels <= 8192*4320 { // 8K (Cover DCI 8K)
+			redactBufferSize = 11
+			fmt.Fprintf(os.Stderr, "⚠️  8K High-Res Video detected. Auto-setting buffer to %d frames (Max ~1.5GB) to prevent OOM.\n", redactBufferSize)
+
+		} else { // 8K+
+			redactBufferSize = 3
+			fmt.Fprintf(os.Stderr, "⚠️  Extreme-Res Video detected. Auto-setting buffer to %d frames (Max ~1.5GB for 16K) to prevent OOM.\n", redactBufferSize)
+
+		}
+	}
+
+	if redactBufferSize < 1 {
+		redactBufferSize = 1
+	}
+	inflightSem := make(chan struct{}, redactBufferSize)
 
 	for i := 0; i < opts.NumEngines; i++ {
 		wg.Add(1)
@@ -200,7 +232,6 @@ func runRedact(ctx context.Context, opts Options) error {
 		}(i)
 	}
 
-	// Wait for workers to be ready
 	fmt.Fprintln(os.Stderr, "🚀 Warming up engines...")
 	for i := 0; i < opts.NumEngines; i++ {
 		select {
@@ -224,6 +255,13 @@ func runRedact(ctx context.Context, opts Options) error {
 		utils.ShowError("Failed to start decoder", err, nil)
 		return err
 	}
+	// Ensure we reap the process even if we return early
+	decoderWaited := false
+	defer func() {
+		if !decoderWaited {
+			decoder.Wait()
+		}
+	}()
 
 	var encoderStderr bytes.Buffer
 	encoder := utils.NewFFmpegEncoder(ctx, redactOutput, fps, width, height)
@@ -237,10 +275,18 @@ func runRedact(ctx context.Context, opts Options) error {
 		utils.ShowError("Failed to start encoder", err, nil)
 		return err
 	}
+	// Ensure we reap the process even if we return early
+	encoderWaited := false
+	defer func() {
+		if !encoderWaited {
+			encoder.Wait()
+		}
+	}()
 
 	go func() {
 		frameSize := width * height * 4
 		idx := 0
+		defer close(taskChan) // Fix: Ensure channel is closed even on early return
 		for {
 			// We use the shared pool from scan.go to reduce GC pressure
 			buf := frameBufferPool.Get().([]byte)
@@ -256,6 +302,13 @@ func runRedact(ctx context.Context, opts Options) error {
 				break
 			}
 
+			// Acquire semaphore (Block if too many frames are in flight)
+			select {
+			case inflightSem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+
 			select {
 			case taskChan <- types.FrameTask{Index: idx, Data: buf}:
 				idx++
@@ -263,7 +316,6 @@ func runRedact(ctx context.Context, opts Options) error {
 				return
 			}
 		}
-		close(taskChan)
 	}()
 
 	buffer := make(map[int]redactResult)
@@ -291,17 +343,25 @@ func runRedact(ctx context.Context, opts Options) error {
 	go func() {
 		defer writerWg.Done()
 		var writeError error
-		for data := range writeChan {
-			if writeError == nil {
-				if _, err := encoderIn.Write(data); err != nil {
-					writeError = err
-					select {
-					case writeErrChan <- err:
-					default:
+		for {
+			select {
+			case data, ok := <-writeChan:
+				if !ok {
+					return
+				}
+				if writeError == nil {
+					if _, err := encoderIn.Write(data); err != nil {
+						writeError = err
+						select {
+						case writeErrChan <- err:
+						default:
+						}
 					}
 				}
+				frameBufferPool.Put(data)
+			case <-ctx.Done():
+				return
 			}
-			frameBufferPool.Put(data)
 		}
 	}()
 
@@ -338,6 +398,9 @@ func runRedact(ctx context.Context, opts Options) error {
 					return ctx.Err()
 				}
 
+				// Release semaphore, allowing decoder to read more frames
+				<-inflightSem
+
 				bar.Add(1)
 				nextFrame++
 			}
@@ -349,6 +412,7 @@ Flush:
 	writerWg.Wait()
 
 	encoderIn.Close()
+	encoderWaited = true
 	if err := encoder.Wait(); err != nil {
 		if encoderStderr.Len() > 0 {
 			fmt.Fprintf(os.Stderr, "\nFFmpeg Encoder Logs:\n%s\n", encoderStderr.String())
@@ -356,6 +420,7 @@ Flush:
 		utils.ShowError("Encoder process failed", err, nil)
 		return err
 	}
+	decoderWaited = true
 	if err := decoder.Wait(); err != nil {
 		if decoderStderr.Len() > 0 {
 			fmt.Fprintf(os.Stderr, "\nFFmpeg Decoder Logs:\n%s\n", decoderStderr.String())
@@ -375,7 +440,7 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 	}
 	strength := p.opts.BlurStrength
 
-	// Optimization 2: Copy master list to a "missing" set.
+	// Optimization: Copy master list to a "missing" set.
 	// We remove IDs as we find them. If any remain, paranoid mode triggers.
 	missingTargets := make(map[int]bool, len(p.targetVecs))
 	if mode == "targeted" {
@@ -390,13 +455,11 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 		faceIdentities[i] = -1
 	}
 
-	// 1. Identify faces using In-Memory Embeddings
 	for i, face := range faces {
 		if mode == "targeted" {
 			bestID := -1
 			minDist := p.opts.MatchThreshold
 
-			// Check against loaded targets
 			for tID, tVec := range p.targetVecs {
 				dist := utils.CosineDist(face.Vec, tVec)
 				if dist < minDist {
@@ -409,19 +472,16 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 				faceIdentities[i] = bestID
 				delete(missingTargets, bestID) // Found it! Remove from missing list.
 
-				// Update Linger Track
 				p.updateTrack(bestID, frameIndex, image.Rect(face.Loc[0], face.Loc[1], face.Loc[2], face.Loc[3]))
 			}
 		}
 	}
 
-	// 2. Paranoid Check
 	isParanoidActive := false
 	if paranoid && mode == "targeted" && len(missingTargets) > 0 {
 		isParanoidActive = true
 	}
 
-	// 3. Apply Redaction
 	for i, face := range faces {
 		shouldBlur := false
 		if mode == "blur-all" || isParanoidActive {
@@ -438,7 +498,7 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 		}
 	}
 
-	// 4. Apply Linger (only in targeted mode)
+	// Apply Linger (only in targeted mode)
 	// If paranoid is active, we are blurring all detected faces.
 	// However, linger covers *undetected* faces (lost tracking), so we still apply it.
 	if mode == "targeted" {
@@ -452,7 +512,6 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 		}
 	}
 
-	// 5. Prune old tracks
 	p.pruneTracks(frameIndex, lingerFrames)
 
 	return m.Pix, nil
@@ -514,7 +573,6 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 		pix := img.Pix
 		imgMinX, imgMinY := img.Rect.Min.X, img.Rect.Min.Y
 
-		// Scan Top & Bottom borders
 		for x := rect.Min.X; x < rect.Max.X; x++ {
 			if y := rect.Min.Y - 1; y >= img.Bounds().Min.Y { // Top
 				off := (y-imgMinY)*stride + (x-imgMinX)*4
@@ -531,7 +589,6 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 				count++
 			}
 		}
-		// Scan Left & Right borders
 		for y := rect.Min.Y; y < rect.Max.Y; y++ {
 			if x := rect.Min.X - 1; x >= img.Bounds().Min.X { // Left
 				off := (y-imgMinY)*stride + (x-imgMinX)*4
@@ -589,7 +646,7 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 		minX, minY := rect.Min.X, rect.Min.Y
 		imgMinX, imgMinY := img.Rect.Min.X, img.Rect.Min.Y
 
-		// 1. Horizontal Pass: Read from Image -> Write to Buffer
+		// Horizontal Pass: Read from Image -> Write to Buffer
 		for y := 0; y < h; y++ {
 			rowStart := (minY + y - imgMinY) * stride
 			bufRowStart := y * w * 4
@@ -615,7 +672,7 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 			}
 		}
 
-		// 2. Vertical Pass: Read from Buffer -> Write to Image
+		// Vertical Pass: Read from Buffer -> Write to Image
 		for y := 0; y < h; y++ {
 			dstRowOff := (minY + y - imgMinY) * stride
 			for x := 0; x < w; x++ {
@@ -652,11 +709,9 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 
 		for y := rect.Min.Y; y < rect.Max.Y; y += blockSize {
 			for x := rect.Min.X; x < rect.Max.X; x += blockSize {
-				// Get color of top-left pixel
 				srcOff := (y-imgMinY)*stride + (x-imgMinX)*4
 				r, g, b, a := pix[srcOff], pix[srcOff+1], pix[srcOff+2], pix[srcOff+3]
 
-				// Calculate block bounds
 				x2 := x + blockSize
 				if x2 > rect.Max.X {
 					x2 = rect.Max.X
@@ -666,7 +721,6 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 					y2 = rect.Max.Y
 				}
 
-				// Fill block using direct slice access
 				for by := y; by < y2; by++ {
 					rowStart := (by - imgMinY) * stride
 					for bx := x; bx < x2; bx++ {

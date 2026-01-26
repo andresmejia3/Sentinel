@@ -24,7 +24,10 @@ func New(ctx context.Context, connString string) (*Store, error) {
 	for i := 0; i < 15; i++ {
 		pool, err = pgxpool.New(ctx, connString)
 		if err == nil {
-			break
+			if pool.Ping(ctx) == nil {
+				break
+			}
+			pool.Close() // Fix: Close the pool if Ping fails to prevent resource leak
 		}
 		fmt.Fprintf(os.Stderr, "⏳ Database not ready (Attempt %d/15). Retrying in 2s...\n", i+1)
 		select {
@@ -38,7 +41,6 @@ func New(ctx context.Context, connString string) (*Store, error) {
 		return nil, fmt.Errorf("database connection failed after retries: %w", err)
 	}
 
-	// Initialize schema (Auto-Migration)
 	if err := initSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("failed to initialize database schema: %w", err)
@@ -79,7 +81,6 @@ func initSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	return err
 }
 
-// Close terminates the database connection.
 func (s *Store) Close(ctx context.Context) {
 	s.pool.Close()
 }
@@ -120,12 +121,10 @@ func (s *Store) CommitScan(ctx context.Context, videoID string, intervals []Inte
 	}
 	defer tx.Rollback(ctx)
 
-	// 1. Delete old intervals for this video
 	if _, err := tx.Exec(ctx, "DELETE FROM face_intervals WHERE video_id = $1", videoID); err != nil {
 		return fmt.Errorf("failed to delete old intervals: %w", err)
 	}
 
-	// 2. Batch insert new intervals
 	if len(intervals) > 0 {
 		batch := &pgx.Batch{}
 		for _, i := range intervals {
@@ -192,7 +191,6 @@ func (s *Store) GetIdentityVectors(ctx context.Context, ids []int) (map[int][]fl
 		if err := rows.Scan(&id, &vec32); err != nil {
 			return nil, err
 		}
-		// Convert float32 (db) to float64 (app)
 		vec64 := make([]float64, len(vec32))
 		for i, v := range vec32 {
 			vec64[i] = float64(v)
@@ -226,7 +224,6 @@ func (s *Store) UpdateIdentity(ctx context.Context, id int, newVec []float64, ne
 	}
 	defer tx.Rollback(ctx)
 
-	// 1. Fetch current state
 	// Optimization: Cast to real[] to let pgx scan directly into []float32 (Binary Protocol)
 	// This avoids the expensive string parsing of "[0.1, 0.2...]"
 	var oldVec []float32
@@ -236,7 +233,6 @@ func (s *Store) UpdateIdentity(ctx context.Context, id int, newVec []float64, ne
 		return err
 	}
 
-	// 2. Weighted Math
 	totalCount := float64(oldCount + newCount)
 	finalVec := make([]float32, len(oldVec))
 
@@ -245,7 +241,6 @@ func (s *Store) UpdateIdentity(ctx context.Context, id int, newVec []float64, ne
 		finalVec[i] = float32(val)
 	}
 
-	// 3. Update
 	// We pass the []float32 slice directly. pgx sends it as a float array, and Postgres casts it to vector.
 	_, err = tx.Exec(ctx, "UPDATE known_identities SET embedding = $1::real[]::vector, face_count = $2 WHERE id = $3", finalVec, int(totalCount), id)
 	if err != nil {
@@ -254,7 +249,6 @@ func (s *Store) UpdateIdentity(ctx context.Context, id int, newVec []float64, ne
 	return tx.Commit(ctx)
 }
 
-// RenameIdentity updates the name of a known identity.
 func (s *Store) RenameIdentity(ctx context.Context, id int, newName string) error {
 	_, err := s.pool.Exec(ctx, "UPDATE known_identities SET name = $1 WHERE id = $2", newName, id)
 	return err
@@ -286,7 +280,6 @@ type IdentityMetadata struct {
 	CreatedAt time.Time
 }
 
-// ListIdentities returns all known identities for display.
 func (s *Store) ListIdentities(ctx context.Context) ([]IdentityMetadata, error) {
 	rows, err := s.pool.Query(ctx, "SELECT id, COALESCE(name, ''), face_count, created_at FROM known_identities ORDER BY id ASC")
 	if err != nil {
@@ -313,7 +306,6 @@ type IntervalResult struct {
 	End       float64
 }
 
-// GetIdentityIntervals retrieves all time intervals for a specific identity ID.
 func (s *Store) GetIdentityIntervals(ctx context.Context, identityID int) ([]IntervalResult, error) {
 	query := `
 		SELECT f.video_id, v.path, f.start_time, f.end_time

@@ -16,7 +16,7 @@ import (
 	"strings"
 )
 
-// --- 1. Process Safety & Command Wrapping ---
+// --- Process Safety & Command Wrapping ---
 
 // SafeCommand wraps a standard exec.Cmd with a buffer to catch Stderr (Python logs)
 // This ensures we don't lose critical crash information if a worker dies.
@@ -65,7 +65,7 @@ func ShowError(context string, err error, s *SafeCommand) {
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 }
 
-// --- 2. Video Engine (Shared by Scan & Redact) ---
+// --- Video Engine (Shared by Scan & Redact) ---
 
 var (
 	JpegSOI = []byte{0xFF, 0xD8} // Start of Image
@@ -75,7 +75,6 @@ var (
 // GetTotalFrames uses ffprobe to count packets for the progress bar
 // It returns 0 if the count fails, allowing the scanner to fallback to a spinner.
 func GetTotalFrames(ctx context.Context, path string) int {
-	// 0. Check dependency
 	if _, err := exec.LookPath("ffprobe"); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠️  ffprobe not found. Cannot provide a progress bar estimation because of this.\n")
 		return 0
@@ -89,7 +88,7 @@ func GetTotalFrames(ctx context.Context, path string) int {
 		} `json:"streams"`
 	}
 
-	// 1. Fast Path: Check Container Metadata
+	// Fast Path: Check Container Metadata
 	// This is instant but might return "N/A" or be inaccurate for VFR.
 	cmdFast := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames", "-of", "json", path)
 	if out, err := cmdFast.Output(); err == nil {

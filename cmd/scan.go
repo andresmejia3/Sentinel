@@ -23,6 +23,7 @@ const megabyte = 1024 * 1024
 const embeddingDim = 512
 
 var scanOpts Options
+var scanBufferSize int
 
 var scanCmd = &cobra.Command{
 	Use:   "scan",
@@ -46,6 +47,7 @@ func init() {
 
 	scanCmd.Flags().StringVar(&scanOpts.WorkerTimeout, "worker-timeout", "30s", "Timeout for a worker to process a single frame")
 	scanCmd.Flags().StringVar(&scanOpts.QualityStrategy, "quality-strategy", "clarity", "Strategy for calculating face quality (clarity, portrait, confidence, legacy)")
+	scanCmd.Flags().IntVarP(&scanBufferSize, "buffer-size", "B", 200, "Max number of frames to buffer in memory")
 
 	scanCmd.MarkFlagRequired("input")
 	rootCmd.AddCommand(scanCmd)
@@ -75,6 +77,13 @@ func runScan(ctx context.Context, opts Options) error {
 	resultsChan := make(chan scanResult, opts.NumEngines*2)
 	var wg sync.WaitGroup
 
+	// Flow Control: Prevent OOM by limiting in-flight frames.
+	// Limits buffering in the aggregator if a worker stalls.
+	if scanBufferSize < 1 {
+		scanBufferSize = 1
+	}
+	inflightSem := make(chan struct{}, scanBufferSize)
+
 	estMemGB := 0.5 + (float64(opts.NumEngines) * 1.2)
 	fmt.Fprintf(os.Stderr, "⚙️  Spawning %d Worker Engines (Est. Memory: ~%.1f GB)...\n", opts.NumEngines, estMemGB)
 
@@ -88,7 +97,6 @@ func runScan(ctx context.Context, opts Options) error {
 		}(i)
 	}
 
-	// 2. Generate Video ID & Register
 	videoID, err := utils.GenerateVideoID(opts.InputPath)
 	if err != nil {
 		utils.ShowError("Failed to generate video ID", err, nil)
@@ -100,14 +108,12 @@ func runScan(ctx context.Context, opts Options) error {
 	}
 	fmt.Fprintf(os.Stderr, "📼 Processing Video ID: %s\n", videoID[:12])
 
-	// 3. Get FPS for Time Calculations
 	fps, err := utils.GetVideoFPS(ctx, opts.InputPath)
 	if err != nil {
 		utils.ShowError("Failed to determine video FPS", err, nil)
 		return err
 	}
 
-	// 5. Get total frames for progress bar
 	totalVideoFrames := utils.GetTotalFrames(ctx, opts.InputPath)
 
 	if totalVideoFrames <= 0 {
@@ -115,7 +121,6 @@ func runScan(ctx context.Context, opts Options) error {
 		totalVideoFrames = -1
 	}
 
-	// Progress bar for worker startup
 	workerBar := progressbar.NewOptions(opts.NumEngines,
 		progressbar.OptionSetDescription("🚀 Warming Up AI Engines"),
 		progressbar.OptionSetWriter(os.Stderr),
@@ -123,7 +128,7 @@ func runScan(ctx context.Context, opts Options) error {
 		progressbar.OptionClearOnFinish(),
 	)
 
-	// WAIT HERE: Ensure all workers are ready before starting the heavy scan
+	// Wait for all workers to be ready before starting the heavy scan
 	for i := 0; i < opts.NumEngines; i++ {
 		select {
 		case <-readyChan:
@@ -141,16 +146,14 @@ func runScan(ctx context.Context, opts Options) error {
 		progressbar.OptionShowCount(),
 	)
 
-	// 6. Start Aggregator (Consumer)
-	// Must run concurrently to prevent deadlock on resultsChan
+	// Start Aggregator (Consumer) concurrently to prevent deadlock on resultsChan
 	aggDone := make(chan struct{})
 	finalIntervalsChan := make(chan []store.IntervalData, 1)
 	go func() {
-		processResults(ctx, resultsChan, DB, videoID, fps, opts, errChan, finalIntervalsChan)
+		processResults(ctx, resultsChan, DB, videoID, fps, opts, errChan, finalIntervalsChan, inflightSem)
 		close(aggDone)
 	}()
 
-	// 8. Start FFmpeg
 	ffmpeg := utils.NewFFmpegCmd(ctx, opts.InputPath, opts.NthFrame)
 
 	var stderrBuf bytes.Buffer
@@ -167,8 +170,14 @@ func runScan(ctx context.Context, opts Options) error {
 		utils.ShowError("Failed to start FFmpeg", err, nil)
 		return err
 	}
+	// Ensure we reap the process even if we return early
+	ffmpegWaited := false
+	defer func() {
+		if !ffmpegWaited {
+			ffmpeg.Wait()
+		}
+	}()
 
-	// 9. Frame Splitter & Nth-Frame Logic
 	scanner := bufio.NewScanner(ffmpegOut)
 	scanner.Buffer(make([]byte, megabyte), 64*megabyte)
 	scanner.Split(utils.SplitJpeg)
@@ -193,13 +202,19 @@ func runScan(ctx context.Context, opts Options) error {
 
 		bar.Add(opts.NthFrame) // Advance bar by N for every 1 frame read
 
-		// Get buffer from pool
 		buf := frameBufferPool.Get().([]byte)
 		if cap(buf) < len(scanner.Bytes()) {
 			buf = make([]byte, len(scanner.Bytes()))
 		}
 		buf = buf[:len(scanner.Bytes())]
 		copy(buf, scanner.Bytes())
+
+		// Acquire semaphore (Block if too many frames are in flight)
+		select {
+		case inflightSem <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 
 		select {
 		case taskChan <- types.FrameTask{Index: virtualIndex, Data: buf}:
@@ -211,13 +226,12 @@ func runScan(ctx context.Context, opts Options) error {
 		}
 	}
 
-	// Check for scanner errors (e.g. token too long, unexpected EOF)
 	if err := scanner.Err(); err != nil {
 		utils.ShowError("Frame scanner failed", err, nil)
 		return err
 	}
 
-	// 10. Cleanup & Completion Check
+	ffmpegWaited = true // Mark as waited so defer doesn't run
 	if err := ffmpeg.Wait(); err != nil {
 		if stderrBuf.Len() > 0 {
 			fmt.Fprintf(os.Stderr, "\nFFmpeg Logs:\n%s\n", stderrBuf.String())
@@ -228,7 +242,6 @@ func runScan(ctx context.Context, opts Options) error {
 
 	close(taskChan)
 
-	// Fix: Avoid deadlock if aggregator fails while workers are still running.
 	// Instead of blocking on wg.Wait(), we wait in a goroutine and select on it.
 	wgDone := make(chan struct{})
 	go func() {
@@ -247,14 +260,11 @@ func runScan(ctx context.Context, opts Options) error {
 
 	close(resultsChan)
 
-	// Wait for aggregator to finish processing
 	<-aggDone
 
-	// Get final intervals from the aggregator
 	intervals := <-finalIntervalsChan
 
-	// ATOMIC COMMIT: All intervals are now inserted in a single transaction.
-	// If the scan had failed, the old data would have been preserved.
+	// Atomic Commit: All intervals are inserted in a single transaction.
 	fmt.Fprintf(os.Stderr, "🗄️  Committing %d intervals to database...\n", len(intervals))
 	if err := DB.CommitScan(ctx, videoID, intervals); err != nil {
 		utils.ShowError("Failed to commit scan results", err, nil)
@@ -321,7 +331,6 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 			frameBufferPool.Put(task.Data)
 
 			if err != nil {
-				// DRAIN: Wait for process to exit and capture final stderr logs
 				worker.Close()
 				utils.ShowError("Python crashed", err, worker.Cmd)
 				select {
@@ -360,13 +369,12 @@ type timeRange struct {
 	End   float64
 }
 
-func processResults(ctx context.Context, results <-chan scanResult, db *store.Store, videoID string, fps float64, opts Options, errChan chan<- error, finalIntervalsChan chan<- []store.IntervalData) {
+func processResults(ctx context.Context, results <-chan scanResult, db *store.Store, videoID string, fps float64, opts Options, errChan chan<- error, finalIntervalsChan chan<- []store.IntervalData, inflightSem chan struct{}) {
 	// Buffer for re-ordering frames (Worker 2 might finish before Worker 1)
 	buffer := make(map[int]scanResult)
 	nextFrame := 0
 
-	// Tracking state
-	// This slice will hold all the final interval data to be batch-inserted at the end.
+	// Holds all final interval data to be batch-inserted at the end
 	var finalIntervals []store.IntervalData
 
 	var tracks []*activeTrack
@@ -382,7 +390,6 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 	summary := make(map[int][]timeRange)
 	totalDetections := 0
 
-	// WaitGroup to ensure all async persistence tasks finish before we exit
 	var consumerWg sync.WaitGroup
 	var producerWg sync.WaitGroup
 
@@ -393,8 +400,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		maxGapFrames = 1 // Ensure at least 1 frame gap to prevent instant closing
 	}
 
-	// Determine output directory base
-	// If /data exists (Docker volume), use it. Otherwise use relative "data" (Local).
+	// If /data exists (Docker volume), use it. Otherwise use relative "data" (Local)
 	outputBase := "data"
 	if _, err := os.Stat("/data"); err == nil {
 		outputBase = "/data"
@@ -409,11 +415,9 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		}
 		return
 	}
-	// Log the location so the user knows where to look
 	fmt.Fprintf(os.Stderr, "📂 Output Directory: %s\n", unknownDir)
 
-	// Async Thumbnail Writer (Sequential to prevent race conditions)
-	// We use a buffered channel to offload disk I/O without blocking the main loop,
+	// We use a buffered channel to offload thumbnail disk I/O without blocking the main loop,
 	// while ensuring that writes for the same ID happen in order.
 	type thumbOp struct {
 		id   int
@@ -444,13 +448,9 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 
 	// Ensure cleanup happens even if we return early due to error (e.g. DB failure)
 	defer func() {
-		// 1. Wait for all DB updates to finish
 		producerWg.Wait()
-		// 2. Close the channel to signal the consumer
 		close(thumbChan)
-		// 3. Wait for the consumer to finish draining the channel
 		consumerWg.Wait()
-		// 4. Send final results back to main goroutine
 		finalIntervalsChan <- finalIntervals
 	}()
 
@@ -459,19 +459,15 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 	// Helper closure to persist a track (DRY: Used in loop and at flush)
 	persistTrack := func(t *activeTrack) {
 		startSec := float64(t.StartFrame) / fps
-		// Fix: Include the duration of the last frame slice in the interval.
-		// Otherwise, single-frame detections have duration 0 and get dropped.
+		// Include the duration of the last frame slice in the interval
 		endSec := float64(t.LastFrame+opts.NthFrame) / fps
 
-		// Filter short tracks (blips)
 		if (endSec - startSec) < blipDuration.Seconds() {
-			// Optimization: Since we use deferred creation (negative IDs),
-			// we simply do nothing here. The track was never in the DB.
+			// Since we use deferred creation (negative IDs), we simply do nothing here
 			return
 		}
 
-		// 1. Update In-Memory State (Synchronous)
-		// Fix: Check quality synchronously to avoid map race conditions and ensure we only write better thumbs.
+		// Check quality synchronously to avoid map race conditions and ensure we only write better thumbs
 		shouldWriteThumb := false
 		isNewIdentity := t.ID < 0
 		finalID := t.ID
@@ -483,9 +479,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 				shouldWriteThumb = true
 			}
 		} else {
-			// CRITICAL FIX: Create Identity Synchronously.
-			// If we do this async, a race condition exists where the person reappears
-			// before the DB commit, causing a duplicate identity.
+			// Create Identity Synchronously. If we do this async, a race condition exists
+			// where the person reappears before the DB commit, causing a duplicate identity.
 			var err error
 			finalID, err = db.CreateIdentity(ctx, t.MeanVec, t.Count)
 			if err != nil {
@@ -499,12 +494,11 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			// Update metadata so the final summary report is correct
 			idNames[finalID] = fmt.Sprintf("Identity %d", finalID)
 			t.ID = finalID                       // Update track ID so summary grouping works
-			bestQuality[finalID] = t.BestQuality // Fix: Record quality so we don't overwrite with worse thumbs later
+			bestQuality[finalID] = t.BestQuality // Record quality so we don't overwrite with worse thumbs later
 			newlyCreated[finalID] = true         // Mark as new for the summary report
 			shouldWriteThumb = true
 		}
 
-		// Fix: Send to channel SYNCHRONOUSLY to guarantee order.
 		// The channel buffer (100) handles backpressure if disk is slow.
 		if shouldWriteThumb {
 			select {
@@ -514,7 +508,6 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			}
 		}
 
-		// 2. Offload I/O to Background (Async)
 		producerWg.Add(1)
 		go func(id int, vec []float64, count int, isNew bool) {
 			defer producerWg.Done()
@@ -540,8 +533,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			FaceCount:       t.Count,
 			KnownIdentityID: finalID,
 		})
-		// Update summary with the final ID.
-		// Since we resolved the ID synchronously above, this is guaranteed to be the correct DB ID.
+		// Update summary with the final ID (guaranteed to be the correct DB ID)
 		summary[t.ID] = append(summary[t.ID], timeRange{Start: startSec, End: endSec})
 	}
 
@@ -564,7 +556,6 @@ Loop:
 				}
 				delete(buffer, nextFrame)
 
-				// 1. Match faces to tracks
 				for _, face := range frame.Faces {
 					totalDetections++
 					bestMatch := -1
@@ -579,7 +570,6 @@ Loop:
 					}
 
 					if bestMatch != -1 {
-						// Update existing track if there's a match
 						t := tracks[bestMatch]
 						t.LastFrame = frame.Index
 
@@ -590,14 +580,11 @@ Loop:
 						}
 						t.Count++
 
-						// Update best thumbnail if this face is higher quality
 						if face.Quality > t.BestQuality {
 							t.BestQuality = face.Quality
 							t.BestThumb = face.Thumb
 						}
 					} else {
-						// No active track matched. Try Re-ID against history.
-						// Query DB for nearest neighbor using pgvector
 						matchID, matchName, err := db.FindClosestIdentity(ctx, face.Vec, opts.MatchThreshold)
 						if err != nil {
 							utils.ShowError("DB Identity Lookup failed", err, nil)
@@ -609,13 +596,11 @@ Loop:
 						}
 
 						if matchID != -1 {
-							// Re-ID Successful: Resurrect existing Identity
 							newT := newActiveTrack(matchID, frame.Index, face.Vec, face.Thumb, face.Quality, matchName, true)
 							tracks = append(tracks, newT)
 							idNames[matchID] = matchName
 						} else {
-							// Truly New Identity -> Use Temporary Negative ID
-							// We defer DB creation until the track survives the blip filter.
+							// New Identity -> Use Temporary Negative ID. Defer DB creation until blip filter passes
 							tempID := tempIDCounter
 							tempIDCounter--
 
@@ -628,7 +613,6 @@ Loop:
 					}
 				}
 
-				// 2. Close stale tracks
 				active := tracks[:0]
 				for _, t := range tracks {
 					if frame.Index-t.LastFrame > maxGapFrames {
@@ -638,12 +622,13 @@ Loop:
 					}
 				}
 				tracks = active
+
+				<-inflightSem
 				nextFrame += opts.NthFrame
 			}
 		}
 	}
 
-	// Flush remaining tracks
 	for _, t := range tracks {
 		persistTrack(t)
 	}
@@ -660,7 +645,6 @@ Loop:
 
 	for _, id := range ids {
 		thumbNote := ""
-		// Check if we saved a thumbnail for this ID
 		if _, ok := bestQuality[id]; ok {
 			filename := fmt.Sprintf("identity_%d.jpg", id)
 			thumbNote = fmt.Sprintf("(See unknown/%s/%s)", videoID, filename)
