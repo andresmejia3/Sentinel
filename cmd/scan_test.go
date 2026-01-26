@@ -90,8 +90,8 @@ func TestScanPersistence(t *testing.T) {
 	}
 
 	// Start Postgres Container
-	pgContainer, err := postgres.RunContainer(ctx,
-		testcontainers.WithImage("pgvector/pgvector:pg16"),
+	pgContainer, err := postgres.Run(ctx,
+		"pgvector/pgvector:pg16",
 		postgres.WithDatabase("sentinel_test"),
 		postgres.WithUsername("user"),
 		postgres.WithPassword("password"),

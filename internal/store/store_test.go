@@ -37,8 +37,8 @@ func TestStoreIntegration(t *testing.T) {
 
 	// Start Postgres Container with pgvector
 	// We use the official pgvector image to ensure the extension is available.
-	pgContainer, err := postgres.RunContainer(ctx,
-		testcontainers.WithImage("pgvector/pgvector:pg16"),
+	pgContainer, err := postgres.Run(ctx,
+		"pgvector/pgvector:pg16",
 		postgres.WithDatabase("sentinel_test"),
 		postgres.WithUsername("user"),
 		postgres.WithPassword("password"),
