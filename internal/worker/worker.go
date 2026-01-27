@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/andresmejia3/sentinel/internal/types"
@@ -53,7 +54,8 @@ type RedactConfig struct {
 
 // newBaseWorker spawns a Python process and sets up the IPC pipes.
 func newBaseWorker(ctx context.Context, id int, script string, args []string, readTimeout time.Duration) (*baseWorker, error) {
-	fullArgs := append([]string{"-u", script}, args...)
+	resolvedScript := resolveScriptPath(script)
+	fullArgs := append([]string{"-u", resolvedScript}, args...)
 
 	py := utils.NewSafeCommand(ctx, "python3", fullArgs...)
 
@@ -121,6 +123,33 @@ func newBaseWorker(ctx context.Context, id int, script string, args []string, re
 		readBuf:     make([]byte, 0, 64*1024), // Pre-allocate 64KB to minimize initial resizing
 		readTimeout: readTimeout,
 	}, nil
+}
+
+// resolveScriptPath attempts to find the python script in multiple locations.
+// 1. Relative to CWD (Dev mode)
+// 2. Relative to Executable (Binary mode)
+// 3. Fixed /app/ location (Docker mode)
+func resolveScriptPath(script string) string {
+	// 1. Check CWD
+	if _, err := os.Stat(script); err == nil {
+		return script
+	}
+
+	// 2. Check relative to Executable
+	if ex, err := os.Executable(); err == nil {
+		exPath := filepath.Join(filepath.Dir(ex), script)
+		if _, err := os.Stat(exPath); err == nil {
+			return exPath
+		}
+	}
+
+	// 3. Check Docker default
+	dockerPath := filepath.Join("/app", script)
+	if _, err := os.Stat(dockerPath); err == nil {
+		return dockerPath
+	}
+
+	return script
 }
 
 func NewPythonScanWorker(ctx context.Context, id int, cfg ScanConfig) (*ScanWorker, error) {

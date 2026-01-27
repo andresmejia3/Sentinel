@@ -29,13 +29,6 @@ fi
 BUILD_FLAG="false"
 
 for arg in "$@"; do
-    if [[ "$arg" == "--wipe" ]]; then
-        echo "🧨 Wiping all data (Database & Volumes)..."
-        $DOCKER_COMPOSE down -v
-        echo "✅ System wiped. Next run will start fresh."
-        exit 0
-    fi
-
     if [[ "$arg" == "--clean" ]]; then
         echo "🧹 Removing Sentinel application image..."
         $DOCKER_COMPOSE down --rmi local
@@ -47,6 +40,10 @@ for arg in "$@"; do
         BUILD_FLAG="true"
     fi
 done
+
+# Always wipe database and volumes
+echo "🧨 Wiping all data (Database & Volumes)..."
+$DOCKER_COMPOSE down -v
 
 # Ensure Database is Running
 # Checks if the 'db' service is up. If not, starts it.

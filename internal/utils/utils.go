@@ -282,3 +282,20 @@ func CosineDist(a, b []float64) float64 {
 	}
 	return 1.0 - (dot / (math.Sqrt(sumA) * math.Sqrt(sumB)))
 }
+
+// GetProcessRSS returns the Resident Set Size (RSS) in bytes for a given PID.
+// Supported on Linux (via /proc). Returns 0 on other OSes or errors.
+func GetProcessRSS(pid int) uint64 {
+	path := fmt.Sprintf("/proc/%d/statm", pid)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0 // Not supported or process gone
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 2 {
+		return 0
+	}
+	// Second field is RSS in pages
+	rssPages, _ := strconv.ParseUint(fields[1], 10, 64)
+	return rssPages * uint64(os.Getpagesize())
+}

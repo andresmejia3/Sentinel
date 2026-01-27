@@ -76,6 +76,9 @@ func initSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		CREATE INDEX IF NOT EXISTS face_intervals_video_id_idx ON face_intervals (video_id);
 		CREATE INDEX IF NOT EXISTS face_intervals_known_identity_id_idx ON face_intervals (known_identity_id);
 		CREATE INDEX IF NOT EXISTS known_identities_embedding_idx ON known_identities USING hnsw (embedding vector_cosine_ops);
+
+		-- Ensure name is nullable (Migration fix for existing schemas)
+		ALTER TABLE known_identities ALTER COLUMN name DROP NOT NULL;
 	`
 	_, err := pool.Exec(ctx, query)
 	return err
@@ -132,12 +135,15 @@ func (s *Store) CommitScan(ctx context.Context, videoID string, intervals []Inte
 		}
 
 		br := tx.SendBatch(ctx, batch)
-		defer br.Close()
 
 		for i := 0; i < len(intervals); i++ {
 			if _, err := br.Exec(); err != nil {
+				br.Close() // Ensure closed on error path
 				return fmt.Errorf("batch insert failed on interval %d: %w", i, err)
 			}
+		}
+		if err := br.Close(); err != nil {
+			return fmt.Errorf("failed to close batch results: %w", err)
 		}
 	}
 	return tx.Commit(ctx)

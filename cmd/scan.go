@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/andresmejia3/sentinel/internal/store"
@@ -84,16 +85,57 @@ func runScan(ctx context.Context, opts Options) error {
 	}
 	inflightSem := make(chan struct{}, scanBufferSize)
 
-	estMemGB := 0.5 + (float64(opts.NumEngines) * 1.2)
-	fmt.Fprintf(os.Stderr, "⚙️  Spawning %d Worker Engines (Est. Memory: ~%.1f GB)...\n", opts.NumEngines, estMemGB)
+	// Memory Monitoring
+	var peakMemory uint64    // Atomic
+	var currentMemory uint64 // Atomic
+	pidChan := make(chan int, opts.NumEngines)
+
+	go func() {
+		var pids []int
+		// Collect PIDs from workers as they start
+		for i := 0; i < opts.NumEngines; i++ {
+			select {
+			case pid := <-pidChan:
+				pids = append(pids, pid)
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		updateMem := func() {
+			var total uint64
+			total += utils.GetProcessRSS(os.Getpid()) // Go Process
+			for _, pid := range pids {
+				total += utils.GetProcessRSS(pid) // Python Workers
+			}
+			if currentPeak := atomic.LoadUint64(&peakMemory); total > currentPeak {
+				atomic.StoreUint64(&peakMemory, total)
+			}
+			atomic.StoreUint64(&currentMemory, total)
+		}
+
+		updateMem()
+
+		// Monitor Memory Loop
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				updateMem()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// Start Workers EARLY (Parallelize with FFprobe/DB checks)
-	readyChan := make(chan bool, opts.NumEngines) // Buffered: Workers drop message and keep going
+	readyChan := make(chan bool, opts.NumEngines)
 	for i := 0; i < opts.NumEngines; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			startWorker(ctx, workerID, taskChan, resultsChan, readyChan, opts, errChan)
+			startWorker(ctx, workerID, taskChan, resultsChan, readyChan, opts, errChan, pidChan)
 		}(i)
 	}
 
@@ -117,7 +159,6 @@ func runScan(ctx context.Context, opts Options) error {
 	totalVideoFrames := utils.GetTotalFrames(ctx, opts.InputPath)
 
 	if totalVideoFrames <= 0 {
-		// Fallback to a spinner or unknown total if ffprobe fails
 		totalVideoFrames = -1
 	}
 
@@ -154,6 +195,29 @@ func runScan(ctx context.Context, opts Options) error {
 		close(aggDone)
 	}()
 
+	go func() {
+		updateDesc := func() {
+			mem := atomic.LoadUint64(&currentMemory)
+			bufLen := len(inflightSem)
+			bufCap := cap(inflightSem)
+			if mem > 0 {
+				bar.Describe(fmt.Sprintf("🔍 Sentinel Scanning (RAM: %.2f GB | Buffer: %d/%d)", float64(mem)/(1024*1024*1024), bufLen, bufCap))
+			}
+		}
+		updateDesc()
+
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				updateDesc()
+			}
+		}
+	}()
+
 	ffmpeg := utils.NewFFmpegCmd(ctx, opts.InputPath, opts.NthFrame)
 
 	var stderrBuf bytes.Buffer
@@ -164,12 +228,13 @@ func runScan(ctx context.Context, opts Options) error {
 		utils.ShowError("Failed to create FFmpeg stdout pipe", err, nil)
 		return err
 	}
-	defer ffmpegOut.Close() // Ensure pipe is closed to prevent leaks/zombies
+	defer ffmpegOut.Close()
 
 	if err := ffmpeg.Start(); err != nil {
 		utils.ShowError("Failed to start FFmpeg", err, nil)
 		return err
 	}
+
 	// Ensure we reap the process even if we return early
 	ffmpegWaited := false
 	defer func() {
@@ -240,6 +305,8 @@ func runScan(ctx context.Context, opts Options) error {
 		return err
 	}
 
+	bar.Finish()
+
 	close(taskChan)
 
 	// Instead of blocking on wg.Wait(), we wait in a goroutine and select on it.
@@ -278,8 +345,12 @@ func runScan(ctx context.Context, opts Options) error {
 	default:
 	}
 
-	bar.Finish()
 	fmt.Fprintf(os.Stderr, "\n🏁 Scan Complete. Processed %d keyframes.\n", sentFrames)
+
+	finalPeak := atomic.LoadUint64(&peakMemory)
+	if finalPeak > 0 {
+		fmt.Fprintf(os.Stderr, "🧠 Peak Memory Used: %.2f GB\n", float64(finalPeak)/(1024*1024*1024))
+	}
 	return nil
 }
 
@@ -291,7 +362,7 @@ type scanResult struct {
 
 // startWorker manages the lifecycle of a single Python worker process.
 // It reads tasks from the channel, sends them to Python, and persists the results to the DB.
-func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, results chan<- scanResult, ready chan<- bool, opts Options, errChan chan<- error) {
+func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, results chan<- scanResult, ready chan<- bool, opts Options, errChan chan<- error, pidChan chan<- int) {
 	cfg := worker.ScanConfig{
 		Debug:              opts.DebugScreenshots,
 		DetectionThreshold: opts.DetectionThreshold,
@@ -315,6 +386,7 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 	defer worker.Close()
 
 	// Signal to the main thread that this worker is ready
+	pidChan <- worker.Cmd.Process.Pid
 	ready <- true
 
 	for {
@@ -356,6 +428,7 @@ type activeTrack struct {
 	ID          int
 	StartFrame  int
 	LastFrame   int
+	LastLoc     []int
 	MeanVec     []float64
 	Count       int
 	BestThumb   []byte  // Raw JPEG bytes of the best face
@@ -556,12 +629,18 @@ Loop:
 				}
 				delete(buffer, nextFrame)
 
+				assignedTracks := make(map[int]bool)
+
 				for _, face := range frame.Faces {
 					totalDetections++
 					bestMatch := -1
 					minDist := opts.MatchThreshold
 
 					for i, t := range tracks {
+						if assignedTracks[t.ID] {
+							continue
+						}
+
 						dist := utils.CosineDist(face.Vec, t.MeanVec)
 						if dist < minDist {
 							minDist = dist
@@ -569,14 +648,55 @@ Loop:
 						}
 					}
 
+					// Spatial Recovery: If strict vector match failed, check for spatial overlap (IoU).
+					// This handles occlusion (e.g., hand over mouth) where embedding distance spikes
+					// but the person hasn't moved significantly.
+					if bestMatch == -1 {
+						bestIoU := 0.0
+
+						for i, t := range tracks {
+							if assignedTracks[t.ID] {
+								continue
+							}
+
+							// Only consider tracks seen recently (within ~5 scan intervals)
+							if frame.Index-t.LastFrame > opts.NthFrame*5 {
+								continue
+							}
+
+							iou := calculateIoU(face.Loc, t.LastLoc)
+							// Relaxed from 0.2 -> 0.1 to catch slight movements during occlusion
+							if iou < 0.1 {
+								continue
+							}
+
+							// Dynamic Threshold: The more the boxes overlap, the more we relax the vector match threshold.
+							// A high IoU strongly implies it's the same person, even if occlusion ruins the vector.
+							// Boosted multiplier: Even small overlap (0.1) now gives +0.2 forgiveness.
+							relaxedThreshold := opts.MatchThreshold + (iou * 2.0)
+
+							dist := utils.CosineDist(face.Vec, t.MeanVec)
+							if dist < relaxedThreshold && iou > bestIoU {
+								bestIoU = iou
+								bestMatch = i
+							}
+						}
+					}
+
 					if bestMatch != -1 {
 						t := tracks[bestMatch]
 						t.LastFrame = frame.Index
+						t.LastLoc = face.Loc
+						assignedTracks[t.ID] = true
 
-						// Incrementally update the mean vector to save memory (avoids storing SumVec)
-						k := float64(t.Count)
-						for j := 0; j < embeddingDim; j++ {
-							t.MeanVec[j] = (k*t.MeanVec[j] + face.Vec[j]) / (k + 1.0)
+						// FIX: Only update mean if the vector is reliable.
+						// If we matched via Spatial Recovery (high distance), the vector is likely garbage (occluded).
+						// We don't want to pollute the track's identity with garbage.
+						if utils.CosineDist(face.Vec, t.MeanVec) < opts.MatchThreshold {
+							k := float64(t.Count)
+							for j := 0; j < embeddingDim; j++ {
+								t.MeanVec[j] = (k*t.MeanVec[j] + face.Vec[j]) / (k + 1.0)
+							}
 						}
 						t.Count++
 
@@ -596,18 +716,20 @@ Loop:
 						}
 
 						if matchID != -1 {
-							newT := newActiveTrack(matchID, frame.Index, face.Vec, face.Thumb, face.Quality, matchName, true)
+							newT := newActiveTrack(matchID, frame.Index, face.Vec, face.Thumb, face.Quality, matchName, true, face.Loc)
 							tracks = append(tracks, newT)
 							idNames[matchID] = matchName
+							assignedTracks[matchID] = true
 						} else {
 							// New Identity -> Use Temporary Negative ID. Defer DB creation until blip filter passes
 							tempID := tempIDCounter
 							tempIDCounter--
 
 							name := fmt.Sprintf("Identity %d (Pending)", tempID)
-							newT := newActiveTrack(tempID, frame.Index, face.Vec, face.Thumb, face.Quality, name, false)
+							newT := newActiveTrack(tempID, frame.Index, face.Vec, face.Thumb, face.Quality, name, false, face.Loc)
 							tracks = append(tracks, newT)
 							idNames[tempID] = name
+							assignedTracks[tempID] = true
 
 						}
 					}
@@ -670,11 +792,12 @@ Loop:
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 }
 
-func newActiveTrack(id, frameIndex int, vec []float64, thumb []byte, quality float64, name string, isKnown bool) *activeTrack {
+func newActiveTrack(id, frameIndex int, vec []float64, thumb []byte, quality float64, name string, isKnown bool, loc []int) *activeTrack {
 	t := &activeTrack{
 		ID:          id,
 		StartFrame:  frameIndex,
 		LastFrame:   frameIndex,
+		LastLoc:     loc,
 		MeanVec:     make([]float64, embeddingDim),
 		Count:       1,
 		BestThumb:   thumb,
@@ -740,4 +863,23 @@ func fmtTime(seconds float64) string {
 	m := int(duration.Minutes()) % 60
 	s := int(duration.Seconds()) % 60
 	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+}
+
+func calculateIoU(boxA, boxB []int) float64 {
+	if len(boxA) < 4 || len(boxB) < 4 {
+		return 0
+	}
+	xA := max(boxA[0], boxB[0])
+	yA := max(boxA[1], boxB[1])
+	xB := min(boxA[2], boxB[2])
+	yB := min(boxA[3], boxB[3])
+
+	interArea := max(0, xB-xA) * max(0, yB-yA)
+	boxAArea := (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+	boxBArea := (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+
+	if boxAArea+boxBArea-interArea <= 0 {
+		return 0
+	}
+	return float64(interArea) / float64(boxAArea+boxBArea-interArea)
 }

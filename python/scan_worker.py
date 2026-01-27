@@ -75,6 +75,10 @@ def process_frame(image_bytes, debug=False) -> bytes:
             box = face.bbox.astype(int)
             x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w_frame, box[2]), min(h_frame, box[3])
             
+            # Filter: Reject profiles and bad detections
+            face_width = x2 - x1
+            if face_width < 1: continue
+
             norm = np.linalg.norm(face.embedding)
             if norm > 1e-6:
                 valid_faces.append((face, x1, y1, x2, y2, norm))
@@ -93,12 +97,24 @@ def process_frame(image_bytes, debug=False) -> bytes:
 
             area = (x2 - x1) * (y2 - y1)
             alignment = 0.5
+            mouth_penalty = 1.0
+
             if face.kps is not None:
                 eye_center_x = (face.kps[0][0] + face.kps[1][0]) / 2
                 eye_dist = np.linalg.norm(face.kps[1] - face.kps[0])
                 if eye_dist > 0:
                     nose_offset = abs(face.kps[2][0] - eye_center_x)
                     alignment = max(0.0, 1.0 - (nose_offset / eye_dist))
+                
+                # Occlusion Check: If nose is too close to mouth center (kps[3], kps[4]), penalize.
+                # This helps avoid thumbnails with hands covering the mouth.
+                if len(face.kps) >= 5:
+                    nose_y = face.kps[2][1]
+                    mouth_y = (face.kps[3][1] + face.kps[4][1]) / 2
+                    eye_y = (face.kps[0][1] + face.kps[1][1]) / 2
+                    # If mouth is closer to nose than nose is to eyes, it's likely occluded/scrunched
+                    if (mouth_y - nose_y) < (nose_y - eye_y) * 0.5:
+                        mouth_penalty = 0.5
 
             face_roi = frame_array[y1:y2, x1:x2]
             sharpness = 0.0
@@ -106,16 +122,22 @@ def process_frame(image_bytes, debug=False) -> bytes:
                 gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
                 sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
 
+            # Cap sharpness to prevent hands/hair from boosting the score artificially
+            # Log(100) ~ 4.6. We cap the multiplier impact.
+            sharpness_score = np.log(max(1.0, sharpness))
+            if sharpness_score > 6.0: sharpness_score = 6.0
+
             quality_strategy = args.quality_strategy
+            # Apply mouth_penalty to all strategies
             if quality_strategy == 'portrait':
-                quality = face.det_score * (alignment ** 2) * np.log(max(1.0, sharpness)) * np.log(max(1.0, float(area)))
+                quality = face.det_score * (alignment ** 2) * sharpness_score * np.log(max(1.0, float(area))) * mouth_penalty
             elif quality_strategy == 'clarity':
                 size_score = 1.0 - np.exp(-float(area) / 40000.0)
-                quality = face.det_score * alignment * np.log(max(1.0, sharpness)) * size_score
+                quality = face.det_score * alignment * sharpness_score * size_score * mouth_penalty
             elif quality_strategy == 'confidence':
-                quality = (face.det_score ** 2) * alignment * np.log(max(1.0, sharpness)) * np.log(max(1.0, float(area)))
+                quality = (face.det_score ** 2) * alignment * sharpness_score * np.log(max(1.0, float(area))) * mouth_penalty
             else:
-                quality = face.det_score * alignment * np.log(max(1.0, sharpness)) * np.sqrt(max(1.0, float(area)))
+                quality = face.det_score * alignment * sharpness_score * np.sqrt(max(1.0, float(area))) * mouth_penalty
 
             if debug:
                 sys.stderr.write(f"Face: Score={face.det_score:.2f} Align={alignment:.2f} Sharp={sharpness:.1f} Area={area:.0f} -> Quality ({quality_strategy})={quality:.4f}\n")
