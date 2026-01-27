@@ -55,26 +55,79 @@ The system is built on a "Right Tool for the Job" philosophy. We use **Go 1.25**
 
 ---
 
-## ⚙️ CLI Configuration
+## 📚 Command Reference
 
-Sentinel exposes a robust CLI interface for tuning performance and privacy parameters.
+Sentinel exposes a robust CLI interface. Below are the available commands and their flags.
 
-### Performance & Accuracy
-| Flag | Name | Description | Default |
+### `scan`
+Ingests a video file, detects faces, and indexes them into the vector database.
+
+| Flag | Short | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-n` | `--nth-frame` | AI keyframe interval (e.g., scan every 10th frame). | `10` |
-| `-e` | `--engines` | Number of parallel engine worker processes. | `1` |
-| `-t` | `--threshold` | Face matching threshold (lower is stricter). | `0.6` |
-| `-b` | `--blip-duration` | Minimum duration of a track to be considered valid (filters blips). | `100ms` |
-| `-d` | `--debug-screenshots` | Save debug images with bounding boxes to `/data/debug_frames/`. | `false` |
+| `--input` | `-i` | (Required) | Path to the video file. |
+| `--engines` | `-e` | `1` | Number of parallel AI worker processes. |
+| `--nth-frame` | `-n` | `10` | Process every Nth frame (lower = more accuracy, slower). |
+| `--threshold` | `-t` | `0.6` | Face matching cosine distance threshold (lower is stricter). |
+| `--detection-threshold` | `-D` | `0.5` | Minimum confidence for face detection. |
+| `--grace-period` | `-g` | `2s` | Time a face can be missing before the track is closed. |
+| `--blip-duration` | `-b` | `100ms` | Minimum duration for a track to be saved (filters noise). |
+| `--buffer-size` | `-B` | `200` | Max frames to buffer in memory. |
+| `--quality-strategy` | | `clarity` | Strategy for face quality (`clarity`, `portrait`, `confidence`). |
+| `--worker-timeout` | | `30s` | Timeout for AI worker processing per frame. |
+| `--debug-screenshots` | `-d` | `false` | Save frames with bounding boxes to `/data/debug_frames/`. |
 
-### Privacy & Redaction
-| Flag | Name | Description | Default |
+### `redact`
+Redacts faces in a video based on detection or specific identities.
+
+| Flag | Short | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-m` | `--mode` | `blur-all` or `targeted`. | `blur-all` |
-| `-l` | `--linger` | How long to keep blurring after a targeted face is lost (e.g., '1s', '500ms'). | `1s` |
-| | `--paranoid` | Blurs ALL faces if a targeted identity is lost. | `false` |
-| `-s` | `--strength`| Strength of the pixelation or blur effect. | `15` |
+| `--input` | `-i` | (Required) | Path to input video. |
+| `--output` | `-o` | `output/redacted.mp4` | Path to output video. |
+| `--mode` | `-m` | `blur-all` | Redaction mode: `blur-all` or `targeted`. |
+| `--target` | | | Comma-separated list of Identity IDs (required for `targeted`). |
+| `--style` | | `black` | Redaction style: `pixel`, `black`, `gauss`, `secure`. |
+| `--strength` | `-s` | `15` | Intensity of the blur/pixelation. |
+| `--linger` | | `1s` | Continue redacting area for X time after face is lost. |
+| `--paranoid` | | `false` | If a target is lost, switch to blurring ALL faces temporarily. |
+| `--engines` | `-e` | `1` | Number of parallel AI worker processes. |
+| `--threshold` | `-t` | `0.6` | Face matching threshold (for targeted mode). |
+| `--detection-threshold` | `-D` | `0.5` | Minimum confidence for face detection. |
+| `--buffer-size` | `-B` | `35` | Max frames to buffer (lower than scan to prevent OOM). |
+| `--worker-timeout` | | `30s` | Timeout for AI worker processing per frame. |
+
+### `find`
+Search for a person in the database using a reference image.
+
+| Flag | Short | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--threshold` | `-t` | `0.6` | Face matching cosine distance threshold. |
+| `--detection-threshold` | `-D` | `0.5` | Minimum confidence for face detection. |
+| `--debug` | `-d` | `false` | Save debug screenshots. |
+
+```bash
+sentinel find -t 0.5 /data/suspect.jpg
+```
+
+### `label`
+Assign a name to a discovered identity ID.
+```bash
+sentinel label 12 "Jane Doe"
+```
+
+### `list`
+List all stored identities and their metadata.
+```bash
+sentinel list
+```
+
+### `reset`
+Wipe system data. By default, clears everything.
+
+| Flag | Description |
+| :--- | :--- |
+| `--db` | Drop all database tables. |
+| `--files` | Delete generated thumbnails and output videos. |
+| `--debug` | Delete debug frames. |
 
 ---
 
@@ -100,47 +153,54 @@ We employ a **Mock-Heavy** testing approach to ensure CI speed and reliability:
 
 ---
 
-## 🚦 Getting Started
+## 🚦 Installation & Usage
 
-### Prerequisites
-*   Docker & Docker Compose
-*   NVIDIA GPU (Optional, defaults to CPU if drivers missing)
+Sentinel can be run in a containerized environment (recommended) or compiled locally.
 
-### Installation
-1.  **Clone the repository:**
+### Option A: Docker (Recommended)
+No dependencies required other than Docker Desktop.
+
+1.  **Start the Environment:**
     ```bash
-    git clone https://github.com/andresmejia3/sentinel.git
-    cd sentinel
+    ./docker.sh
+    ```
+    This will start the database, build the image, and drop you into a **Sentinel Shell**.
+
+2.  **Run Commands:**
+    Inside the shell, the `sentinel` binary is already added to your `$PATH`.
+    ```bash
+    # Scan a video
+    sentinel scan -i /data/video.mp4
+
+    # List identified people
+    sentinel list
     ```
 
-2.  **Configure Environment:**
-    Create a `.env` file:
+### Option B: Local Installation
+If you prefer to run Sentinel natively, you must install the following dependencies:
+
+1.  **System Requirements:**
+    *   **Go 1.25+**
+    *   **Python 3.11**
+    *   **FFmpeg** (Must be in `$PATH`)
+    *   **PostgreSQL 16** with `pgvector` extension enabled.
+
+2.  **Python Dependencies:**
     ```bash
-    POSTGRES_USER=sentinel
-    POSTGRES_PASSWORD=secret
-    POSTGRES_DB=sentinel
-    POSTGRES_HOST=db
+    pip install insightface onnxruntime numpy opencv-python-headless
+    ```
+    *(Note: Use `onnxruntime-gpu` if you have an NVIDIA GPU)*
+
+3.  **Compile:**
+    ```bash
+    go build -o sentinel
     ```
 
-3.  **Run with Docker:**
-    Use the provided wrapper script for easy execution:
+4.  **Run:**
+    Ensure your `.env` file connects to your local Postgres instance.
     ```bash
-    chmod +x sentinel
-    ./sentinel --help
+    ./sentinel scan -i video.mp4
     ```
-
-### Usage Examples
-
-**Index a Video:**
-```bash
-# Local files are automatically mapped into the container
-./sentinel scan -i security_footage.mp4
-```
-
-**Search for a Person:**
-```bash
-./sentinel find /data/suspect_photo.jpg
-```
 
 ---
 

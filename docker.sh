@@ -1,8 +1,11 @@
 #!/bin/bash
 
-# Sentinel Docker Wrapper
-# Usage: ./sentinel <command> <flags>
-# Example: ./sentinel scan -i video.mp4
+# Sentinel Docker Environment Setup
+# Usage: ./docker.sh [flags]
+# Flags:
+#   --build    Rebuild the Docker image before starting
+#   --clean    Remove the application image before starting
+#   --wipe     Wipe all data (Database & Volumes)
 
 if ! docker info > /dev/null 2>&1; then echo "❌ Error: Docker is not running."
     echo "Please start Docker Desktop and try again."
@@ -22,35 +25,28 @@ if [ ! -f .env ]; then
     exit 1
 fi
 
-# Lifecycle Commands
-if [[ "$1" == "stop" ]]; then
-    echo "🛑 Gracefully stopping Sentinel services..."
-    $DOCKER_COMPOSE down
-    exit 0
-fi
+# Handle Flags
+BUILD_FLAG="false"
 
-if [[ "$1" == "wipe" ]]; then
-    echo "🧨 Wiping all data (Database & Volumes)..."
-    $DOCKER_COMPOSE down -v
-    echo "✅ System wiped. Next run will start fresh."
-    exit 0
-fi
+for arg in "$@"; do
+    if [[ "$arg" == "--wipe" ]]; then
+        echo "🧨 Wiping all data (Database & Volumes)..."
+        $DOCKER_COMPOSE down -v
+        echo "✅ System wiped. Next run will start fresh."
+        exit 0
+    fi
 
-if [[ "$1" == "prune" ]]; then
-    echo "🧹 Pruning Docker stopped containers and dangling images..."
-    docker system prune -f
-    # NOTE: We do NOT run 'docker builder prune' here anymore.
-    # That deletes the cached pip/apt layers, forcing slow re-downloads.
-    echo "✅ Docker system cleaned (Build cache preserved)."
-    exit 0
-fi
+    if [[ "$arg" == "--clean" ]]; then
+        echo "🧹 Removing Sentinel application image..."
+        $DOCKER_COMPOSE down --rmi local
+        echo "✅ Application image removed. Next run will rebuild code layers."
+        exit 0
+    fi
 
-if [[ "$1" == "clean" ]]; then
-    echo "🧹 Removing Sentinel application image..."
-    $DOCKER_COMPOSE down --rmi local
-    echo "✅ Application image removed. Next run will rebuild code layers."
-    exit 0
-fi
+    if [[ "$arg" == "--build" ]]; then
+        BUILD_FLAG="true"
+    fi
+done
 
 # Ensure Database is Running
 # Checks if the 'db' service is up. If not, starts it.
@@ -62,7 +58,6 @@ if [ -z "$($DOCKER_COMPOSE ps -q db 2>/dev/null)" ] || [ "$($DOCKER_COMPOSE ps -
 fi
 
 # Detect GPU capability
-# We check if the Docker daemon reports an 'nvidia' runtime.
 COMPOSE_FILES="-f docker-compose.yml"
 if docker info 2>/dev/null | grep -i "runtimes.*nvidia" > /dev/null; then
     echo "🚀 NVIDIA GPU detected. Enabling GPU acceleration."
@@ -72,20 +67,17 @@ else
 fi
 
 # Check Docker Memory Limit
-# Warn if less than 4GB (approx 4 * 1024^3 bytes)
 MEM_BYTES=$(docker info --format '{{.MemTotal}}')
 if [ "$MEM_BYTES" -lt 4294967296 ]; then
     echo "⚠️  WARNING: Docker has less than 4GB of RAM allocated."
     echo "   Sentinel's AI models are memory intensive."
-    echo "   Recommendation: Increase Docker memory to 4GB+ or run with '-e 1'."
+    echo "   Recommendation: Increase Docker memory to 4GB+."
 fi
 
-# Check for build flag
-if [[ "$1" == "--build" ]]; then
+# Rebuild if requested
+if [ "$BUILD_FLAG" == "true" ]; then
     echo "🔨 Rebuilding Docker image..."
-    # Pass CACHEBUST to invalidate the COPY layer for Python code, but keep pip/apt cache
     DOCKER_BUILDKIT=1 $DOCKER_COMPOSE $COMPOSE_FILES build --build-arg CACHEBUST=$(date +%s) app || exit 1
-    shift # Remove --build from args
 fi
 
 # Start Interactive Session
@@ -93,10 +85,15 @@ echo "🐳 Starting Sentinel Shell..."
 echo "   - Current directory mounted to: /data"
 echo "   - Run 'sentinel --help' to get started."
 
-$DOCKER_COMPOSE $COMPOSE_FILES run --rm --entrypoint bash app
+# We use --entrypoint bash to override the default 'sentinel' entrypoint
+# This drops the user into a shell where they can run the binary manually.
+# We pass '-l' to override the default command (["--help"]) defined in docker-compose.yml
+$DOCKER_COMPOSE $COMPOSE_FILES run --rm -w /data --entrypoint bash app -l
 
 # Cleanup (Only if we built)
 if [ "$BUILD_FLAG" == "true" ]; then
     echo "🧹 Pruning old image layers..."
     docker image prune -f > /dev/null
 fi
+
+echo "👋 Session ended."
