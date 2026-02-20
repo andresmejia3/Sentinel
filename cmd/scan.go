@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -425,16 +426,32 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 // --- Aggregation & Tracking Logic ---
 
 type activeTrack struct {
-	ID          int
-	StartFrame  int
-	LastFrame   int
-	LastLoc     []int
-	MeanVec     []float64
-	Count       int
-	BestThumb   []byte  // Raw JPEG bytes of the best face
-	BestQuality float64 // Best quality score seen so far
-	Name        string  // Display name (e.g. "Jenny" or "Identity 1")
-	IsKnown     bool    // Is this an existing identity from the DB?
+	ID         int
+	StartFrame int
+	LastFrame  int
+	LastLoc    []int
+	MeanVec    []float64
+	Count      int
+
+	FirstThumb     []byte
+	FirstScore     float64
+	LastThumb      []byte
+	LastScore      float64
+	BestThumb      []byte  // Raw JPEG bytes of the best face
+	BestQuality    float64 // Best quality score seen so far (Highest)
+	LowestThumb    []byte
+	LowestScore    float64
+	LastSavedScore float64
+	PendingFrames  []frameData
+
+	Name    string // Display name (e.g. "Jenny" or "Identity 1")
+	IsKnown bool   // Is this an existing identity from the DB?
+}
+
+type frameData struct {
+	Index int
+	Score float64
+	Data  []byte
 }
 
 type timeRange struct {
@@ -452,9 +469,11 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 
 	var tracks []*activeTrack
 
-	// Cache of the best quality score seen for each identity to avoid overwriting good thumbnails with bad ones.
-	// Maps IdentityID -> MaxQuality
-	bestQuality := make(map[int]float64)
+	// Global stats for identities to track extremes across multiple tracks
+	globalBestScore := make(map[int]float64)
+	globalLowestScore := make(map[int]float64)
+	firstDetectionWritten := make(map[int]bool)
+	identityDirsCreated := make(map[int]bool)
 
 	idNames := make(map[int]string)
 	newlyCreated := make(map[int]bool) // Track which IDs were generated in this session
@@ -493,15 +512,25 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 	// We use a buffered channel to offload thumbnail disk I/O without blocking the main loop,
 	// while ensuring that writes for the same ID happen in order.
 	type thumbOp struct {
-		id   int
-		data []byte
+		dir        string
+		filename   string
+		data       []byte
+		removeGlob string
 	}
-	thumbChan := make(chan thumbOp, 100)
+	// Buffer increased to 1024 to prevent blocking the main loop during heavy track persistence
+	thumbChan := make(chan thumbOp, 1024)
 	consumerWg.Add(1)
 	go func() {
 		defer consumerWg.Done()
 		for op := range thumbChan {
-			finalPath := filepath.Join(unknownDir, fmt.Sprintf("identity_%d.jpg", op.id))
+			if op.removeGlob != "" {
+				matches, _ := filepath.Glob(filepath.Join(op.dir, op.removeGlob))
+				for _, m := range matches {
+					os.Remove(m)
+				}
+			}
+
+			finalPath := filepath.Join(op.dir, op.filename)
 			tempPath := finalPath + ".tmp"
 
 			var err error
@@ -514,7 +543,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			}
 
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "⚠️  Failed to save thumbnail for ID %d: %v\n", op.id, err)
+				fmt.Fprintf(os.Stderr, "⚠️  Failed to save thumbnail %s: %v\n", op.filename, err)
 			}
 		}
 	}()
@@ -540,18 +569,10 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			return
 		}
 
-		// Check quality synchronously to avoid map race conditions and ensure we only write better thumbs
-		shouldWriteThumb := false
 		isNewIdentity := t.ID < 0
 		finalID := t.ID
 
-		if !isNewIdentity { // Known Identity
-			curQ, exists := bestQuality[t.ID]
-			if !exists || t.BestQuality > curQ {
-				bestQuality[t.ID] = t.BestQuality
-				shouldWriteThumb = true
-			}
-		} else {
+		if isNewIdentity {
 			// Create Identity Synchronously. If we do this async, a race condition exists
 			// where the person reappears before the DB commit, causing a duplicate identity.
 			var err error
@@ -566,18 +587,68 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			}
 			// Update metadata so the final summary report is correct
 			idNames[finalID] = fmt.Sprintf("Identity %d", finalID)
-			t.ID = finalID                       // Update track ID so summary grouping works
-			bestQuality[finalID] = t.BestQuality // Record quality so we don't overwrite with worse thumbs later
-			newlyCreated[finalID] = true         // Mark as new for the summary report
-			shouldWriteThumb = true
+			t.ID = finalID               // Update track ID so summary grouping works
+			newlyCreated[finalID] = true // Mark as new for the summary report
 		}
 
-		// The channel buffer (100) handles backpressure if disk is slow.
-		if shouldWriteThumb {
-			select {
-			case thumbChan <- thumbOp{id: finalID, data: t.BestThumb}:
-			case <-ctx.Done():
-				return
+		// Create Identity Directory
+		identityDir := filepath.Join(unknownDir, fmt.Sprintf("identity_%d", finalID))
+		framesDir := filepath.Join(identityDir, "frames")
+		if !identityDirsCreated[finalID] {
+			if err := os.MkdirAll(framesDir, 0755); err != nil {
+				utils.ShowError("Failed to create identity directory", err, nil)
+			}
+			identityDirsCreated[finalID] = true
+		}
+
+		// 1. First Detection (Only if not written for this ID yet)
+		if !firstDetectionWritten[finalID] {
+			thumbChan <- thumbOp{
+				dir:        identityDir,
+				filename:   fmt.Sprintf("1_First_Detection_[%.2f].jpg", t.FirstScore),
+				data:       t.FirstThumb,
+				removeGlob: "1_First_Detection_*.jpg",
+			}
+			firstDetectionWritten[finalID] = true
+		}
+
+		// 2. Last Detection (Always overwrite)
+		thumbChan <- thumbOp{
+			dir:        identityDir,
+			filename:   fmt.Sprintf("2_Last_Detection_[%.2f].jpg", t.LastScore),
+			data:       t.LastThumb,
+			removeGlob: "2_Last_Detection_*.jpg",
+		}
+
+		// 3. Highest Confidence
+		if t.BestQuality > globalBestScore[finalID] {
+			globalBestScore[finalID] = t.BestQuality
+			thumbChan <- thumbOp{
+				dir:        identityDir,
+				filename:   fmt.Sprintf("3_Highest_Confidence_[%.2f].jpg", t.BestQuality),
+				data:       t.BestThumb,
+				removeGlob: "3_Highest_Confidence_*.jpg",
+			}
+		}
+
+		// 4. Lowest Confidence
+		currLow, ok := globalLowestScore[finalID]
+		if !ok || t.LowestScore < currLow {
+			globalLowestScore[finalID] = t.LowestScore
+			thumbChan <- thumbOp{
+				dir:        identityDir,
+				filename:   fmt.Sprintf("4_Lowest_Confidence_[%.2f].jpg", t.LowestScore),
+				data:       t.LowestThumb,
+				removeGlob: "4_Lowest_Confidence_*.jpg",
+			}
+		}
+
+		// Frames (10% change)
+		for _, f := range t.PendingFrames {
+			thumbChan <- thumbOp{
+				dir:      framesDir,
+				filename: fmt.Sprintf("frame_[%05d]_score_[%.2f].jpg", f.Index, f.Score),
+				data:     f.Data,
 			}
 		}
 
@@ -700,9 +771,21 @@ Loop:
 						}
 						t.Count++
 
+						t.LastThumb = face.Thumb
+						t.LastScore = face.Quality
+
 						if face.Quality > t.BestQuality {
 							t.BestQuality = face.Quality
 							t.BestThumb = face.Thumb
+						}
+						if face.Quality < t.LowestScore {
+							t.LowestScore = face.Quality
+							t.LowestThumb = face.Thumb
+						}
+
+						if math.Abs(face.Quality-t.LastSavedScore)/t.LastSavedScore >= 0.10 {
+							t.PendingFrames = append(t.PendingFrames, frameData{Index: frame.Index, Score: face.Quality, Data: face.Thumb})
+							t.LastSavedScore = face.Quality
 						}
 					} else {
 						matchID, matchName, err := db.FindClosestIdentity(ctx, face.Vec, opts.MatchThreshold)
@@ -767,9 +850,9 @@ Loop:
 
 	for _, id := range ids {
 		thumbNote := ""
-		if _, ok := bestQuality[id]; ok {
-			filename := fmt.Sprintf("identity_%d.jpg", id)
-			thumbNote = fmt.Sprintf("(See unknown/%s/%s)", videoID, filename)
+		// Check if we wrote anything for this ID (we check globalBestScore as a proxy)
+		if _, ok := globalBestScore[id]; ok {
+			thumbNote = fmt.Sprintf("(See unknown/%s/identity_%d/)", videoID, id)
 		}
 
 		name := idNames[id]
@@ -794,16 +877,24 @@ Loop:
 
 func newActiveTrack(id, frameIndex int, vec []float64, thumb []byte, quality float64, name string, isKnown bool, loc []int) *activeTrack {
 	t := &activeTrack{
-		ID:          id,
-		StartFrame:  frameIndex,
-		LastFrame:   frameIndex,
-		LastLoc:     loc,
-		MeanVec:     make([]float64, embeddingDim),
-		Count:       1,
-		BestThumb:   thumb,
-		BestQuality: quality,
-		Name:        name,
-		IsKnown:     isKnown,
+		ID:             id,
+		StartFrame:     frameIndex,
+		LastFrame:      frameIndex,
+		LastLoc:        loc,
+		MeanVec:        make([]float64, embeddingDim),
+		Count:          1,
+		BestThumb:      thumb,
+		BestQuality:    quality,
+		FirstThumb:     thumb,
+		FirstScore:     quality,
+		LastThumb:      thumb,
+		LastScore:      quality,
+		LowestThumb:    thumb,
+		LowestScore:    quality,
+		LastSavedScore: quality,
+		PendingFrames:  []frameData{{Index: frameIndex, Score: quality, Data: thumb}},
+		Name:           name,
+		IsKnown:        isKnown,
 	}
 	copy(t.MeanVec, vec)
 	return t
