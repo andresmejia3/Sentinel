@@ -48,7 +48,6 @@ func init() {
 	scanCmd.Flags().Float64VarP(&scanOpts.DetectionThreshold, "detection-threshold", "D", 0.5, "Face detection confidence threshold (0.0 - 1.0)")
 
 	scanCmd.Flags().StringVar(&scanOpts.WorkerTimeout, "worker-timeout", "30s", "Timeout for a worker to process a single frame")
-	scanCmd.Flags().StringVar(&scanOpts.QualityStrategy, "quality-strategy", "clarity", "Strategy for calculating face quality (clarity, portrait, confidence, legacy)")
 	scanCmd.Flags().IntVarP(&scanBufferSize, "buffer-size", "B", 200, "Max number of frames to buffer in memory")
 
 	scanCmd.MarkFlagRequired("input")
@@ -367,7 +366,6 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 	cfg := worker.ScanConfig{
 		Debug:              opts.DebugScreenshots,
 		DetectionThreshold: opts.DetectionThreshold,
-		QualityStrategy:    opts.QualityStrategy,
 	}
 	readTimeout, err := time.ParseDuration(opts.WorkerTimeout)
 	if err != nil {
@@ -427,6 +425,7 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 
 type activeTrack struct {
 	ID         int
+	MasterID   int // Optimization: Store MasterID to avoid DB lookups during persistence
 	StartFrame int
 	LastFrame  int
 	LastLoc    []int
@@ -443,15 +442,28 @@ type activeTrack struct {
 	LowestScore    float64
 	LastSavedScore float64
 	PendingFrames  []frameData
+	TopFrames      []frameCandidate
 
-	Name    string // Display name (e.g. "Jenny" or "Identity 1")
-	IsKnown bool   // Is this an existing identity from the DB?
+	Name        string // Master display name (e.g. "Jenny" or "Identity 1")
+	VariantName string // Specific variant name (e.g. "Default", "Glasses")
+	IsKnown     bool   // Is this an existing identity from the DB?
+}
+
+type identityNameData struct {
+	MasterName  string
+	VariantName string
 }
 
 type frameData struct {
 	Index int
 	Score float64
 	Data  []byte
+}
+
+type frameCandidate struct {
+	Score float64
+	Vec   []float64
+	Thumb []byte
 }
 
 type timeRange struct {
@@ -475,7 +487,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 	firstDetectionWritten := make(map[int]bool)
 	identityDirsCreated := make(map[int]bool)
 
-	idNames := make(map[int]string)
+	variantToMasterID := make(map[int]int)
+	idNames := make(map[int]identityNameData)
 	newlyCreated := make(map[int]bool) // Track which IDs were generated in this session
 	tempIDCounter := -1                // Negative IDs for pending tracks
 
@@ -498,8 +511,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		outputBase = "/data"
 	}
 	// Optimization: Ensure output directory exists ONCE, not per-track
-	unknownDir := filepath.Join(outputBase, "unknown", videoID)
-	if err := os.MkdirAll(unknownDir, 0755); err != nil {
+	resultsDir := filepath.Join(outputBase, "results", videoID)
+	if err := os.MkdirAll(resultsDir, 0755); err != nil {
 		utils.ShowError("Failed to create output directory", err, nil)
 		select {
 		case errChan <- err:
@@ -507,7 +520,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		}
 		return
 	}
-	fmt.Fprintf(os.Stderr, "📂 Output Directory: %s\n", unknownDir)
+	fmt.Fprintf(os.Stderr, "📂 Output Directory: %s\n", resultsDir)
 
 	// We use a buffered channel to offload thumbnail disk I/O without blocking the main loop,
 	// while ensuring that writes for the same ID happen in order.
@@ -570,13 +583,31 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		}
 
 		isNewIdentity := t.ID < 0
-		finalID := t.ID
+		finalVariantID := t.ID // This is the Variant ID
+
+		// Forensic Selection: Select the frame closest to the mean vector from the top candidates
+		if len(t.TopFrames) > 0 {
+			bestIdx := -1
+			minDist := 2.0
+			for i, f := range t.TopFrames {
+				dist := utils.CosineDist(f.Vec, t.MeanVec)
+				if dist < minDist {
+					minDist = dist
+					bestIdx = i
+				}
+			}
+			if bestIdx != -1 {
+				t.BestThumb = t.TopFrames[bestIdx].Thumb
+				t.BestQuality = t.TopFrames[bestIdx].Score
+			}
+		}
 
 		if isNewIdentity {
 			// Create Identity Synchronously. If we do this async, a race condition exists
 			// where the person reappears before the DB commit, causing a duplicate identity.
 			var err error
-			finalID, err = db.CreateIdentity(ctx, t.MeanVec, t.Count)
+			var createdMasterID int
+			finalVariantID, createdMasterID, err = db.CreateIdentity(ctx, t.MeanVec, t.Count)
 			if err != nil {
 				utils.ShowError("Failed to create deferred identity", err, nil)
 				select {
@@ -585,31 +616,37 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 				}
 				return
 			}
+			t.MasterID = createdMasterID
 			// Update metadata so the final summary report is correct
-			idNames[finalID] = fmt.Sprintf("Identity %d", finalID)
-			t.ID = finalID               // Update track ID so summary grouping works
-			newlyCreated[finalID] = true // Mark as new for the summary report
+			// Note: CreateIdentity creates a Master "Identity <ID>" and Variant "Default"
+			// We store the Master Name for display
+			variantToMasterID[finalVariantID] = t.MasterID
+			idNames[finalVariantID] = identityNameData{MasterName: fmt.Sprintf("Identity %d", t.MasterID), VariantName: "Default"}
+			t.ID = finalVariantID               // Update track ID with VariantID
+			newlyCreated[finalVariantID] = true // Mark as new for the summary report
 		}
 
+		finalMasterID := t.MasterID
+
 		// Create Identity Directory
-		identityDir := filepath.Join(unknownDir, fmt.Sprintf("identity_%d", finalID))
+		identityDir := filepath.Join(resultsDir, fmt.Sprintf("identity_%d", finalMasterID)) // Use MasterID for directory
 		framesDir := filepath.Join(identityDir, "frames")
-		if !identityDirsCreated[finalID] {
+		if !identityDirsCreated[finalMasterID] { // Use MasterID for map key
 			if err := os.MkdirAll(framesDir, 0755); err != nil {
 				utils.ShowError("Failed to create identity directory", err, nil)
 			}
-			identityDirsCreated[finalID] = true
+			identityDirsCreated[finalMasterID] = true // Use MasterID for map key
 		}
 
 		// 1. First Detection (Only if not written for this ID yet)
-		if !firstDetectionWritten[finalID] {
+		if !firstDetectionWritten[finalMasterID] { // Use MasterID for map key
 			thumbChan <- thumbOp{
 				dir:        identityDir,
 				filename:   fmt.Sprintf("1_First_Detection_[%.2f].jpg", t.FirstScore),
 				data:       t.FirstThumb,
 				removeGlob: "1_First_Detection_*.jpg",
 			}
-			firstDetectionWritten[finalID] = true
+			firstDetectionWritten[finalMasterID] = true // Use MasterID for map key
 		}
 
 		// 2. Last Detection (Always overwrite)
@@ -621,8 +658,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		}
 
 		// 3. Highest Confidence
-		if t.BestQuality > globalBestScore[finalID] {
-			globalBestScore[finalID] = t.BestQuality
+		if t.BestQuality > globalBestScore[finalMasterID] { // Use MasterID for map key
+			globalBestScore[finalMasterID] = t.BestQuality // Use MasterID for map key
 			thumbChan <- thumbOp{
 				dir:        identityDir,
 				filename:   fmt.Sprintf("3_Highest_Confidence_[%.2f].jpg", t.BestQuality),
@@ -632,9 +669,9 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		}
 
 		// 4. Lowest Confidence
-		currLow, ok := globalLowestScore[finalID]
+		currLow, ok := globalLowestScore[finalMasterID] // Use MasterID for map key
 		if !ok || t.LowestScore < currLow {
-			globalLowestScore[finalID] = t.LowestScore
+			globalLowestScore[finalMasterID] = t.LowestScore // Use MasterID for map key
 			thumbChan <- thumbOp{
 				dir:        identityDir,
 				filename:   fmt.Sprintf("4_Lowest_Confidence_[%.2f].jpg", t.LowestScore),
@@ -659,8 +696,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			if !isNew {
 				// Only update vector if it was already known (accumulate average).
 				// For new identities, CreateIdentity already inserted the vector.
-				if err := db.UpdateIdentity(ctx, id, vec, count); err != nil {
-					utils.ShowError(fmt.Sprintf("Failed to update identity %d", id), err, nil)
+				if err := db.UpdateIdentity(ctx, id, vec, count); err != nil { // `id` here is VariantID, correct for UpdateIdentity
+					utils.ShowError(fmt.Sprintf("Failed to update variant %d", id), err, nil)
 					select {
 					case errChan <- err:
 					default:
@@ -669,13 +706,13 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 				}
 			}
 
-		}(finalID, t.MeanVec, t.Count, isNewIdentity)
+		}(finalVariantID, t.MeanVec, t.Count, isNewIdentity)
 
 		finalIntervals = append(finalIntervals, store.IntervalData{
-			Start:           startSec,
-			End:             endSec,
-			FaceCount:       t.Count,
-			KnownIdentityID: finalID,
+			Start:     startSec,
+			End:       endSec,
+			FaceCount: t.Count,
+			VariantID: finalVariantID, // This is correct, intervals link to variants
 		})
 		// Update summary with the final ID (guaranteed to be the correct DB ID)
 		summary[t.ID] = append(summary[t.ID], timeRange{Start: startSec, End: endSec})
@@ -719,55 +756,16 @@ Loop:
 						}
 					}
 
-					// Spatial Recovery: If strict vector match failed, check for spatial overlap (IoU).
-					// This handles occlusion (e.g., hand over mouth) where embedding distance spikes
-					// but the person hasn't moved significantly.
-					if bestMatch == -1 {
-						bestIoU := 0.0
-
-						for i, t := range tracks {
-							if assignedTracks[t.ID] {
-								continue
-							}
-
-							// Only consider tracks seen recently (within ~5 scan intervals)
-							if frame.Index-t.LastFrame > opts.NthFrame*5 {
-								continue
-							}
-
-							iou := calculateIoU(face.Loc, t.LastLoc)
-							// Relaxed from 0.2 -> 0.1 to catch slight movements during occlusion
-							if iou < 0.1 {
-								continue
-							}
-
-							// Dynamic Threshold: The more the boxes overlap, the more we relax the vector match threshold.
-							// A high IoU strongly implies it's the same person, even if occlusion ruins the vector.
-							// Boosted multiplier: Even small overlap (0.1) now gives +0.2 forgiveness.
-							relaxedThreshold := opts.MatchThreshold + (iou * 2.0)
-
-							dist := utils.CosineDist(face.Vec, t.MeanVec)
-							if dist < relaxedThreshold && iou > bestIoU {
-								bestIoU = iou
-								bestMatch = i
-							}
-						}
-					}
-
 					if bestMatch != -1 {
 						t := tracks[bestMatch]
 						t.LastFrame = frame.Index
 						t.LastLoc = face.Loc
 						assignedTracks[t.ID] = true
 
-						// FIX: Only update mean if the vector is reliable.
-						// If we matched via Spatial Recovery (high distance), the vector is likely garbage (occluded).
-						// We don't want to pollute the track's identity with garbage.
-						if utils.CosineDist(face.Vec, t.MeanVec) < opts.MatchThreshold {
-							k := float64(t.Count)
-							for j := 0; j < embeddingDim; j++ {
-								t.MeanVec[j] = (k*t.MeanVec[j] + face.Vec[j]) / (k + 1.0)
-							}
+						// Update running mean vector
+						k := float64(t.Count)
+						for j := 0; j < embeddingDim; j++ {
+							t.MeanVec[j] = (k*t.MeanVec[j] + face.Vec[j]) / (k + 1.0)
 						}
 						t.Count++
 
@@ -778,6 +776,25 @@ Loop:
 							t.BestQuality = face.Quality
 							t.BestThumb = face.Thumb
 						}
+
+						// Maintain Top 10 Frames for Centroid Strategy
+						candidate := frameCandidate{Score: face.Quality, Vec: face.Vec, Thumb: face.Thumb}
+						if len(t.TopFrames) < 10 {
+							t.TopFrames = append(t.TopFrames, candidate)
+						} else {
+							minIdx := -1
+							minScore := math.MaxFloat64
+							for i, f := range t.TopFrames {
+								if f.Score < minScore {
+									minScore = f.Score
+									minIdx = i
+								}
+							}
+							if face.Quality > minScore {
+								t.TopFrames[minIdx] = candidate
+							}
+						}
+
 						if face.Quality < t.LowestScore {
 							t.LowestScore = face.Quality
 							t.LowestThumb = face.Thumb
@@ -788,7 +805,7 @@ Loop:
 							t.LastSavedScore = face.Quality
 						}
 					} else {
-						matchID, matchName, err := db.FindClosestIdentity(ctx, face.Vec, opts.MatchThreshold)
+						matchVariantID, matchMasterID, matchMasterName, matchVariantName, err := db.FindClosestIdentity(ctx, face.Vec, opts.MatchThreshold)
 						if err != nil {
 							utils.ShowError("DB Identity Lookup failed", err, nil)
 							select {
@@ -798,20 +815,22 @@ Loop:
 							return
 						}
 
-						if matchID != -1 {
-							newT := newActiveTrack(matchID, frame.Index, face.Vec, face.Thumb, face.Quality, matchName, true, face.Loc)
+						if matchVariantID != -1 {
+							newT := newActiveTrack(matchVariantID, matchMasterID, frame.Index, face.Vec, face.Thumb, face.Quality, matchMasterName, matchVariantName, true, face.Loc)
 							tracks = append(tracks, newT)
-							idNames[matchID] = matchName
-							assignedTracks[matchID] = true
+							variantToMasterID[matchVariantID] = matchMasterID
+							idNames[matchVariantID] = identityNameData{MasterName: matchMasterName, VariantName: matchVariantName}
+							assignedTracks[matchVariantID] = true
 						} else {
 							// New Identity -> Use Temporary Negative ID. Defer DB creation until blip filter passes
 							tempID := tempIDCounter
 							tempIDCounter--
 
 							name := fmt.Sprintf("Identity %d (Pending)", tempID)
-							newT := newActiveTrack(tempID, frame.Index, face.Vec, face.Thumb, face.Quality, name, false, face.Loc)
+							newT := newActiveTrack(tempID, 0, frame.Index, face.Vec, face.Thumb, face.Quality, name, "Default", false, face.Loc)
 							tracks = append(tracks, newT)
-							idNames[tempID] = name
+							// We don't know the master ID yet, so we can't add to variantToMasterID here. It will be added in persistTrack.
+							idNames[tempID] = identityNameData{MasterName: name, VariantName: "Default"}
 							assignedTracks[tempID] = true
 
 						}
@@ -851,20 +870,30 @@ Loop:
 	for _, id := range ids {
 		thumbNote := ""
 		// Check if we wrote anything for this ID (we check globalBestScore as a proxy)
-		if _, ok := globalBestScore[id]; ok {
-			thumbNote = fmt.Sprintf("(See unknown/%s/identity_%d/)", videoID, id)
+		// Use the in-memory map to get the MasterID, avoiding a DB query.
+		masterID := variantToMasterID[id]
+		if _, ok := globalBestScore[masterID]; ok {
+			thumbNote = fmt.Sprintf("(See results/%s/identity_%d/)", videoID, masterID)
 		}
 
-		name := idNames[id]
-		if name == "" {
-			name = fmt.Sprintf("Identity %d", id)
+		names, ok := idNames[id]
+		if !ok {
+			// Fallback if idNames somehow doesn't have it, though it should.
+			names = identityNameData{MasterName: fmt.Sprintf("Identity %d", masterID)}
 		}
 
-		status := "[EXISTING]"
+		status := "💾" // Existing
 		if newlyCreated[id] {
-			status = "[NEW]"
+			status = "✨" // New
 		}
-		fmt.Fprintf(os.Stderr, "\n👤 %s %s Found: %s\n", name, status, thumbNote)
+
+		variantPart := ""
+		if names.VariantName != "Default" && names.VariantName != "" {
+			variantPart = fmt.Sprintf(" (%s)", names.VariantName)
+		}
+
+		// Display Variant ID for reference
+		fmt.Fprintf(os.Stderr, "\n👤 %s%s %s (ID: %d, Variant: %d) Found: %s\n", names.MasterName, variantPart, status, masterID, id, thumbNote)
 		for _, r := range summary[id] {
 			fmt.Fprintf(os.Stderr, "   %s -> %s\n", fmtTime(r.Start), fmtTime(r.End))
 		}
@@ -875,9 +904,10 @@ Loop:
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 }
 
-func newActiveTrack(id, frameIndex int, vec []float64, thumb []byte, quality float64, name string, isKnown bool, loc []int) *activeTrack {
+func newActiveTrack(id, masterID, frameIndex int, vec []float64, thumb []byte, quality float64, name, variantName string, isKnown bool, loc []int) *activeTrack {
 	t := &activeTrack{
 		ID:             id,
+		MasterID:       masterID,
 		StartFrame:     frameIndex,
 		LastFrame:      frameIndex,
 		LastLoc:        loc,
@@ -893,7 +923,9 @@ func newActiveTrack(id, frameIndex int, vec []float64, thumb []byte, quality flo
 		LowestScore:    quality,
 		LastSavedScore: quality,
 		PendingFrames:  []frameData{{Index: frameIndex, Score: quality, Data: thumb}},
+		TopFrames:      []frameCandidate{{Score: quality, Vec: vec, Thumb: thumb}},
 		Name:           name,
+		VariantName:    variantName,
 		IsKnown:        isKnown,
 	}
 	copy(t.MeanVec, vec)
@@ -937,14 +969,7 @@ func validateScanFlags(opts *Options) error {
 		utils.ShowError("Invalid worker-timeout format (use '30s', '1m')", err, nil)
 		return err
 	}
-	switch opts.QualityStrategy {
-	case "clarity", "portrait", "confidence", "legacy":
-		// Valid
-	default:
-		err := fmt.Errorf("must be one of: clarity, portrait, confidence, legacy")
-		utils.ShowError("Invalid quality-strategy", err, nil)
-		return err
-	}
+
 	return nil
 }
 
@@ -954,23 +979,4 @@ func fmtTime(seconds float64) string {
 	m := int(duration.Minutes()) % 60
 	s := int(duration.Seconds()) % 60
 	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
-}
-
-func calculateIoU(boxA, boxB []int) float64 {
-	if len(boxA) < 4 || len(boxB) < 4 {
-		return 0
-	}
-	xA := max(boxA[0], boxB[0])
-	yA := max(boxA[1], boxB[1])
-	xB := min(boxA[2], boxB[2])
-	yB := min(boxA[3], boxB[3])
-
-	interArea := max(0, xB-xA) * max(0, yB-yA)
-	boxAArea := (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-	boxBArea := (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-
-	if boxAArea+boxBArea-interArea <= 0 {
-		return 0
-	}
-	return float64(interArea) / float64(boxAArea+boxBArea-interArea)
 }

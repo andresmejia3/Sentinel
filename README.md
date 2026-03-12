@@ -72,7 +72,6 @@ Ingests a video file, detects faces, and indexes them into the vector database.
 | `--grace-period` | `-g` | `2s` | Time a face can be missing before the track is closed. |
 | `--blip-duration` | `-b` | `100ms` | Minimum duration for a track to be saved (filters noise). |
 | `--buffer-size` | `-B` | `200` | Max frames to buffer in memory. |
-| `--quality-strategy` | | `clarity` | Strategy for face quality (`clarity`, `portrait`, `confidence`). |
 | `--worker-timeout` | | `30s` | Timeout for AI worker processing per frame. |
 | `--debug-screenshots` | `-d` | `false` | Save frames with bounding boxes to `/data/debug_frames/`. |
 
@@ -109,10 +108,18 @@ sentinel find -t 0.5 /data/suspect.jpg
 ```
 
 ### `label`
-Assign a name to a discovered identity ID.
+Assign names to master identities or variants.
+
+**Label a Master Identity:**
 ```bash
-sentinel label 12 "Jane Doe"
+sentinel label identity <master_id> <new_name>
 ```
+
+**Label a Variant:** Links a detected variant to a master identity and gives the variant a specific name.
+```bash
+sentinel label variant <variant_id> <master_name> <variant_name>
+```
+
 
 ### `list`
 List all stored identities and their metadata.

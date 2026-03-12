@@ -25,7 +25,6 @@ type Options struct {
 	DebugScreenshots   bool
 	DetectionThreshold float64
 	WorkerTimeout      string
-	QualityStrategy    string
 }
 
 var (

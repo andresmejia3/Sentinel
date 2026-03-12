@@ -39,7 +39,6 @@ type ScanConfig struct {
 	Debug              bool
 	DetectionThreshold float64
 	ReadTimeout        time.Duration
-	QualityStrategy    string
 }
 
 // RedactConfig holds configuration for the RedactWorker.
@@ -158,9 +157,6 @@ func NewPythonScanWorker(ctx context.Context, id int, cfg ScanConfig) (*ScanWork
 		args = append(args, "--debug")
 	}
 	args = append(args, "--detection-threshold", fmt.Sprintf("%f", cfg.DetectionThreshold))
-	if cfg.QualityStrategy != "" {
-		args = append(args, "--quality-strategy", cfg.QualityStrategy)
-	}
 
 	base, err := newBaseWorker(ctx, id, "python/scan_worker.py", args, cfg.ReadTimeout)
 	if err != nil {

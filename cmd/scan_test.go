@@ -122,7 +122,7 @@ func TestScanPersistence(t *testing.T) {
 	vec := make([]float64, 512)
 	vec[0] = 1.0
 
-	id, err := db.CreateIdentity(ctx, vec, 10)
+	variantID, masterID, err := db.CreateIdentity(ctx, vec, 10)
 	if err != nil {
 		t.Fatalf("Failed to create identity: %v", err)
 	}
@@ -133,31 +133,34 @@ func TestScanPersistence(t *testing.T) {
 	// Expected Avg: [0.5, 0.5...], Total Count: 20
 	vecUpdate := make([]float64, 512)
 	vecUpdate[1] = 1.0
-	if err := db.UpdateIdentity(ctx, id, vecUpdate, 10); err != nil {
+	if err := db.UpdateIdentity(ctx, variantID, vecUpdate, 10); err != nil {
 		t.Fatalf("Failed to update identity: %v", err)
 	}
 
-	if err = db.InsertInterval(ctx, videoID, 0.0, 5.0, 10, id); err != nil {
+	if err = db.InsertInterval(ctx, videoID, 0.0, 5.0, 10, variantID); err != nil {
 		t.Fatalf("Failed to insert interval: %v", err)
 	}
 
 	// Verify Vector Math
-	vecs, err := db.GetIdentityVectors(ctx, []int{id})
+	variants, err := db.GetVariantsForIdentities(ctx, []int{masterID})
 	if err != nil {
 		t.Fatalf("Failed to retrieve vectors: %v", err)
 	}
-	gotVec := vecs[id]
+	if len(variants) == 0 || variants[0].VariantID != variantID {
+		t.Fatalf("Expected variant %d, got %v", variantID, variants)
+	}
+	gotVec := variants[0].Vec
 	if math.Abs(gotVec[0]-0.5) > 1e-5 || math.Abs(gotVec[1]-0.5) > 1e-5 {
 		t.Errorf("UpdateIdentity failed weighted average. Expected ~0.5 at indices 0&1, got %v", gotVec[:2])
 	}
 
 	// Verify Intervals
-	intervals, err := db.GetIdentityIntervals(ctx, id)
+	intervals, err := db.GetIdentityIntervals(ctx, variantID)
 	if err != nil {
 		t.Fatalf("Failed to get intervals for verification: %v", err)
 	}
 	if len(intervals) != 1 {
-		t.Fatalf("Expected 1 interval for identity %d, got %d", id, len(intervals))
+		t.Fatalf("Expected 1 interval for identity %d, got %d", variantID, len(intervals))
 	}
 	if intervals[0].VideoID != videoID || intervals[0].Start != 0.0 || intervals[0].End != 5.0 {
 		t.Errorf("Mismatch in persisted interval data. Got %+v", intervals[0])
@@ -205,12 +208,11 @@ func TestValidateScanFlags(t *testing.T) {
 		{
 			name: "Valid options",
 			opts: Options{
-				InputPath:       tmpFile.Name(),
-				NthFrame:        1,
-				MatchThreshold:  0.5,
-				GracePeriod:     "1s",
-				WorkerTimeout:   "30s",
-				QualityStrategy: "clarity",
+				InputPath:      tmpFile.Name(),
+				NthFrame:       1,
+				MatchThreshold: 0.5,
+				GracePeriod:    "1s",
+				WorkerTimeout:  "30s",
 			},
 			wantErr: false,
 		},

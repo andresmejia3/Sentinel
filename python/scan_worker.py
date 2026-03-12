@@ -21,7 +21,6 @@ logging.getLogger('insightface').setLevel(logging.ERROR)
 parser = argparse.ArgumentParser()
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--detection-threshold', type=float, default=0.5, help='Face detection confidence threshold')
-parser.add_argument('--quality-strategy', type=str, default='clarity', choices=['clarity', 'portrait', 'confidence', 'legacy'], help='Quality scoring strategy')
 args, _ = parser.parse_known_args()
 
 DETECTION_THRESHOLD = args.detection_threshold
@@ -43,6 +42,44 @@ def read_exactly(stream, n):
         chunks.append(chunk)
         bytes_read += len(chunk)
     return b''.join(chunks)
+
+def compute_iqs(face, frame_array, w_size=1.0, w_sharp=1.5):
+    # 1. Get Area (Resolution)
+    x1, y1, x2, y2 = face.bbox.astype(int)
+    area = (x2 - x1) * (y2 - y1)
+    
+    # 2. Get Sharpness (Laplacian Variance)
+    # Ensure coordinates are within bounds
+    h, w = frame_array.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    
+    face_roi = frame_array[y1:y2, x1:x2]
+    sharpness = 0.0
+    if face_roi.size > 0:
+        gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+    # 3. Apply Weighted Additive Log-Scale
+    size_score = np.log(max(1.0, float(area)))
+    sharpness_score = np.log(max(1.0, sharpness))
+    
+    base_quality = (w_size * size_score) + (w_sharp * sharpness_score)
+
+    # 4. Occlusion Penalty (Mouth Penalty logic)
+    # We rely on the caller to handle detection score gating if needed, 
+    # but here we return the raw IQS scaled by detection score as requested.
+    penalty = 0.0
+    if face.kps is not None:
+        nose_y = face.kps[2][1]
+        mouth_y = (face.kps[3][1] + face.kps[4][1]) / 2
+        eye_y = (face.kps[0][1] + face.kps[1][1]) / 2
+        if (mouth_y - nose_y) < (nose_y - eye_y) * 0.5:
+            penalty = 2.0 # Flat deduction
+
+    # Final Score gated by Detection Confidence
+    final_iqs = (base_quality - penalty) * face.det_score
+    return final_iqs
 
 def process_frame(image_bytes, debug=False) -> bytes:
     try:
@@ -95,52 +132,10 @@ def process_frame(image_bytes, debug=False) -> bytes:
         for face, x1, y1, x2, y2, norm in valid_faces:
             embedding_bytes = (face.embedding / norm).astype('>f4').tobytes()
 
-            area = (x2 - x1) * (y2 - y1)
-            alignment = 0.5
-            mouth_penalty = 1.0
-
-            if face.kps is not None:
-                eye_center_x = (face.kps[0][0] + face.kps[1][0]) / 2
-                eye_dist = np.linalg.norm(face.kps[1] - face.kps[0])
-                if eye_dist > 0:
-                    nose_offset = abs(face.kps[2][0] - eye_center_x)
-                    alignment = max(0.0, 1.0 - (nose_offset / eye_dist))
-                
-                # Occlusion Check: If nose is too close to mouth center (kps[3], kps[4]), penalize.
-                # This helps avoid thumbnails with hands covering the mouth.
-                if len(face.kps) >= 5:
-                    nose_y = face.kps[2][1]
-                    mouth_y = (face.kps[3][1] + face.kps[4][1]) / 2
-                    eye_y = (face.kps[0][1] + face.kps[1][1]) / 2
-                    # If mouth is closer to nose than nose is to eyes, it's likely occluded/scrunched
-                    if (mouth_y - nose_y) < (nose_y - eye_y) * 0.5:
-                        mouth_penalty = 0.5
-
-            face_roi = frame_array[y1:y2, x1:x2]
-            sharpness = 0.0
-            if face_roi.size > 0:
-                gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-                sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-            # Cap sharpness to prevent hands/hair from boosting the score artificially
-            # Log(100) ~ 4.6. We cap the multiplier impact.
-            sharpness_score = np.log(max(1.0, sharpness))
-            if sharpness_score > 6.0: sharpness_score = 6.0
-
-            quality_strategy = args.quality_strategy
-            # Apply mouth_penalty to all strategies
-            if quality_strategy == 'portrait':
-                quality = face.det_score * (alignment ** 2) * sharpness_score * np.log(max(1.0, float(area))) * mouth_penalty
-            elif quality_strategy == 'clarity':
-                size_score = 1.0 - np.exp(-float(area) / 40000.0)
-                quality = face.det_score * alignment * sharpness_score * size_score * mouth_penalty
-            elif quality_strategy == 'confidence':
-                quality = (face.det_score ** 2) * alignment * sharpness_score * np.log(max(1.0, float(area))) * mouth_penalty
-            else:
-                quality = face.det_score * alignment * sharpness_score * np.sqrt(max(1.0, float(area))) * mouth_penalty
-
+            quality = compute_iqs(face, frame_array)
+            
             if debug:
-                sys.stderr.write(f"Face: Score={face.det_score:.2f} Align={alignment:.2f} Sharp={sharpness:.1f} Area={area:.0f} -> Quality ({quality_strategy})={quality:.4f}\n")
+                sys.stderr.write(f"Face: Score={face.det_score:.2f} -> IQS={quality:.4f}\n")
 
             thumb_img = resized_frame.copy()
             draw_x1, draw_y1, draw_x2, draw_y2 = int(x1*scale), int(y1*scale), int(x2*scale), int(y2*scale)
@@ -173,7 +168,7 @@ def process_frame(image_bytes, debug=False) -> bytes:
 
 def main():
     with os.fdopen(3, 'wb') as out_pipe:
-        sys.stderr.write(f"🐍 Scan Worker Started. Strategy: {args.quality_strategy}\n")
+        sys.stderr.write("🐍 Scan Worker Started.\n")
         out_pipe.write(b'READY')
         out_pipe.flush()
 

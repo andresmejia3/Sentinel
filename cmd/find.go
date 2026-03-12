@@ -86,23 +86,25 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	}
 
 	fmt.Fprintln(os.Stderr, "🗄️  Searching database...")
-	id, name, err := DB.FindClosestIdentity(ctx, bestFace.Vec, opts.MatchThreshold)
+	variantID, masterID, masterName, variantName, err := DB.FindClosestIdentity(ctx, bestFace.Vec, opts.MatchThreshold)
 	if err != nil {
 		utils.ShowError("Database search failed", err, nil)
 		return err
 	}
 
-	if id == -1 {
+	if variantID == -1 {
 		fmt.Println("❌ No match found in database.")
 		return nil
 	}
 
-	if name == "" {
-		name = fmt.Sprintf("Identity %d", id)
+	variantPart := ""
+	if variantName != "Default" && variantName != "" {
+		variantPart = fmt.Sprintf(" (%s)", variantName)
 	}
-	fmt.Printf("✅ Found Match: %s (ID: %d)\n", name, id)
 
-	intervals, err := DB.GetIdentityIntervals(ctx, id)
+	fmt.Printf("✅ Found Match: %s%s (ID: %d, Variant: %d)\n", masterName, variantPart, masterID, variantID)
+
+	intervals, err := DB.GetIdentityIntervals(ctx, variantID)
 	if err != nil {
 		utils.ShowError("Failed to retrieve history", err, nil)
 		return err

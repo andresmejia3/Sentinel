@@ -51,7 +51,7 @@ var resetCmd = &cobra.Command{
 		if resetFiles {
 			if confirm(reader, "⚠️  Are you sure you want to delete all thumbnails and output videos?") {
 				fmt.Println("🗑️  Clearing Output Files (Thumbnails, Videos)...")
-				removeDir(filepath.Join(outputBase, "unknown"))
+				removeDir(filepath.Join(outputBase, "results"))
 				removeDir(filepath.Join(outputBase, "output"))
 			}
 		}

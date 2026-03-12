@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/andresmejia3/sentinel/internal/store"
 	"github.com/andresmejia3/sentinel/internal/types"
 	"github.com/andresmejia3/sentinel/internal/utils"
 	"github.com/andresmejia3/sentinel/internal/worker"
@@ -80,9 +81,9 @@ type redactionTrack struct {
 
 // paranoidTracker manages the stateful redaction logic, including lingering and paranoid mode.
 type paranoidTracker struct {
-	targetVecs   map[int][]float64 // Optimization: In-memory embeddings
-	activeTracks []*redactionTrack
-	opts         *Options
+	targetVariants []store.VariantData // All variants for target masters
+	activeTracks   []*redactionTrack
+	opts           *Options
 }
 
 func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
@@ -103,13 +104,21 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	}
 
 	targetIDs := []int{}
+	var validationErrors []string
 	if redactMode == "targeted" {
 		for _, s := range strings.Split(redactTargets, ",") {
 			id, err := strconv.Atoi(strings.TrimSpace(s))
-			if err == nil {
-				targetIDs = append(targetIDs, id)
+			if err != nil {
+				validationErrors = append(validationErrors, fmt.Sprintf("'%s'", s))
+				continue
 			}
+			targetIDs = append(targetIDs, id)
 		}
+	}
+	if len(validationErrors) > 0 {
+		err := fmt.Errorf("invalid target IDs: %s", strings.Join(validationErrors, ", "))
+		utils.ShowError("Configuration Error", err, nil)
+		return err
 	}
 
 	if err := os.MkdirAll(filepath.Dir(redactOutput), 0755); err != nil {
@@ -136,8 +145,8 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	var wg sync.WaitGroup
 	readyChan := make(chan bool, opts.NumEngines)
 
-	// Optimization: Load target embeddings into memory
-	targetVecs, err := DB.GetIdentityVectors(ctx, targetIDs)
+	// Optimization: Load all target variant embeddings into memory
+	targetVariants, err := DB.GetVariantsForIdentities(ctx, targetIDs)
 	if err != nil {
 		utils.ShowError("Failed to load target embeddings", err, nil)
 		return err
@@ -146,9 +155,9 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	lingerDuration, _ := time.ParseDuration(redactLinger)
 	lingerFrames := int(lingerDuration.Seconds() * fps)
 	tracker := &paranoidTracker{
-		targetVecs:   targetVecs,
-		activeTracks: make([]*redactionTrack, 0),
-		opts:         &opts,
+		targetVariants: targetVariants,
+		activeTracks:   make([]*redactionTrack, 0),
+		opts:           &opts,
 	}
 
 	workerTimeout, _ := time.ParseDuration(opts.WorkerTimeout)
@@ -442,10 +451,10 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 
 	// Optimization: Copy master list to a "missing" set.
 	// We remove IDs as we find them. If any remain, paranoid mode triggers.
-	missingTargets := make(map[int]bool, len(p.targetVecs))
+	missingTargets := make(map[int]bool)
 	if mode == "targeted" {
-		for id := range p.targetVecs {
-			missingTargets[id] = true
+		for _, v := range p.targetVariants {
+			missingTargets[v.MasterID] = true
 		}
 	}
 
@@ -460,11 +469,11 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 			bestID := -1
 			minDist := p.opts.MatchThreshold
 
-			for tID, tVec := range p.targetVecs {
-				dist := utils.CosineDist(face.Vec, tVec)
+			for _, v := range p.targetVariants {
+				dist := utils.CosineDist(face.Vec, v.Vec)
 				if dist < minDist {
 					minDist = dist
-					bestID = tID
+					bestID = v.MasterID
 				}
 			}
 
