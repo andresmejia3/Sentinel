@@ -861,41 +861,57 @@ Loop:
 	fmt.Fprintf(os.Stderr, "📊 SCAN SUMMARY\n")
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 
-	var ids []int
-	for id := range summary {
-		ids = append(ids, id)
+	// Group results by Master Identity
+	masterGroups := make(map[int][]int) // MasterID -> []VariantID
+	for vid := range summary {
+		mid := variantToMasterID[vid]
+		masterGroups[mid] = append(masterGroups[mid], vid)
 	}
-	sort.Ints(ids)
 
-	for _, id := range ids {
+	var masterIDs []int
+	for mid := range masterGroups {
+		masterIDs = append(masterIDs, mid)
+	}
+	sort.Ints(masterIDs)
+
+	for _, mid := range masterIDs {
+		vids := masterGroups[mid]
+		sort.Ints(vids)
+
+		// Derive Master info from the first variant
+		firstVID := vids[0]
+		names := idNames[firstVID]
+		masterName := names.MasterName
+		if masterName == "" {
+			masterName = fmt.Sprintf("Identity %d", mid)
+		}
+
 		thumbNote := ""
-		// Check if we wrote anything for this ID (we check globalBestScore as a proxy)
-		// Use the in-memory map to get the MasterID, avoiding a DB query.
-		masterID := variantToMasterID[id]
-		if _, ok := globalBestScore[masterID]; ok {
-			thumbNote = fmt.Sprintf("(See results/%s/identity_%d/)", videoID, masterID)
+		if _, ok := globalBestScore[mid]; ok {
+			thumbNote = fmt.Sprintf("(See results/%s/identity_%d/)", videoID, mid)
 		}
 
-		names, ok := idNames[id]
-		if !ok {
-			// Fallback if idNames somehow doesn't have it, though it should.
-			names = identityNameData{MasterName: fmt.Sprintf("Identity %d", masterID)}
+		// Determine status based on whether any variant is new
+		status := "💾"
+		for _, vid := range vids {
+			if newlyCreated[vid] {
+				status = "✨"
+				break
+			}
 		}
 
-		status := "💾" // Existing
-		if newlyCreated[id] {
-			status = "✨" // New
-		}
+		fmt.Fprintf(os.Stderr, "\n👤 %s %s (ID: %d) Found: %s\n", masterName, status, mid, thumbNote)
 
-		variantPart := ""
-		if names.VariantName != "Default" && names.VariantName != "" {
-			variantPart = fmt.Sprintf(" (%s)", names.VariantName)
-		}
+		for _, vid := range vids {
+			vName := idNames[vid].VariantName
+			if vName == "" {
+				vName = "Default"
+			}
 
-		// Display Variant ID for reference
-		fmt.Fprintf(os.Stderr, "\n👤 %s%s %s (ID: %d, Variant: %d) Found: %s\n", names.MasterName, variantPart, status, masterID, id, thumbNote)
-		for _, r := range summary[id] {
-			fmt.Fprintf(os.Stderr, "   %s -> %s\n", fmtTime(r.Start), fmtTime(r.End))
+			fmt.Fprintf(os.Stderr, "   👉 Variant: %s (ID: %d)\n", vName, vid)
+			for _, r := range summary[vid] {
+				fmt.Fprintf(os.Stderr, "      %s -> %s\n", fmtTime(r.Start), fmtTime(r.End))
+			}
 		}
 	}
 

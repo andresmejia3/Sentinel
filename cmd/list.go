@@ -54,11 +54,11 @@ func runList() error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "ID\tNAME\tFACE COUNT\tCREATED")
-	fmt.Fprintln(w, "--\t----\t----------\t-------")
+	fmt.Fprintln(w, "ID\tNAME\tVARIANTS\tFACE COUNT\tCREATED")
+	fmt.Fprintln(w, "--\t----\t--------\t----------\t-------")
 
 	for _, id := range identities {
-		fmt.Fprintf(w, "%d\t%s\t%d\t%s\n", id.ID, id.Name, id.Count, id.CreatedAt.Local().Format("2006-01-02 15:04"))
+		fmt.Fprintf(w, "%d\t%s\t%d\t%d\t%s\n", id.ID, id.Name, id.VariantCount, id.Count, id.CreatedAt.Local().Format("2006-01-02 15:04"))
 	}
 	w.Flush()
 	return nil

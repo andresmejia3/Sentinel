@@ -223,6 +223,9 @@ func (s *Store) GetVariantsForIdentities(ctx context.Context, masterIDs []int) (
 		}
 		results = append(results, v)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return results, nil
 }
 
@@ -355,16 +358,17 @@ func (s *Store) Reset(ctx context.Context) error {
 
 // IdentityMetadata represents the display info for an identity
 type IdentityMetadata struct {
-	ID        int
-	Name      string
-	Count     int
-	CreatedAt time.Time
+	ID           int
+	Name         string
+	Count        int // Total face count across all variants
+	VariantCount int // Number of variants for this master
+	CreatedAt    time.Time
 }
 
 type VariantMetadata struct {
 	ID        int
 	Name      string
-	Count     int
+	Count     int // Face count for this specific variant
 	CreatedAt time.Time
 }
 
@@ -377,6 +381,7 @@ func (s *Store) ListIdentities(ctx context.Context) ([]IdentityMetadata, error) 
 			i.id,
 			COALESCE(i.name, 'Identity ' || i.id),
 			COALESCE(SUM(v.face_count), 0)::INT,
+			COUNT(v.id)::INT,
 			i.created_at
 		FROM identities i
 		LEFT JOIN variants v ON i.id = v.identity_id
@@ -390,10 +395,13 @@ func (s *Store) ListIdentities(ctx context.Context) ([]IdentityMetadata, error) 
 	var results []IdentityMetadata
 	for rows.Next() {
 		var i IdentityMetadata
-		if err := rows.Scan(&i.ID, &i.Name, &i.Count, &i.CreatedAt); err != nil {
+		if err := rows.Scan(&i.ID, &i.Name, &i.Count, &i.VariantCount, &i.CreatedAt); err != nil {
 			return nil, err
 		}
 		results = append(results, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return results, nil
 }
@@ -417,6 +425,9 @@ func (s *Store) ListVariantsForIdentity(ctx context.Context, masterID int) ([]Va
 			return nil, err
 		}
 		results = append(results, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return results, nil
 }
@@ -450,6 +461,9 @@ func (s *Store) GetIdentityIntervals(ctx context.Context, identityID int) ([]Int
 			return nil, err
 		}
 		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return results, nil
 }
