@@ -25,6 +25,7 @@ type Options struct {
 	DebugScreenshots   bool
 	DetectionThreshold float64
 	WorkerTimeout      string
+	StagingFile        string
 }
 
 var (

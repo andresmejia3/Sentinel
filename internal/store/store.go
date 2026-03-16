@@ -88,6 +88,17 @@ func initSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		CREATE INDEX IF NOT EXISTS face_intervals_video_id_idx ON face_intervals (video_id);
 		CREATE INDEX IF NOT EXISTS face_intervals_variant_id_idx ON face_intervals (variant_id);
 		CREATE INDEX IF NOT EXISTS variants_embedding_idx ON variants USING hnsw (embedding vector_cosine_ops);
+
+		CREATE TABLE IF NOT EXISTS ledger_entries (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			commit_id TEXT NOT NULL,
+			track_id TEXT NOT NULL,
+			variant_id INT REFERENCES variants(id) ON DELETE CASCADE,
+			added_sum VECTOR(512) NOT NULL,
+			added_count INT NOT NULL,
+			created_at TIMESTAMPTZ DEFAULT NOW()
+		);
+		CREATE INDEX IF NOT EXISTS ledger_entries_commit_id_idx ON ledger_entries (commit_id);
 	`
 	_, err := pool.Exec(ctx, query)
 	return err
@@ -160,7 +171,7 @@ func (s *Store) CommitScan(ctx context.Context, videoID string, intervals []Inte
 
 // FindClosestIdentity searches for the nearest neighbor in the database using cosine distance.
 // Returns -1 if no match is found within the threshold.
-func (s *Store) FindClosestIdentity(ctx context.Context, vec []float64, threshold float64) (variantID int, masterID int, masterName string, variantName string, err error) {
+func (s *Store) FindClosestIdentity(ctx context.Context, vec []float64, threshold float64) (variantID int, identityID int, identityName string, variantName string, err error) {
 	// Optimization: Use binary protocol (pass []float32) to avoid string parsing overhead.
 	vec32 := make([]float32, len(vec))
 	for i, v := range vec {
@@ -169,7 +180,7 @@ func (s *Store) FindClosestIdentity(ctx context.Context, vec []float64, threshol
 
 	// <=> is the cosine distance operator in pgvector
 	// We order by distance and limit to 1 to find the nearest neighbor
-	// We join with identities to return the Master Name
+	// We join with identities to return the Identity Name
 	query := `
 		SELECT v.id, i.id, COALESCE(i.name, 'Identity ' || i.id), COALESCE(v.name, 'Default')
 		FROM variants v
@@ -177,7 +188,7 @@ func (s *Store) FindClosestIdentity(ctx context.Context, vec []float64, threshol
 		WHERE v.embedding <=> $1::real[]::vector < $2 
 		ORDER BY v.embedding <=> $1::real[]::vector ASC LIMIT 1`
 
-	err = s.pool.QueryRow(ctx, query, vec32, threshold).Scan(&variantID, &masterID, &masterName, &variantName)
+	err = s.pool.QueryRow(ctx, query, vec32, threshold).Scan(&variantID, &identityID, &identityName, &variantName)
 	if err == pgx.ErrNoRows {
 		return -1, 0, "", "", nil // No match found
 	}
@@ -185,26 +196,106 @@ func (s *Store) FindClosestIdentity(ctx context.Context, vec []float64, threshol
 		return 0, 0, "", "", err
 	}
 
-	return variantID, masterID, masterName, variantName, nil
+	return variantID, identityID, identityName, variantName, nil
+}
+
+// IdentityMatch represents a candidate match for k-NN search.
+type IdentityMatch struct {
+	VariantID    int
+	IdentityID   int
+	IdentityName string
+	VariantName  string
+	Distance     float64
+}
+
+// FindTopIdentities returns the top K nearest neighbors for ranked k-NN logic.
+func (s *Store) FindTopIdentities(ctx context.Context, vec []float64, limit int) ([]IdentityMatch, error) {
+	vec32 := make([]float32, len(vec))
+	for i, v := range vec {
+		vec32[i] = float32(v)
+	}
+
+	query := `
+		SELECT v.id, i.id, COALESCE(i.name, 'Identity ' || i.id), COALESCE(v.name, 'Default'), v.embedding <=> $1::real[]::vector
+		FROM variants v
+		LEFT JOIN identities i ON v.identity_id = i.id
+		ORDER BY v.embedding <=> $1::real[]::vector ASC LIMIT $2`
+
+	rows, err := s.pool.Query(ctx, query, vec32, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var matches []IdentityMatch
+	for rows.Next() {
+		var m IdentityMatch
+		if err := rows.Scan(&m.VariantID, &m.IdentityID, &m.IdentityName, &m.VariantName, &m.Distance); err != nil {
+			return nil, err
+		}
+		matches = append(matches, m)
+	}
+	return matches, rows.Err()
+}
+
+// CommitMetadata summarizes a batch transaction.
+type CommitMetadata struct {
+	CommitID   string
+	TotalFaces int
+	TrackCount int
+	CreatedAt  time.Time
+}
+
+// ListCommits retrieves the history of batch operations.
+func (s *Store) ListCommits(ctx context.Context, limit int) ([]CommitMetadata, error) {
+	var rows pgx.Rows
+	var err error
+
+	queryBase := `
+		SELECT commit_id, SUM(added_count)::INT, COUNT(*)::INT, MAX(created_at)
+		FROM ledger_entries
+		GROUP BY commit_id
+		ORDER BY MAX(created_at) DESC
+	`
+	if limit > 0 {
+		rows, err = s.pool.Query(ctx, queryBase+" LIMIT $1", limit)
+	} else {
+		rows, err = s.pool.Query(ctx, queryBase)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []CommitMetadata
+	for rows.Next() {
+		var c CommitMetadata
+		if err := rows.Scan(&c.CommitID, &c.TotalFaces, &c.TrackCount, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		results = append(results, c)
+	}
+	return results, nil
 }
 
 // VariantData holds the embedding and linkage info for a variant.
 type VariantData struct {
-	VariantID int
-	MasterID  int
-	Vec       []float64
+	VariantID  int
+	IdentityID int
+	Vec        []float64
 }
 
-// GetVariantsForIdentities retrieves all variant embeddings for a list of Master Identity IDs.
-func (s *Store) GetVariantsForIdentities(ctx context.Context, masterIDs []int) ([]VariantData, error) {
-	if len(masterIDs) == 0 {
+// GetVariantsForIdentities retrieves all variant embeddings for a list of Identity IDs.
+func (s *Store) GetVariantsForIdentities(ctx context.Context, identityIDs []int) ([]VariantData, error) {
+	if len(identityIDs) == 0 {
 		return nil, nil
 	}
 
 	// Use ANY($1) to match any ID in the list
 	query := `SELECT id, identity_id, embedding::real[] FROM variants WHERE identity_id = ANY($1)`
 
-	rows, err := s.pool.Query(ctx, query, masterIDs)
+	rows, err := s.pool.Query(ctx, query, identityIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -214,7 +305,7 @@ func (s *Store) GetVariantsForIdentities(ctx context.Context, masterIDs []int) (
 	for rows.Next() {
 		var v VariantData
 		var vec32 []float32
-		if err := rows.Scan(&v.VariantID, &v.MasterID, &vec32); err != nil {
+		if err := rows.Scan(&v.VariantID, &v.IdentityID, &vec32); err != nil {
 			return nil, err
 		}
 		v.Vec = make([]float64, len(vec32))
@@ -230,7 +321,7 @@ func (s *Store) GetVariantsForIdentities(ctx context.Context, masterIDs []int) (
 }
 
 // CreateIdentity inserts a new unknown identity and returns its ID.
-func (s *Store) CreateIdentity(ctx context.Context, vec []float64, count int) (variantID int, masterID int, err error) {
+func (s *Store) CreateIdentity(ctx context.Context, vec []float64, count int) (variantID int, identityID int, err error) {
 	// Optimization: Use binary protocol (pass []float32) to avoid string parsing overhead.
 	vec32 := make([]float32, len(vec))
 	for i, v := range vec {
@@ -243,54 +334,54 @@ func (s *Store) CreateIdentity(ctx context.Context, vec []float64, count int) (v
 	}
 	defer tx.Rollback(ctx)
 
-	// 1. Create a new Master Identity (Name is NULL initially, will be "Identity <ID>" in UI)
-	if err := tx.QueryRow(ctx, "INSERT INTO identities DEFAULT VALUES RETURNING id").Scan(&masterID); err != nil {
+	// 1. Create a new Identity (Name is NULL initially, will be "Identity <ID>" in UI)
+	if err := tx.QueryRow(ctx, "INSERT INTO identities DEFAULT VALUES RETURNING id").Scan(&identityID); err != nil {
 		return 0, 0, err // Return 0 for both IDs on error
 	}
 
 	// 2. Create the Default Variant
-	err = tx.QueryRow(ctx, "INSERT INTO variants (embedding, face_count, identity_id, name) VALUES ($1::real[]::vector, $2, $3, 'Default') RETURNING id", vec32, count, masterID).Scan(&variantID)
+	err = tx.QueryRow(ctx, "INSERT INTO variants (embedding, face_count, identity_id, name) VALUES ($1::real[]::vector, $2, $3, 'Default') RETURNING id", vec32, count, identityID).Scan(&variantID)
 	if err != nil {
 		return 0, 0, err // Return 0 for both IDs on error
 	}
 
-	return variantID, masterID, tx.Commit(ctx)
+	return variantID, identityID, tx.Commit(ctx)
 }
 
-// MasterIdentityExists checks if a master identity exists in the database.
-func (s *Store) MasterIdentityExists(ctx context.Context, masterID int) (bool, error) {
+// IdentityExists checks if an identity exists in the database.
+func (s *Store) IdentityExists(ctx context.Context, identityID int) (bool, error) {
 	var exists bool
-	err := s.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM identities WHERE id = $1)", masterID).Scan(&exists)
+	err := s.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM identities WHERE id = $1)", identityID).Scan(&exists)
 	return exists, err
 }
 
-// GetMasterIDForVariant retrieves the Master Identity ID for a given Variant ID.
-func (s *Store) GetMasterIDForVariant(ctx context.Context, variantID int) (int, error) {
-	var masterID int
-	err := s.pool.QueryRow(ctx, "SELECT identity_id FROM variants WHERE id = $1", variantID).Scan(&masterID)
+// GetIdentityIDForVariant retrieves the Identity ID for a given Variant ID.
+func (s *Store) GetIdentityIDForVariant(ctx context.Context, variantID int) (int, error) {
+	var identityID int
+	err := s.pool.QueryRow(ctx, "SELECT identity_id FROM variants WHERE id = $1", variantID).Scan(&identityID)
 	if err == pgx.ErrNoRows {
 		return 0, fmt.Errorf("variant %d not found", variantID)
 	}
-	return masterID, err
+	return identityID, err
 }
 
-// SetVariantLabel links an existing variant to a Master Identity (creating it if needed) and names the variant.
-func (s *Store) SetVariantLabel(ctx context.Context, variantID int, masterName string, variantName string) error {
+// SetVariantLabel links an existing variant to an Identity (creating it if needed) and names the variant.
+func (s *Store) SetVariantLabel(ctx context.Context, variantID int, identityName string, variantName string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 
-	// Upsert Master Identity
-	var masterID int
-	err = tx.QueryRow(ctx, "INSERT INTO identities (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id", masterName).Scan(&masterID)
+	// Upsert Identity
+	var identityID int
+	err = tx.QueryRow(ctx, "INSERT INTO identities (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id", identityName).Scan(&identityID)
 	if err != nil {
-		return fmt.Errorf("failed to get/create master identity: %w", err)
+		return fmt.Errorf("failed to get/create identity: %w", err)
 	}
 
 	// Update Variant
-	_, err = tx.Exec(ctx, "UPDATE variants SET identity_id = $1, name = $2 WHERE id = $3", masterID, variantName, variantID)
+	_, err = tx.Exec(ctx, "UPDATE variants SET identity_id = $1, name = $2 WHERE id = $3", identityID, variantName, variantID)
 	if err != nil {
 		return fmt.Errorf("failed to update variant: %w", err)
 	}
@@ -331,9 +422,9 @@ func (s *Store) UpdateIdentity(ctx context.Context, id int, newVec []float64, ne
 	return tx.Commit(ctx)
 }
 
-// RenameIdentity renames a Master Identity directly by its ID.
-func (s *Store) RenameIdentity(ctx context.Context, masterID int, newName string) error {
-	_, err := s.pool.Exec(ctx, "UPDATE identities SET name = $1 WHERE id = $2", newName, masterID)
+// RenameIdentity renames an Identity directly by its ID.
+func (s *Store) RenameIdentity(ctx context.Context, identityID int, newName string) error {
+	_, err := s.pool.Exec(ctx, "UPDATE identities SET name = $1 WHERE id = $2", newName, identityID)
 	return err
 }
 
@@ -342,6 +433,98 @@ func (s *Store) RenameIdentity(ctx context.Context, masterID int, newName string
 func (s *Store) DeleteIdentity(ctx context.Context, id int) error {
 	_, err := s.pool.Exec(ctx, "DELETE FROM variants WHERE id = $1", id)
 	return err
+}
+
+// ApplyVariantDelta updates an identity by adding (or subtracting) a sum vector and frame count.
+// This is used for both Commits (positive delta) and Rollbacks (negative delta).
+func (s *Store) ApplyVariantDelta(ctx context.Context, variantID int, sumDelta []float64, countDelta int) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var oldVec []float32
+	var oldCount int
+	err = tx.QueryRow(ctx, "SELECT embedding::real[], face_count FROM variants WHERE id = $1 FOR UPDATE", variantID).Scan(&oldVec, &oldCount)
+	if err != nil {
+		return fmt.Errorf("failed to fetch variant %d: %w", variantID, err)
+	}
+
+	newCount := oldCount + countDelta
+
+	if newCount <= 0 {
+		// Delete the variant if it becomes empty
+		if _, err := tx.Exec(ctx, "DELETE FROM variants WHERE id = $1", variantID); err != nil {
+			return err
+		}
+		// Check if the identity is now empty and delete if so (optional cleanup)
+		// For now, we leave the identity even if empty to preserve ID continuity
+		return tx.Commit(ctx)
+	}
+
+	// Calculate new mean
+	// NewMean = (OldMean * OldCount + DeltaSum) / NewCount
+	finalVec := make([]float32, len(oldVec))
+	for i := range oldVec {
+		currentSum := float64(oldVec[i]) * float64(oldCount)
+		newMean := (currentSum + sumDelta[i]) / float64(newCount)
+		finalVec[i] = float32(newMean)
+	}
+
+	_, err = tx.Exec(ctx, "UPDATE variants SET embedding = $1::real[]::vector, face_count = $2 WHERE id = $3", finalVec, newCount, variantID)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// LedgerEntry represents a record in the transactional ledger.
+type LedgerEntry struct {
+	CommitID   string
+	TrackID    string
+	VariantID  int
+	AddedSum   []float64
+	AddedCount int
+}
+
+// InsertLedgerEntry records a change in the ledger.
+func (s *Store) InsertLedgerEntry(ctx context.Context, entry LedgerEntry) error {
+	vec32 := make([]float32, len(entry.AddedSum))
+	for i, v := range entry.AddedSum {
+		vec32[i] = float32(v)
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO ledger_entries (commit_id, track_id, variant_id, added_sum, added_count)
+		VALUES ($1, $2, $3, $4::real[]::vector, $5)
+	`, entry.CommitID, entry.TrackID, entry.VariantID, vec32, entry.AddedCount)
+	return err
+}
+
+// GetLedgerEntries retrieves all entries for a specific commit.
+func (s *Store) GetLedgerEntries(ctx context.Context, commitID string) ([]LedgerEntry, error) {
+	rows, err := s.pool.Query(ctx, "SELECT track_id, variant_id, added_sum::real[], added_count FROM ledger_entries WHERE commit_id = $1", commitID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []LedgerEntry
+	for rows.Next() {
+		var e LedgerEntry
+		var vec32 []float32
+		if err := rows.Scan(&e.TrackID, &e.VariantID, &vec32, &e.AddedCount); err != nil {
+			return nil, err
+		}
+		e.CommitID = commitID
+		e.AddedSum = make([]float64, len(vec32))
+		for i, v := range vec32 {
+			e.AddedSum[i] = float64(v)
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
 }
 
 // Reset drops all application tables to clear the database state.
@@ -361,7 +544,7 @@ type IdentityMetadata struct {
 	ID           int
 	Name         string
 	Count        int // Total face count across all variants
-	VariantCount int // Number of variants for this master
+	VariantCount int // Number of variants for this identity
 	CreatedAt    time.Time
 }
 
@@ -373,9 +556,9 @@ type VariantMetadata struct {
 }
 
 func (s *Store) ListIdentities(ctx context.Context) ([]IdentityMetadata, error) {
-	// List Master Identities
-	// We LEFT JOIN so that master identities with no variants yet still appear.
-	// We SUM the face_count from all variants belonging to a master identity.
+	// List Identities
+	// We LEFT JOIN so that identities with no variants yet still appear.
+	// We SUM the face_count from all variants belonging to an identity.
 	query := `
 		SELECT
 			i.id,
@@ -406,13 +589,13 @@ func (s *Store) ListIdentities(ctx context.Context) ([]IdentityMetadata, error) 
 	return results, nil
 }
 
-func (s *Store) ListVariantsForIdentity(ctx context.Context, masterID int) ([]VariantMetadata, error) {
+func (s *Store) ListVariantsForIdentity(ctx context.Context, identityID int) ([]VariantMetadata, error) {
 	query := `
 		SELECT id, COALESCE(name, 'Default'), face_count, created_at
 		FROM variants
 		WHERE identity_id = $1
 		ORDER BY id ASC`
-	rows, err := s.pool.Query(ctx, query, masterID)
+	rows, err := s.pool.Query(ctx, query, identityID)
 	if err != nil {
 		return nil, err
 	}

@@ -13,7 +13,7 @@ import (
 
 var listCmd = &cobra.Command{
 	Use:   "list",
-	Short: "List all master identities in the database",
+	Short: "List all identities in the database",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
 		return runList()
@@ -23,21 +23,37 @@ var listCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(listCmd)
 	listCmd.AddCommand(listVariantsCmd)
+	listCmd.AddCommand(listCommitsCmd)
 }
 
+var listCommitsLimit int
+
 var listVariantsCmd = &cobra.Command{
-	Use:   "variants <master_id>",
-	Short: "List all variants for a specific master identity",
+	Use:   "variants <identity_id>",
+	Short: "List all variants for a specific identity",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
 		id, err := strconv.Atoi(args[0])
 		if err != nil {
-			utils.ShowError("Invalid master ID", err, nil)
+			utils.ShowError("Invalid identity ID", err, nil)
 			return err
 		}
 		return runListVariants(id)
 	},
+}
+
+var listCommitsCmd = &cobra.Command{
+	Use:   "commits",
+	Short: "List transaction history (commits)",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cmd.SilenceUsage = true
+		return runListCommits(listCommitsLimit)
+	},
+}
+
+func init() {
+	listCommitsCmd.Flags().IntVarP(&listCommitsLimit, "n", "n", 0, "Limit number of commits to show (0 = all)")
 }
 
 func runList() error {
@@ -64,25 +80,48 @@ func runList() error {
 	return nil
 }
 
-func runListVariants(masterID int) error {
+func runListCommits(limit int) error {
 	ctx := context.Background()
-	variants, err := DB.ListVariantsForIdentity(ctx, masterID)
+	commits, err := DB.ListCommits(ctx, limit)
+	if err != nil {
+		utils.ShowError("Failed to list commits", err, nil)
+		return err
+	}
+
+	if len(commits) == 0 {
+		fmt.Println("No commits found in ledger.")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "COMMIT ID\tTRACKS\tFACES ADDED\tDATE")
+	fmt.Fprintln(w, "---------\t------\t-----------\t----")
+	for _, c := range commits {
+		fmt.Fprintf(w, "%s\t%d\t%d\t%s\n", c.CommitID[:8], c.TrackCount, c.TotalFaces, c.CreatedAt.Local().Format("2006-01-02 15:04"))
+	}
+	w.Flush()
+	return nil
+}
+
+func runListVariants(identityID int) error {
+	ctx := context.Background()
+	variants, err := DB.ListVariantsForIdentity(ctx, identityID)
 	if err != nil {
 		utils.ShowError("Failed to list variants", err, nil)
 		return err
 	}
 
 	if len(variants) == 0 {
-		// Check if the master ID is valid to provide a better error message.
-		exists, err := DB.MasterIdentityExists(ctx, masterID)
+		// Check if the identity ID is valid to provide a better error message.
+		exists, err := DB.IdentityExists(ctx, identityID)
 		if err != nil {
-			utils.ShowError("Failed to verify master identity", err, nil)
+			utils.ShowError("Failed to verify identity", err, nil)
 			return err
 		}
 		if !exists {
-			fmt.Printf("Error: Master identity %d not found.\n", masterID)
+			fmt.Printf("Error: Identity %d not found.\n", identityID)
 		} else {
-			fmt.Printf("No variants found for master identity %d.\n", masterID)
+			fmt.Printf("No variants found for identity %d.\n", identityID)
 		}
 		return nil
 	}

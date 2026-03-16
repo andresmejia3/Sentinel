@@ -86,7 +86,7 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	}
 
 	fmt.Fprintln(os.Stderr, "🗄️  Searching database...")
-	variantID, masterID, masterName, variantName, err := DB.FindClosestIdentity(ctx, bestFace.Vec, opts.MatchThreshold)
+	variantID, identityID, identityName, variantName, err := DB.FindClosestIdentity(ctx, bestFace.Vec, opts.MatchThreshold)
 	if err != nil {
 		utils.ShowError("Database search failed", err, nil)
 		return err
@@ -102,7 +102,7 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 		variantPart = fmt.Sprintf(" (%s)", variantName)
 	}
 
-	fmt.Printf("✅ Found Match: %s%s (ID: %d, Variant: %d)\n", masterName, variantPart, masterID, variantID)
+	fmt.Printf("✅ Found Match: %s%s (ID: %d, Variant: %d)\n", identityName, variantPart, identityID, variantID)
 
 	intervals, err := DB.GetIdentityIntervals(ctx, variantID)
 	if err != nil {

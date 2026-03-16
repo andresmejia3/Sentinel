@@ -19,6 +19,7 @@ import (
 	"github.com/andresmejia3/sentinel/internal/worker"
 	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 const megabyte = 1024 * 1024
@@ -49,6 +50,7 @@ func init() {
 
 	scanCmd.Flags().StringVar(&scanOpts.WorkerTimeout, "worker-timeout", "30s", "Timeout for a worker to process a single frame")
 	scanCmd.Flags().IntVarP(&scanBufferSize, "buffer-size", "B", 200, "Max number of frames to buffer in memory")
+	scanCmd.Flags().StringVar(&scanOpts.StagingFile, "staging-file", "", "Output path for staging YAML (enables review mode, skips DB commit)")
 
 	scanCmd.MarkFlagRequired("input")
 	rootCmd.AddCommand(scanCmd)
@@ -331,6 +333,12 @@ func runScan(ctx context.Context, opts Options) error {
 
 	intervals := <-finalIntervalsChan
 
+	// If Staging Mode is active, we skip the DB commit
+	if opts.StagingFile != "" {
+		fmt.Fprintf(os.Stderr, "\n📝 Staging file generated at: %s\n", opts.StagingFile)
+		return nil
+	}
+
 	// Atomic Commit: All intervals are inserted in a single transaction.
 	fmt.Fprintf(os.Stderr, "🗄️  Committing %d intervals to database...\n", len(intervals))
 	if err := DB.CommitScan(ctx, videoID, intervals); err != nil {
@@ -421,11 +429,24 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 	}
 }
 
+// StagingItem represents a track to be reviewed in YAML.
+type StagingItem struct {
+	TrackID           string   `yaml:"track_id"`
+	SuggestedIdentity string   `yaml:"suggested_identity"`
+	SuggestedVariant  string   `yaml:"suggested_variant"`
+	Confidence        float64  `yaml:"confidence"`
+	Thumbnail         string   `yaml:"thumbnail"`
+	Action            string   `yaml:"action"`
+	// Internal data for the commit process
+	InternalVector    []float64 `yaml:"internal_vector,omitempty"`
+	InternalCount     int       `yaml:"internal_count,omitempty"`
+}
+
 // --- Aggregation & Tracking Logic ---
 
 type activeTrack struct {
 	ID         int
-	MasterID   int // Optimization: Store MasterID to avoid DB lookups during persistence
+	IdentityID int // Optimization: Store IdentityID to avoid DB lookups during persistence
 	StartFrame int
 	LastFrame  int
 	LastLoc    []int
@@ -444,13 +465,13 @@ type activeTrack struct {
 	PendingFrames  []frameData
 	TopFrames      []frameCandidate
 
-	Name        string // Master display name (e.g. "Jenny" or "Identity 1")
+	IdentityName string // Identity display name (e.g. "Jenny" or "Identity 1")
 	VariantName string // Specific variant name (e.g. "Default", "Glasses")
 	IsKnown     bool   // Is this an existing identity from the DB?
 }
 
 type identityNameData struct {
-	MasterName  string
+	IdentityName string
 	VariantName string
 }
 
@@ -487,13 +508,14 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 	firstDetectionWritten := make(map[int]bool)
 	identityDirsCreated := make(map[int]bool)
 
-	variantToMasterID := make(map[int]int)
+	variantToIdentityID := make(map[int]int)
 	idNames := make(map[int]identityNameData)
 	newlyCreated := make(map[int]bool) // Track which IDs were generated in this session
 	tempIDCounter := -1                // Negative IDs for pending tracks
 
 	summary := make(map[int][]timeRange)
 	totalDetections := 0
+	var stagingItems []StagingItem
 
 	var consumerWg sync.WaitGroup
 	var producerWg sync.WaitGroup
@@ -566,6 +588,11 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		producerWg.Wait()
 		close(thumbChan)
 		consumerWg.Wait()
+
+		if opts.StagingFile != "" {
+			writeStagingFile(opts.StagingFile, stagingItems)
+		}
+
 		finalIntervalsChan <- finalIntervals
 	}()
 
@@ -580,6 +607,61 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		if (endSec - startSec) < blipDuration.Seconds() {
 			// Since we use deferred creation (negative IDs), we simply do nothing here
 			return
+		}
+
+		// --- Staging Mode Logic ---
+		if opts.StagingFile != "" {
+			// Save best thumbnail to disk for review
+			thumbFilename := fmt.Sprintf("%s_thumb.jpg", fmt.Sprintf("Track_%d", t.ID))
+			thumbChan <- thumbOp{
+				dir:      resultsDir,
+				filename: thumbFilename,
+				data:     t.BestThumb,
+			}
+
+			// Ranked k-NN Logic
+			// 1. Get Top 2 matches (as requested)
+			matches, _ := db.FindTopIdentities(ctx, t.MeanVec, 2)
+			
+			item := StagingItem{
+				TrackID:        fmt.Sprintf("Track_%d", t.ID),
+				Thumbnail:      filepath.Join("results", videoID, thumbFilename),
+				InternalVector: t.MeanVec,
+				InternalCount:  t.Count,
+			}
+
+			if len(matches) > 0 {
+				top := matches[0]
+				// Convert distance to confidence (0.0 - 1.0)
+				// Assuming simple linear inversion for display: 1.0 - (dist / 2.0)
+				// Since cosine dist is 0..2
+				conf := 1.0 - (top.Distance / 2.0)
+				item.SuggestedIdentity = top.IdentityName
+				item.SuggestedVariant = top.VariantName
+				item.Confidence = math.Round(conf*100) / 100
+
+				// Heuristics
+				if top.Distance > opts.MatchThreshold {
+					// Too far -> New Identity
+					item.Action = "new_identity"
+				} else if len(matches) > 1 && math.Abs(matches[1].Distance-top.Distance) < 0.05 {
+					// Ambiguous gap -> Leave action blank for review
+					item.Action = "" // User must decide
+				} else if top.Distance > 0.35 && top.Distance <= opts.MatchThreshold {
+					// Logic: It matches (<= Threshold), but it's not super close (> 0.35).
+					// This often implies the same person but a different look (sunglasses, beard, etc).
+					// Suggest a new variant so we don't pollute the main "Default" cluster.
+					item.Action = "new_variant"
+				} else {
+					// High confidence (<= 0.35) -> Merge
+					item.Action = "merge"
+				}
+			} else {
+				item.Action = "new_identity"
+			}
+
+			stagingItems = append(stagingItems, item)
+			return // Skip DB persistence in staging mode
 		}
 
 		isNewIdentity := t.ID < 0
@@ -606,8 +688,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			// Create Identity Synchronously. If we do this async, a race condition exists
 			// where the person reappears before the DB commit, causing a duplicate identity.
 			var err error
-			var createdMasterID int
-			finalVariantID, createdMasterID, err = db.CreateIdentity(ctx, t.MeanVec, t.Count)
+			var createdIdentityID int
+			finalVariantID, createdIdentityID, err = db.CreateIdentity(ctx, t.MeanVec, t.Count)
 			if err != nil {
 				utils.ShowError("Failed to create deferred identity", err, nil)
 				select {
@@ -616,37 +698,37 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 				}
 				return
 			}
-			t.MasterID = createdMasterID
+			t.IdentityID = createdIdentityID
 			// Update metadata so the final summary report is correct
-			// Note: CreateIdentity creates a Master "Identity <ID>" and Variant "Default"
-			// We store the Master Name for display
-			variantToMasterID[finalVariantID] = t.MasterID
-			idNames[finalVariantID] = identityNameData{MasterName: fmt.Sprintf("Identity %d", t.MasterID), VariantName: "Default"}
+			// Note: CreateIdentity creates an Identity "Identity <ID>" and Variant "Default"
+			// We store the Identity Name for display
+			variantToIdentityID[finalVariantID] = t.IdentityID
+			idNames[finalVariantID] = identityNameData{IdentityName: fmt.Sprintf("Identity %d", t.IdentityID), VariantName: "Default"}
 			t.ID = finalVariantID               // Update track ID with VariantID
 			newlyCreated[finalVariantID] = true // Mark as new for the summary report
 		}
 
-		finalMasterID := t.MasterID
+		finalIdentityID := t.IdentityID
 
 		// Create Identity Directory
-		identityDir := filepath.Join(resultsDir, fmt.Sprintf("identity_%d", finalMasterID)) // Use MasterID for directory
+		identityDir := filepath.Join(resultsDir, fmt.Sprintf("identity_%d", finalIdentityID)) // Use IdentityID for directory
 		framesDir := filepath.Join(identityDir, "frames")
-		if !identityDirsCreated[finalMasterID] { // Use MasterID for map key
+		if !identityDirsCreated[finalIdentityID] { // Use IdentityID for map key
 			if err := os.MkdirAll(framesDir, 0755); err != nil {
 				utils.ShowError("Failed to create identity directory", err, nil)
 			}
-			identityDirsCreated[finalMasterID] = true // Use MasterID for map key
+			identityDirsCreated[finalIdentityID] = true // Use IdentityID for map key
 		}
 
 		// 1. First Detection (Only if not written for this ID yet)
-		if !firstDetectionWritten[finalMasterID] { // Use MasterID for map key
+		if !firstDetectionWritten[finalIdentityID] { // Use IdentityID for map key
 			thumbChan <- thumbOp{
 				dir:        identityDir,
 				filename:   fmt.Sprintf("1_First_Detection_[%.2f].jpg", t.FirstScore),
 				data:       t.FirstThumb,
 				removeGlob: "1_First_Detection_*.jpg",
 			}
-			firstDetectionWritten[finalMasterID] = true // Use MasterID for map key
+			firstDetectionWritten[finalIdentityID] = true // Use IdentityID for map key
 		}
 
 		// 2. Last Detection (Always overwrite)
@@ -658,8 +740,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		}
 
 		// 3. Highest Confidence
-		if t.BestQuality > globalBestScore[finalMasterID] { // Use MasterID for map key
-			globalBestScore[finalMasterID] = t.BestQuality // Use MasterID for map key
+		if t.BestQuality > globalBestScore[finalIdentityID] { // Use IdentityID for map key
+			globalBestScore[finalIdentityID] = t.BestQuality // Use IdentityID for map key
 			thumbChan <- thumbOp{
 				dir:        identityDir,
 				filename:   fmt.Sprintf("3_Highest_Confidence_[%.2f].jpg", t.BestQuality),
@@ -669,9 +751,9 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		}
 
 		// 4. Lowest Confidence
-		currLow, ok := globalLowestScore[finalMasterID] // Use MasterID for map key
+		currLow, ok := globalLowestScore[finalIdentityID] // Use IdentityID for map key
 		if !ok || t.LowestScore < currLow {
-			globalLowestScore[finalMasterID] = t.LowestScore // Use MasterID for map key
+			globalLowestScore[finalIdentityID] = t.LowestScore // Use IdentityID for map key
 			thumbChan <- thumbOp{
 				dir:        identityDir,
 				filename:   fmt.Sprintf("4_Lowest_Confidence_[%.2f].jpg", t.LowestScore),
@@ -805,7 +887,7 @@ Loop:
 							t.LastSavedScore = face.Quality
 						}
 					} else {
-						matchVariantID, matchMasterID, matchMasterName, matchVariantName, err := db.FindClosestIdentity(ctx, face.Vec, opts.MatchThreshold)
+						matchVariantID, matchIdentityID, matchIdentityName, matchVariantName, err := db.FindClosestIdentity(ctx, face.Vec, opts.MatchThreshold)
 						if err != nil {
 							utils.ShowError("DB Identity Lookup failed", err, nil)
 							select {
@@ -816,10 +898,10 @@ Loop:
 						}
 
 						if matchVariantID != -1 {
-							newT := newActiveTrack(matchVariantID, matchMasterID, frame.Index, face.Vec, face.Thumb, face.Quality, matchMasterName, matchVariantName, true, face.Loc)
+							newT := newActiveTrack(matchVariantID, matchIdentityID, frame.Index, face.Vec, face.Thumb, face.Quality, matchIdentityName, matchVariantName, true, face.Loc)
 							tracks = append(tracks, newT)
-							variantToMasterID[matchVariantID] = matchMasterID
-							idNames[matchVariantID] = identityNameData{MasterName: matchMasterName, VariantName: matchVariantName}
+							variantToIdentityID[matchVariantID] = matchIdentityID
+							idNames[matchVariantID] = identityNameData{IdentityName: matchIdentityName, VariantName: matchVariantName}
 							assignedTracks[matchVariantID] = true
 						} else {
 							// New Identity -> Use Temporary Negative ID. Defer DB creation until blip filter passes
@@ -829,8 +911,8 @@ Loop:
 							name := fmt.Sprintf("Identity %d (Pending)", tempID)
 							newT := newActiveTrack(tempID, 0, frame.Index, face.Vec, face.Thumb, face.Quality, name, "Default", false, face.Loc)
 							tracks = append(tracks, newT)
-							// We don't know the master ID yet, so we can't add to variantToMasterID here. It will be added in persistTrack.
-							idNames[tempID] = identityNameData{MasterName: name, VariantName: "Default"}
+							// We don't know the identity ID yet, so we can't add to variantToIdentityID here. It will be added in persistTrack.
+							idNames[tempID] = identityNameData{IdentityName: name, VariantName: "Default"}
 							assignedTracks[tempID] = true
 
 						}
@@ -861,29 +943,29 @@ Loop:
 	fmt.Fprintf(os.Stderr, "📊 SCAN SUMMARY\n")
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 
-	// Group results by Master Identity
-	masterGroups := make(map[int][]int) // MasterID -> []VariantID
+	// Group results by Identity
+	identityGroups := make(map[int][]int) // IdentityID -> []VariantID
 	for vid := range summary {
-		mid := variantToMasterID[vid]
-		masterGroups[mid] = append(masterGroups[mid], vid)
+		mid := variantToIdentityID[vid]
+		identityGroups[mid] = append(identityGroups[mid], vid)
 	}
 
-	var masterIDs []int
-	for mid := range masterGroups {
-		masterIDs = append(masterIDs, mid)
+	var identityIDs []int
+	for mid := range identityGroups {
+		identityIDs = append(identityIDs, mid)
 	}
-	sort.Ints(masterIDs)
+	sort.Ints(identityIDs)
 
-	for _, mid := range masterIDs {
-		vids := masterGroups[mid]
+	for _, mid := range identityIDs {
+		vids := identityGroups[mid]
 		sort.Ints(vids)
 
-		// Derive Master info from the first variant
+		// Derive Identity info from the first variant
 		firstVID := vids[0]
 		names := idNames[firstVID]
-		masterName := names.MasterName
-		if masterName == "" {
-			masterName = fmt.Sprintf("Identity %d", mid)
+		identityName := names.IdentityName
+		if identityName == "" {
+			identityName = fmt.Sprintf("Identity %d", mid)
 		}
 
 		thumbNote := ""
@@ -900,7 +982,7 @@ Loop:
 			}
 		}
 
-		fmt.Fprintf(os.Stderr, "\n👤 %s %s (ID: %d) Found: %s\n", masterName, status, mid, thumbNote)
+		fmt.Fprintf(os.Stderr, "\n👤 %s %s (ID: %d) Found: %s\n", identityName, status, mid, thumbNote)
 
 		for _, vid := range vids {
 			vName := idNames[vid].VariantName
@@ -920,10 +1002,21 @@ Loop:
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 }
 
-func newActiveTrack(id, masterID, frameIndex int, vec []float64, thumb []byte, quality float64, name, variantName string, isKnown bool, loc []int) *activeTrack {
+func writeStagingFile(path string, items []StagingItem) {
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create staging file: %v\n", err)
+		return
+	}
+	defer f.Close()
+	enc := yaml.NewEncoder(f)
+	enc.Encode(items)
+}
+
+func newActiveTrack(id, identityID, frameIndex int, vec []float64, thumb []byte, quality float64, name, variantName string, isKnown bool, loc []int) *activeTrack {
 	t := &activeTrack{
 		ID:             id,
-		MasterID:       masterID,
+		IdentityID:     identityID,
 		StartFrame:     frameIndex,
 		LastFrame:      frameIndex,
 		LastLoc:        loc,
@@ -940,7 +1033,7 @@ func newActiveTrack(id, masterID, frameIndex int, vec []float64, thumb []byte, q
 		LastSavedScore: quality,
 		PendingFrames:  []frameData{{Index: frameIndex, Score: quality, Data: thumb}},
 		TopFrames:      []frameCandidate{{Score: quality, Vec: vec, Thumb: thumb}},
-		Name:           name,
+		IdentityName:   name,
 		VariantName:    variantName,
 		IsKnown:        isKnown,
 	}
