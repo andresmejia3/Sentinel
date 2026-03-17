@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"text/tabwriter"
 
-	"github.com/andresmejia3/sentinel/internal/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -16,10 +15,13 @@ var listCmd = &cobra.Command{
 	Short: "List all identities in the database",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
-		return runList()
+		return runList(cmd.Context())
 	},
 }
 
+var listLimit int
+var listPage int
+var listName string
 var listCommitsLimit int
 
 var listVariantsCmd = &cobra.Command{
@@ -30,10 +32,10 @@ var listVariantsCmd = &cobra.Command{
 		cmd.SilenceUsage = true
 		id, err := strconv.Atoi(args[0])
 		if err != nil {
-			utils.ShowError("Invalid identity ID", err, nil)
-			return err
+			// Return a clean error for invalid input; Cobra will print it.
+			return fmt.Errorf("invalid identity ID: %q is not an integer", args[0])
 		}
-		return runListVariants(id)
+		return runListVariants(cmd.Context(), id)
 	},
 }
 
@@ -42,7 +44,10 @@ var listCommitsCmd = &cobra.Command{
 	Short: "List transaction history (commits)",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
-		return runListCommits(listCommitsLimit)
+		if listCommitsLimit < 0 {
+			return fmt.Errorf("limit cannot be negative")
+		}
+		return runListCommits(cmd.Context(), listCommitsLimit)
 	},
 }
 
@@ -51,15 +56,25 @@ func init() {
 	listCmd.AddCommand(listVariantsCmd)
 	listCmd.AddCommand(listCommitsCmd)
 
-	listCommitsCmd.Flags().IntVarP(&listCommitsLimit, "n", "n", 0, "Limit number of commits to show (0 = all)")
+	listCmd.Flags().IntVarP(&listLimit, "limit", "l", 50, "Limit results per page (0 for all)")
+	listCmd.Flags().IntVarP(&listPage, "page", "p", 1, "Page number")
+	listCmd.Flags().StringVarP(&listName, "name", "n", "", "Filter by identity name")
+
+	listCommitsCmd.Flags().IntVarP(&listCommitsLimit, "limit", "n", 0, "Limit number of commits to show (0 = all)")
 }
 
-func runList() error {
-	ctx := context.Background()
-	identities, err := DB.ListIdentities(ctx)
+func runList(ctx context.Context) error {
+	if listLimit < 0 {
+		return fmt.Errorf("limit cannot be negative")
+	}
+	if listPage < 1 {
+		listPage = 1
+	}
+	offset := (listPage - 1) * listLimit
+
+	identities, err := DB.ListIdentities(ctx, listLimit, offset, listName)
 	if err != nil {
-		utils.ShowError("Failed to list identities", err, nil)
-		return err
+		return fmt.Errorf("failed to list identities: %w", err)
 	}
 
 	if len(identities) == 0 {
@@ -78,12 +93,10 @@ func runList() error {
 	return nil
 }
 
-func runListCommits(limit int) error {
-	ctx := context.Background()
+func runListCommits(ctx context.Context, limit int) error {
 	commits, err := DB.ListCommits(ctx, limit)
 	if err != nil {
-		utils.ShowError("Failed to list commits", err, nil)
-		return err
+		return fmt.Errorf("failed to list commits: %w", err)
 	}
 
 	if len(commits) == 0 {
@@ -95,29 +108,30 @@ func runListCommits(limit int) error {
 	fmt.Fprintln(w, "COMMIT ID\tSTATUS\tTRACKS\tFACES ADDED\tDATE")
 	fmt.Fprintln(w, "---------\t------\t------\t-----------\t----")
 	for _, c := range commits {
-		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\n", c.CommitID[:8], c.Status, c.TrackCount, c.TotalFaces, c.CreatedAt.Local().Format("2006-01-02 15:04"))
+		idDisplay := c.CommitID
+		if len(c.CommitID) > 8 {
+			idDisplay = c.CommitID[:8]
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\n", idDisplay, c.Status, c.TrackCount, c.TotalFaces, c.CreatedAt.Local().Format("2006-01-02 15:04"))
 	}
 	w.Flush()
 	return nil
 }
 
-func runListVariants(identityID int) error {
-	ctx := context.Background()
+func runListVariants(ctx context.Context, identityID int) error {
 	variants, err := DB.ListVariantsForIdentity(ctx, identityID)
 	if err != nil {
-		utils.ShowError("Failed to list variants", err, nil)
-		return err
+		return fmt.Errorf("failed to list variants: %w", err)
 	}
 
 	if len(variants) == 0 {
 		// Check if the identity ID is valid to provide a better error message.
 		exists, err := DB.IdentityExists(ctx, identityID)
 		if err != nil {
-			utils.ShowError("Failed to verify identity", err, nil)
-			return err
+			return fmt.Errorf("failed to verify identity: %w", err)
 		}
 		if !exists {
-			fmt.Printf("Error: Identity %d not found.\n", identityID)
+			return fmt.Errorf("identity %d not found", identityID)
 		} else {
 			fmt.Printf("No variants found for identity %d.\n", identityID)
 		}

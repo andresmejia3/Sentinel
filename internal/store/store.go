@@ -510,7 +510,7 @@ func (s *Store) RenameVariant(ctx context.Context, variantID int, newName string
 // DeleteIdentity removes an identity from the database.
 // Used for cleaning up "ghost" identities that were created but filtered out as blips.
 func (s *Store) DeleteIdentity(ctx context.Context, id int) error {
-	_, err := s.pool.Exec(ctx, "DELETE FROM variants WHERE id = $1", id)
+	_, err := s.pool.Exec(ctx, "DELETE FROM identities WHERE id = $1", id)
 	return err
 }
 
@@ -872,11 +872,11 @@ type VariantMetadata struct {
 	CreatedAt time.Time
 }
 
-func (s *Store) ListIdentities(ctx context.Context) ([]IdentityMetadata, error) {
+func (s *Store) ListIdentities(ctx context.Context, limit, offset int, nameFilter string) ([]IdentityMetadata, error) {
 	// List Identities
 	// We LEFT JOIN so that identities with no variants yet still appear.
 	// We SUM the face_count from all variants belonging to an identity.
-	query := `
+	baseQuery := `
 		SELECT
 			i.id,
 			COALESCE(i.name, 'Identity ' || i.id),
@@ -884,9 +884,19 @@ func (s *Store) ListIdentities(ctx context.Context) ([]IdentityMetadata, error) 
 			COUNT(v.id)::INT,
 			i.created_at
 		FROM identities i
-		LEFT JOIN variants v ON i.id = v.identity_id
+		LEFT JOIN variants v ON i.id = v.identity_id 
+		WHERE ($1 = '' OR COALESCE(i.name, 'Identity ' || i.id) ILIKE '%' || $1 || '%')
 		GROUP BY i.id, i.name, i.created_at ORDER BY i.id ASC`
-	rows, err := s.pool.Query(ctx, query)
+
+	var rows pgx.Rows
+	var err error
+
+	if limit > 0 {
+		rows, err = s.pool.Query(ctx, baseQuery+" LIMIT $2 OFFSET $3", nameFilter, limit, offset)
+	} else {
+		rows, err = s.pool.Query(ctx, baseQuery, nameFilter)
+	}
+
 	if err != nil {
 		return nil, err
 	}

@@ -135,7 +135,7 @@ func TestStoreIntegration(t *testing.T) {
 		t.Fatalf("InsertInterval failed: %v", err)
 	}
 
-	identities, err := s.ListIdentities(ctx)
+	identities, err := s.ListIdentities(ctx, 0, 0, "")
 	if err != nil {
 		t.Fatalf("ListIdentities failed: %v", err)
 	}
