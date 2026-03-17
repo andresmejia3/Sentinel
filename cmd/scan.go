@@ -609,6 +609,9 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 
 		if (endSec - startSec) < blipDuration.Seconds() {
 			// Since we use deferred creation (negative IDs), we simply do nothing here
+			if t.ID < 0 {
+				delete(idNames, t.ID) // Fix: Prevent memory leak by cleaning up discarded track names
+			}
 			return
 		}
 
@@ -1078,6 +1081,12 @@ func validateScanFlags(opts *Options) error {
 	}
 	if opts.MatchThreshold <= 0 || opts.MatchThreshold > 1.0 {
 		return fmt.Errorf("invalid match threshold: must be between 0.0 and 1.0, got %f", opts.MatchThreshold)
+	}
+	if opts.DetectionThreshold <= 0 || opts.DetectionThreshold > 1.0 {
+		return fmt.Errorf("invalid detection threshold: must be between 0.0 and 1.0, got %f", opts.DetectionThreshold)
+	}
+	if _, err := time.ParseDuration(opts.BlipDuration); err != nil {
+		return fmt.Errorf("invalid blip-duration format: %w (use '100ms', '1s')", err)
 	}
 	if _, err := time.ParseDuration(opts.GracePeriod); err != nil {
 		return fmt.Errorf("invalid grace-period format: %w (use '2s', '500ms')", err)
