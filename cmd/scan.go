@@ -591,6 +591,17 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 	fmt.Fprintf(os.Stderr, "⚙️  Tracker initialized with Cosine Distance (Threshold: %.2f)\n", opts.MatchThreshold)
 
 	// Helper closure to persist a track (DRY: Used in loop and at flush)
+	sendThumbOp := func(op thumbOp) bool {
+		// This select is critical to prevent deadlocks on shutdown if the disk is slow
+		// and this channel's buffer fills up.
+		select {
+		case thumbChan <- op:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
 	persistTrack := func(t *activeTrack) {
 		startSec := float64(t.StartFrame) / fps
 		// Include the duration of the last frame slice in the interval
@@ -605,10 +616,12 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		if opts.StagingFile != "" {
 			// Save best thumbnail to disk for review
 			thumbFilename := fmt.Sprintf("%s_thumb.jpg", fmt.Sprintf("Track_%d", t.ID))
-			thumbChan <- thumbOp{
+			if !sendThumbOp(thumbOp{
 				dir:      resultsDir,
 				filename: thumbFilename,
 				data:     t.BestThumb,
+			}) {
+				return
 			}
 
 			// Ranked k-NN Logic
@@ -714,31 +727,37 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 
 		// 1. First Detection (Only if not written for this ID yet)
 		if !firstDetectionWritten[finalIdentityID] { // Use IdentityID for map key
-			thumbChan <- thumbOp{
+			if !sendThumbOp(thumbOp{
 				dir:        identityDir,
 				filename:   fmt.Sprintf("1_First_Detection_[%.2f].jpg", t.FirstScore),
 				data:       t.FirstThumb,
 				removeGlob: "1_First_Detection_*.jpg",
+			}) {
+				return
 			}
 			firstDetectionWritten[finalIdentityID] = true // Use IdentityID for map key
 		}
 
 		// 2. Last Detection (Always overwrite)
-		thumbChan <- thumbOp{
+		if !sendThumbOp(thumbOp{
 			dir:        identityDir,
 			filename:   fmt.Sprintf("2_Last_Detection_[%.2f].jpg", t.LastScore),
 			data:       t.LastThumb,
 			removeGlob: "2_Last_Detection_*.jpg",
+		}) {
+			return
 		}
 
 		// 3. Highest Confidence
 		if t.BestQuality > globalBestScore[finalIdentityID] { // Use IdentityID for map key
 			globalBestScore[finalIdentityID] = t.BestQuality // Use IdentityID for map key
-			thumbChan <- thumbOp{
+			if !sendThumbOp(thumbOp{
 				dir:        identityDir,
 				filename:   fmt.Sprintf("3_Highest_Confidence_[%.2f].jpg", t.BestQuality),
 				data:       t.BestThumb,
 				removeGlob: "3_Highest_Confidence_*.jpg",
+			}) {
+				return
 			}
 		}
 
@@ -746,20 +765,24 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		currLow, ok := globalLowestScore[finalIdentityID] // Use IdentityID for map key
 		if !ok || t.LowestScore < currLow {
 			globalLowestScore[finalIdentityID] = t.LowestScore // Use IdentityID for map key
-			thumbChan <- thumbOp{
+			if !sendThumbOp(thumbOp{
 				dir:        identityDir,
 				filename:   fmt.Sprintf("4_Lowest_Confidence_[%.2f].jpg", t.LowestScore),
 				data:       t.LowestThumb,
 				removeGlob: "4_Lowest_Confidence_*.jpg",
+			}) {
+				return
 			}
 		}
 
 		// Frames (10% change)
 		for _, f := range t.PendingFrames {
-			thumbChan <- thumbOp{
+			if !sendThumbOp(thumbOp{
 				dir:      framesDir,
 				filename: fmt.Sprintf("frame_[%05d]_score_[%.2f].jpg", f.Index, f.Score),
 				data:     f.Data,
+			}) {
+				return
 			}
 		}
 
