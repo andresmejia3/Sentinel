@@ -20,12 +20,6 @@ var listCmd = &cobra.Command{
 	},
 }
 
-func init() {
-	rootCmd.AddCommand(listCmd)
-	listCmd.AddCommand(listVariantsCmd)
-	listCmd.AddCommand(listCommitsCmd)
-}
-
 var listCommitsLimit int
 
 var listVariantsCmd = &cobra.Command{
@@ -53,6 +47,10 @@ var listCommitsCmd = &cobra.Command{
 }
 
 func init() {
+	rootCmd.AddCommand(listCmd)
+	listCmd.AddCommand(listVariantsCmd)
+	listCmd.AddCommand(listCommitsCmd)
+
 	listCommitsCmd.Flags().IntVarP(&listCommitsLimit, "n", "n", 0, "Limit number of commits to show (0 = all)")
 }
 
@@ -94,10 +92,10 @@ func runListCommits(limit int) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "COMMIT ID\tTRACKS\tFACES ADDED\tDATE")
-	fmt.Fprintln(w, "---------\t------\t-----------\t----")
+	fmt.Fprintln(w, "COMMIT ID\tSTATUS\tTRACKS\tFACES ADDED\tDATE")
+	fmt.Fprintln(w, "---------\t------\t------\t-----------\t----")
 	for _, c := range commits {
-		fmt.Fprintf(w, "%s\t%d\t%d\t%s\n", c.CommitID[:8], c.TrackCount, c.TotalFaces, c.CreatedAt.Local().Format("2006-01-02 15:04"))
+		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\n", c.CommitID[:8], c.Status, c.TrackCount, c.TotalFaces, c.CreatedAt.Local().Format("2006-01-02 15:04"))
 	}
 	w.Flush()
 	return nil

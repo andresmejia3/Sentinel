@@ -25,30 +25,13 @@ func init() {
 func runRollback(ctx context.Context, commitID string) error {
 	fmt.Printf("↺ Rolling back commit: %s\n", commitID)
 
-	entries, err := DB.GetLedgerEntries(ctx, commitID)
-	if err != nil {
-		utils.ShowError("Failed to fetch ledger entries", err, nil)
+	// Atomic Rollback via Store
+	if err := DB.RevertCommit(ctx, commitID); err != nil {
+		// Error message is safe to display as it comes from the transaction logic
+		utils.ShowError("Rollback Failed", err, nil)
 		return err
 	}
 
-	if len(entries) == 0 {
-		fmt.Println("⚠️  No ledger entries found for this commit ID.")
-		return nil
-	}
-
-	for _, entry := range entries {
-		// Math: Subtraction is adding a negative sum
-		negSum := make([]float64, len(entry.AddedSum))
-		for i, v := range entry.AddedSum {
-			negSum[i] = -v
-		}
-		negCount := -entry.AddedCount
-
-		if err := DB.ApplyVariantDelta(ctx, entry.VariantID, negSum, negCount); err != nil {
-			return fmt.Errorf("failed to rollback track %s (Variant %d): %w", entry.TrackID, entry.VariantID, err)
-		}
-	}
-
-	fmt.Printf("✅ Rollback Successful. Reverted %d entries.\n", len(entries))
+	fmt.Println("✅ Rollback Successful.")
 	return nil
 }

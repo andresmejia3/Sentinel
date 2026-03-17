@@ -155,12 +155,12 @@ func TestScanPersistence(t *testing.T) {
 	}
 
 	// Verify Intervals
-	intervals, err := db.GetIdentityIntervals(ctx, variantID)
+	intervals, err := db.GetIntervalsForIdentity(ctx, masterID)
 	if err != nil {
 		t.Fatalf("Failed to get intervals for verification: %v", err)
 	}
 	if len(intervals) != 1 {
-		t.Fatalf("Expected 1 interval for identity %d, got %d", variantID, len(intervals))
+		t.Fatalf("Expected 1 interval for identity %d, got %d", masterID, len(intervals))
 	}
 	if intervals[0].VideoID != videoID || intervals[0].Start != 0.0 || intervals[0].End != 5.0 {
 		t.Errorf("Mismatch in persisted interval data. Got %+v", intervals[0])

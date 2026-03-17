@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"text/tabwriter"
 	"time"
 
 	"github.com/andresmejia3/sentinel/internal/utils"
@@ -104,7 +103,7 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 
 	fmt.Printf("✅ Found Match: %s%s (ID: %d, Variant: %d)\n", identityName, variantPart, identityID, variantID)
 
-	intervals, err := DB.GetIdentityIntervals(ctx, variantID)
+	intervals, err := DB.GetIntervalsForIdentity(ctx, identityID)
 	if err != nil {
 		utils.ShowError("Failed to retrieve history", err, nil)
 		return err
@@ -115,20 +114,21 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 		return nil
 	}
 
-	wOut := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(wOut, "\nVIDEO\tTIME RANGE\tDURATION")
-	fmt.Fprintln(wOut, "-----\t----------\t--------")
-
+	fmt.Println("") // Spacing
+	currentVideo := ""
 	for _, inv := range intervals {
+		baseName := filepath.Base(inv.VideoPath)
+		if baseName != currentVideo {
+			if currentVideo != "" {
+				fmt.Println("")
+			}
+			fmt.Printf("🎬 %s\n", baseName)
+			currentVideo = baseName
+		}
+
 		duration := inv.End - inv.Start
-		fmt.Fprintf(wOut, "%s\t%s - %s\t%.1fs\n",
-			filepath.Base(inv.VideoPath),
-			fmtTime(inv.Start),
-			fmtTime(inv.End),
-			duration,
-		)
+		fmt.Printf("   👉 %s - %s (%.1fs)\n", fmtTime(inv.Start), fmtTime(inv.End), duration)
 	}
-	wOut.Flush()
 
 	return nil
 }
