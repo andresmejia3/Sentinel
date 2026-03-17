@@ -143,19 +143,16 @@ func runScan(ctx context.Context, opts Options) error {
 
 	videoID, err := utils.GenerateVideoID(opts.InputPath)
 	if err != nil {
-		utils.ShowError("Failed to generate video ID", err, nil)
-		return err
+		return fmt.Errorf("failed to generate video ID: %w", err)
 	}
 	if err := DB.EnsureVideoMetadata(ctx, videoID, opts.InputPath); err != nil {
-		utils.ShowError("Failed to register video metadata", err, nil)
-		return err
+		return fmt.Errorf("failed to register video metadata: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "📼 Processing Video ID: %s\n", videoID[:12])
 
 	fps, err := utils.GetVideoFPS(ctx, opts.InputPath)
 	if err != nil {
-		utils.ShowError("Failed to determine video FPS", err, nil)
-		return err
+		return fmt.Errorf("failed to determine video FPS: %w", err)
 	}
 
 	totalVideoFrames := utils.GetTotalFrames(ctx, opts.InputPath)
@@ -227,14 +224,12 @@ func runScan(ctx context.Context, opts Options) error {
 
 	ffmpegOut, err := ffmpeg.StdoutPipe()
 	if err != nil {
-		utils.ShowError("Failed to create FFmpeg stdout pipe", err, nil)
-		return err
+		return fmt.Errorf("failed to create FFmpeg stdout pipe: %w", err)
 	}
 	defer ffmpegOut.Close()
 
 	if err := ffmpeg.Start(); err != nil {
-		utils.ShowError("Failed to start FFmpeg", err, nil)
-		return err
+		return fmt.Errorf("failed to start FFmpeg: %w", err)
 	}
 
 	// Ensure we reap the process even if we return early
@@ -279,6 +274,8 @@ func runScan(ctx context.Context, opts Options) error {
 		// Acquire semaphore (Block if too many frames are in flight)
 		select {
 		case inflightSem <- struct{}{}:
+		case err := <-errChan:
+			return err
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -294,8 +291,7 @@ func runScan(ctx context.Context, opts Options) error {
 	}
 
 	if err := scanner.Err(); err != nil {
-		utils.ShowError("Frame scanner failed", err, nil)
-		return err
+		return fmt.Errorf("frame scanner failed: %w", err)
 	}
 
 	ffmpegWaited = true // Mark as waited so defer doesn't run
@@ -303,8 +299,7 @@ func runScan(ctx context.Context, opts Options) error {
 		if stderrBuf.Len() > 0 {
 			fmt.Fprintf(os.Stderr, "\nFFmpeg Logs:\n%s\n", stderrBuf.String())
 		}
-		utils.ShowError("FFmpeg execution failed", err, nil)
-		return err
+		return fmt.Errorf("FFmpeg execution failed: %w", err)
 	}
 
 	bar.Finish()
@@ -342,8 +337,7 @@ func runScan(ctx context.Context, opts Options) error {
 	// Atomic Commit: All intervals are inserted in a single transaction.
 	fmt.Fprintf(os.Stderr, "🗄️  Committing %d intervals to database...\n", len(intervals))
 	if err := DB.CommitScan(ctx, videoID, intervals); err != nil {
-		utils.ShowError("Failed to commit scan results", err, nil)
-		return err
+		return fmt.Errorf("failed to commit scan results: %w", err)
 	}
 
 	// Final check for any errors that occurred during shutdown
@@ -383,9 +377,8 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 	cfg.ReadTimeout = readTimeout
 	worker, err := worker.NewPythonScanWorker(ctx, id, cfg)
 	if err != nil {
-		utils.ShowError("Worker startup failed", err, nil)
 		select {
-		case errChan <- err:
+		case errChan <- &utils.ContextualError{Context: "Worker Startup Failed", Err: err}:
 		default:
 		}
 		return
@@ -413,7 +406,7 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 				worker.Close()
 				utils.ShowError("Python crashed", err, worker.Cmd)
 				select {
-				case errChan <- err:
+				case errChan <- &utils.SilentError{Err: err}:
 				default:
 				}
 				return
@@ -431,15 +424,15 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 
 // StagingItem represents a track to be reviewed in YAML.
 type StagingItem struct {
-	TrackID           string   `yaml:"track_id"`
-	SuggestedIdentity string   `yaml:"suggested_identity"`
-	SuggestedVariant  string   `yaml:"suggested_variant"`
-	Confidence        float64  `yaml:"confidence"`
-	Thumbnail         string   `yaml:"thumbnail"`
-	Action            string   `yaml:"action"`
+	TrackID           string  `yaml:"track_id"`
+	SuggestedIdentity string  `yaml:"suggested_identity"`
+	SuggestedVariant  string  `yaml:"suggested_variant"`
+	Confidence        float64 `yaml:"confidence"`
+	Thumbnail         string  `yaml:"thumbnail"`
+	Action            string  `yaml:"action"`
 	// Internal data for the commit process
-	InternalVector    []float64 `yaml:"internal_vector,omitempty"`
-	InternalCount     int       `yaml:"internal_count,omitempty"`
+	InternalVector []float64 `yaml:"internal_vector,omitempty"`
+	InternalCount  int       `yaml:"internal_count,omitempty"`
 }
 
 // --- Aggregation & Tracking Logic ---
@@ -466,13 +459,13 @@ type activeTrack struct {
 	TopFrames      []frameCandidate
 
 	IdentityName string // Identity display name (e.g. "Jenny" or "Identity 1")
-	VariantName string // Specific variant name (e.g. "Default", "Glasses")
-	IsKnown     bool   // Is this an existing identity from the DB?
+	VariantName  string // Specific variant name (e.g. "Default", "Glasses")
+	IsKnown      bool   // Is this an existing identity from the DB?
 }
 
 type identityNameData struct {
 	IdentityName string
-	VariantName string
+	VariantName  string
 }
 
 type frameData struct {
@@ -535,9 +528,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 	// Optimization: Ensure output directory exists ONCE, not per-track
 	resultsDir := filepath.Join(outputBase, "results", videoID)
 	if err := os.MkdirAll(resultsDir, 0755); err != nil {
-		utils.ShowError("Failed to create output directory", err, nil)
 		select {
-		case errChan <- err:
+		case errChan <- fmt.Errorf("failed to create output directory: %w", err):
 		default:
 		}
 		return
@@ -622,7 +614,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			// Ranked k-NN Logic
 			// 1. Get Top 2 matches (as requested)
 			matches, _ := db.FindTopIdentities(ctx, t.MeanVec, 2)
-			
+
 			item := StagingItem{
 				TrackID:        fmt.Sprintf("Track_%d", t.ID),
 				Thumbnail:      filepath.Join("results", videoID, thumbFilename),
@@ -691,9 +683,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			var createdIdentityID int
 			finalVariantID, createdIdentityID, err = db.CreateIdentity(ctx, t.MeanVec, t.Count)
 			if err != nil {
-				utils.ShowError("Failed to create deferred identity", err, nil)
 				select {
-				case errChan <- err:
+				case errChan <- fmt.Errorf("failed to create deferred identity: %w", err):
 				default:
 				}
 				return
@@ -715,7 +706,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		framesDir := filepath.Join(identityDir, "frames")
 		if !identityDirsCreated[finalIdentityID] { // Use IdentityID for map key
 			if err := os.MkdirAll(framesDir, 0755); err != nil {
-				utils.ShowError("Failed to create identity directory", err, nil)
+				// Non-fatal, just log warning
+				fmt.Fprintf(os.Stderr, "⚠️ Failed to create identity directory: %v\n", err)
 			}
 			identityDirsCreated[finalIdentityID] = true // Use IdentityID for map key
 		}
@@ -779,9 +771,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 				// Only update vector if it was already known (accumulate average).
 				// For new identities, CreateIdentity already inserted the vector.
 				if err := db.UpdateIdentity(ctx, id, vec, count); err != nil { // `id` here is VariantID, correct for UpdateIdentity
-					utils.ShowError(fmt.Sprintf("Failed to update variant %d", id), err, nil)
 					select {
-					case errChan <- err:
+					case errChan <- fmt.Errorf("failed to update variant %d: %w", id, err):
 					default:
 					}
 					return
@@ -827,14 +818,18 @@ Loop:
 					minDist := opts.MatchThreshold
 
 					for i, t := range tracks {
-						if assignedTracks[t.ID] {
-							continue
-						}
-
 						dist := utils.CosineDist(face.Vec, t.MeanVec)
 						if dist < minDist {
 							minDist = dist
 							bestMatch = i
+						}
+					}
+
+					if bestMatch != -1 {
+						// The best matching track was found. Check if it's already taken by another face in this frame.
+						// If so, this face cannot claim it and must become a new track.
+						if assignedTracks[tracks[bestMatch].ID] {
+							bestMatch = -1 // Invalidate the match, forcing creation of a new track below.
 						}
 					}
 
@@ -889,9 +884,8 @@ Loop:
 					} else {
 						matchVariantID, matchIdentityID, matchIdentityName, matchVariantName, err := db.FindClosestIdentity(ctx, face.Vec, opts.MatchThreshold)
 						if err != nil {
-							utils.ShowError("DB Identity Lookup failed", err, nil)
 							select {
-							case errChan <- err:
+							case errChan <- fmt.Errorf("DB identity lookup failed: %w", err):
 							default:
 							}
 							return
@@ -1046,37 +1040,27 @@ func validateScanFlags(opts *Options) error {
 	info, err := os.Stat(opts.InputPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			utils.ShowError("Input file does not exist", err, nil)
-			return err
+			return fmt.Errorf("input file does not exist: %w", err)
 		}
-		utils.ShowError("Unable to access input file", err, nil)
-		return err
+		return fmt.Errorf("unable to access input file: %w", err)
 	}
 	if info.IsDir() {
-		err := fmt.Errorf("is a directory")
-		utils.ShowError("Input path is a directory, expected a video file", err, nil)
-		return err
+		return fmt.Errorf("input path is a directory, not a video file")
 	}
 	if opts.NthFrame < 1 {
-		err := fmt.Errorf("must be >= 1, got %d", opts.NthFrame)
-		utils.ShowError("Invalid nth-frame interval", err, nil)
-		return err
+		return fmt.Errorf("invalid nth-frame interval: must be >= 1, got %d", opts.NthFrame)
 	}
 	if opts.NumEngines < 1 {
 		opts.NumEngines = 1
 	}
 	if opts.MatchThreshold <= 0 || opts.MatchThreshold > 1.0 {
-		err := fmt.Errorf("must be between 0.0 and 1.0, got %f", opts.MatchThreshold)
-		utils.ShowError("Invalid match threshold", err, nil)
-		return err
+		return fmt.Errorf("invalid match threshold: must be between 0.0 and 1.0, got %f", opts.MatchThreshold)
 	}
 	if _, err := time.ParseDuration(opts.GracePeriod); err != nil {
-		utils.ShowError("Invalid grace-period format (use '2s', '500ms')", err, nil)
-		return err
+		return fmt.Errorf("invalid grace-period format: %w (use '2s', '500ms')", err)
 	}
 	if _, err := time.ParseDuration(opts.WorkerTimeout); err != nil {
-		utils.ShowError("Invalid worker-timeout format (use '30s', '1m')", err, nil)
-		return err
+		return fmt.Errorf("invalid worker-timeout format: %w (use '30s', '1m')", err)
 	}
 
 	return nil

@@ -33,8 +33,7 @@ func init() {
 
 func runFind(ctx context.Context, imagePath string, opts Options) error {
 	if _, err := os.Stat(imagePath); os.IsNotExist(err) {
-		utils.ShowError("Input file does not exist", err, nil)
-		return err
+		return fmt.Errorf("input file does not exist: %w", err)
 	}
 
 	fmt.Fprintln(os.Stderr, "🚀 Starting AI Engine...")
@@ -47,22 +46,20 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	// We use ID 0 for this ad-hoc worker
 	w, err := worker.NewPythonScanWorker(ctx, 0, cfg)
 	if err != nil {
-		utils.ShowError("Failed to start AI worker", err, nil)
-		return err
+		return &utils.ContextualError{Context: "AI Worker Failed to Start", Err: err}
 	}
 	defer w.Close()
 
 	imgData, err := os.ReadFile(imagePath)
 	if err != nil {
-		utils.ShowError("Failed to read image file", err, nil)
-		return err
+		return fmt.Errorf("failed to read image file: %w", err)
 	}
 
 	fmt.Fprintln(os.Stderr, "🔍 Analyzing face...")
 	faces, err := w.ProcessScanFrame(imgData)
 	if err != nil {
 		utils.ShowError("AI processing failed", err, w.Cmd)
-		return err
+		return &utils.SilentError{Err: err}
 	}
 
 	if len(faces) == 0 {
@@ -87,8 +84,7 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	fmt.Fprintln(os.Stderr, "🗄️  Searching database...")
 	variantID, identityID, identityName, variantName, err := DB.FindClosestIdentity(ctx, bestFace.Vec, opts.MatchThreshold)
 	if err != nil {
-		utils.ShowError("Database search failed", err, nil)
-		return err
+		return fmt.Errorf("database search failed: %w", err)
 	}
 
 	if variantID == -1 {
@@ -105,8 +101,7 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 
 	intervals, err := DB.GetIntervalsForIdentity(ctx, identityID)
 	if err != nil {
-		utils.ShowError("Failed to retrieve history", err, nil)
-		return err
+		return fmt.Errorf("failed to retrieve history: %w", err)
 	}
 
 	if len(intervals) == 0 {

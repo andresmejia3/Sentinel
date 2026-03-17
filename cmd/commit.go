@@ -34,14 +34,12 @@ func runCommit(ctx context.Context, stagingPath string) (err error) {
 	var data []byte
 	data, err = os.ReadFile(stagingPath)
 	if err != nil {
-		utils.ShowError("Failed to read staging file", err, nil)
-		return err
+		return fmt.Errorf("failed to read staging file: %w", err)
 	}
 
 	var items []StagingItem
 	if err := yaml.Unmarshal(data, &items); err != nil {
-		utils.ShowError("Failed to parse staging YAML", err, nil)
-		return err
+		return fmt.Errorf("failed to parse staging YAML: %w", err)
 	}
 
 	// 1. Strict Pre-Validation (Fixing Bug #4: Trojan Horse Vector)
@@ -70,8 +68,7 @@ func runCommit(ctx context.Context, stagingPath string) (err error) {
 
 	// Register Commit (Fixing Bug #5: Atomicity Gap / Tracking)
 	if err = DB.CreateCommit(ctx, commitID); err != nil {
-		utils.ShowError("Failed to register commit", err, nil)
-		return err
+		return fmt.Errorf("failed to register commit: %w", err)
 	}
 
 	// Ensure status is updated on exit

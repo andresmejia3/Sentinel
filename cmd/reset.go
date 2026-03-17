@@ -36,8 +36,7 @@ var resetCmd = &cobra.Command{
 			if confirm(reader, "⚠️  Are you sure you want to DROP all database tables?") {
 				fmt.Println("🗑️  Clearing Database...")
 				if err := DB.Reset(cmd.Context()); err != nil {
-					utils.ShowError("Failed to reset database", err, nil)
-					return err
+					return fmt.Errorf("failed to reset database: %w", err)
 				}
 			}
 		}

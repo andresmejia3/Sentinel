@@ -116,25 +116,20 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 		}
 	}
 	if len(validationErrors) > 0 {
-		err := fmt.Errorf("invalid target IDs: %s", strings.Join(validationErrors, ", "))
-		utils.ShowError("Configuration Error", err, nil)
-		return err
+		return fmt.Errorf("invalid target IDs: %s", strings.Join(validationErrors, ", "))
 	}
 
 	if err := os.MkdirAll(filepath.Dir(redactOutput), 0755); err != nil {
-		utils.ShowError("Failed to create output directory", err, nil)
-		return err
+		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
 	fps, err := utils.GetVideoFPS(ctx, opts.InputPath)
 	if err != nil {
-		utils.ShowError("Failed to determine video FPS", err, nil)
-		return err
+		return fmt.Errorf("failed to determine video FPS: %w", err)
 	}
 	width, height, err := utils.GetVideoDimensions(ctx, opts.InputPath)
 	if err != nil {
-		utils.ShowError("Failed to determine video dimensions", err, nil)
-		return err
+		return fmt.Errorf("failed to determine video dimensions: %w", err)
 	}
 	totalFrames := utils.GetTotalFrames(ctx, opts.InputPath)
 
@@ -148,8 +143,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	// Optimization: Load all target variant embeddings into memory
 	targetVariants, err := DB.GetVariantsForIdentities(ctx, targetIDs)
 	if err != nil {
-		utils.ShowError("Failed to load target embeddings", err, nil)
-		return err
+		return fmt.Errorf("failed to load target embeddings: %w", err)
 	}
 
 	lingerDuration, _ := time.ParseDuration(redactLinger)
@@ -212,9 +206,8 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 			}
 			w, err := worker.NewPythonRedactWorker(ctx, id, cfg)
 			if err != nil {
-				utils.ShowError("Worker startup failed", err, nil)
 				select {
-				case errChan <- err:
+				case errChan <- &utils.ContextualError{Context: "Worker Startup Failed", Err: err}:
 				default:
 				}
 				return
@@ -227,7 +220,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 				if err != nil {
 					utils.ShowError("Python crashed", err, w.Cmd)
 					select {
-					case errChan <- err:
+					case errChan <- &utils.SilentError{Err: err}:
 					default:
 					}
 					return
@@ -257,12 +250,10 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	decoder.Stderr = &decoderStderr
 	decoderOut, err := decoder.StdoutPipe()
 	if err != nil {
-		utils.ShowError("Failed to create decoder pipe", err, nil)
-		return err
+		return fmt.Errorf("failed to create decoder pipe: %w", err)
 	}
 	if err := decoder.Start(); err != nil {
-		utils.ShowError("Failed to start decoder", err, nil)
-		return err
+		return fmt.Errorf("failed to start decoder: %w", err)
 	}
 	// Ensure we reap the process even if we return early
 	decoderWaited := false
@@ -277,12 +268,10 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	encoder.Stderr = &encoderStderr
 	encoderIn, err := encoder.StdinPipe()
 	if err != nil {
-		utils.ShowError("Failed to create encoder pipe", err, nil)
-		return err
+		return fmt.Errorf("failed to create encoder pipe: %w", err)
 	}
 	if err := encoder.Start(); err != nil {
-		utils.ShowError("Failed to start encoder", err, nil)
-		return err
+		return fmt.Errorf("failed to start encoder: %w", err)
 	}
 	// Ensure we reap the process even if we return early
 	encoderWaited := false
@@ -395,8 +384,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 
 				outData, err := tracker.apply(ctx, frame.Data, width, height, nextFrame, frame.Faces, redactMode, redactStyle, redactParanoid, lingerFrames)
 				if err != nil {
-					utils.ShowError("Redaction failed", err, nil)
-					return err
+					return fmt.Errorf("redaction failed: %w", err)
 				}
 
 				select {
@@ -426,16 +414,14 @@ Flush:
 		if encoderStderr.Len() > 0 {
 			fmt.Fprintf(os.Stderr, "\nFFmpeg Encoder Logs:\n%s\n", encoderStderr.String())
 		}
-		utils.ShowError("Encoder process failed", err, nil)
-		return err
+		return fmt.Errorf("encoder process failed: %w", err)
 	}
 	decoderWaited = true
 	if err := decoder.Wait(); err != nil {
 		if decoderStderr.Len() > 0 {
 			fmt.Fprintf(os.Stderr, "\nFFmpeg Decoder Logs:\n%s\n", decoderStderr.String())
 		}
-		utils.ShowError("Decoder process failed", err, nil)
-		return err
+		return fmt.Errorf("decoder process failed: %w", err)
 	}
 	return nil
 }
@@ -749,40 +735,29 @@ func validateRedactFlags(opts *Options) error {
 	info, err := os.Stat(opts.InputPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			utils.ShowError("Input file does not exist", err, nil)
-			return err
+			return fmt.Errorf("input file does not exist: %w", err)
 		}
-		utils.ShowError("Unable to access input file", err, nil)
-		return err
+		return fmt.Errorf("unable to access input file: %w", err)
 	}
 	if info.IsDir() {
-		err := fmt.Errorf("is a directory")
-		utils.ShowError("Input path is a directory, expected a video file", err, nil)
-		return err
+		return fmt.Errorf("input path is a directory, not a video file")
 	}
 
 	if redactMode != "blur-all" && redactMode != "targeted" {
-		err := fmt.Errorf("invalid mode '%s'. Must be 'blur-all' or 'targeted'", redactMode)
-		utils.ShowError("Configuration Error", err, nil)
-		return err
+		return fmt.Errorf("invalid mode '%s'. Must be 'blur-all' or 'targeted'", redactMode)
 	}
 
 	validStyles := map[string]bool{"pixel": true, "black": true, "gauss": true, "secure": true}
 	if !validStyles[redactStyle] {
-		err := fmt.Errorf("invalid style '%s'. Must be one of: pixel, black, gauss, secure", redactStyle)
-		utils.ShowError("Configuration Error", err, nil)
-		return err
+		return fmt.Errorf("invalid style '%s'. Must be one of: pixel, black, gauss, secure", redactStyle)
 	}
 
 	if redactMode == "targeted" && redactTargets == "" {
-		err := fmt.Errorf("targeted mode requires --target list of IDs")
-		utils.ShowError("Configuration Error", err, nil)
-		return err
+		return fmt.Errorf("targeted mode requires --target list of IDs")
 	}
 
 	if _, err := time.ParseDuration(redactLinger); err != nil {
-		utils.ShowError("Invalid linger format (use '1s', '500ms')", err, nil)
-		return err
+		return fmt.Errorf("invalid linger format: %w (use '1s', '500ms')", err)
 	}
 
 	if opts.NumEngines < 1 {
@@ -790,20 +765,15 @@ func validateRedactFlags(opts *Options) error {
 	}
 
 	if opts.MatchThreshold <= 0 || opts.MatchThreshold > 1.0 {
-		err := fmt.Errorf("must be between 0.0 and 1.0, got %f", opts.MatchThreshold)
-		utils.ShowError("Invalid match threshold", err, nil)
-		return err
+		return fmt.Errorf("invalid match threshold: must be between 0.0 and 1.0, got %f", opts.MatchThreshold)
 	}
 
 	if opts.DetectionThreshold <= 0 || opts.DetectionThreshold > 1.0 {
-		err := fmt.Errorf("must be between 0.0 and 1.0, got %f", opts.DetectionThreshold)
-		utils.ShowError("Invalid detection threshold", err, nil)
-		return err
+		return fmt.Errorf("invalid detection threshold: must be between 0.0 and 1.0, got %f", opts.DetectionThreshold)
 	}
 
 	if _, err := time.ParseDuration(opts.WorkerTimeout); err != nil {
-		utils.ShowError("Invalid worker-timeout format (use '30s', '1m')", err, nil)
-		return err
+		return fmt.Errorf("invalid worker-timeout format: %w (use '30s', '1m')", err)
 	}
 
 	return nil

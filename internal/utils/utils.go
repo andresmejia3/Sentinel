@@ -309,3 +309,23 @@ func FmtTime(seconds float64) string {
 	s := int(duration.Seconds()) % 60
 	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }
+
+// SilentError is a wrapper for errors that have already been logged/displayed.
+// It signals to the root command handler that it should exit with an error code
+// but NOT print the error message again.
+type SilentError struct {
+	Err error
+}
+
+func (e *SilentError) Error() string { return e.Err.Error() }
+func (e *SilentError) Unwrap() error { return e.Err }
+
+// ContextualError allows a command to return an error with a specific
+// top-level context message for the root error handler.
+type ContextualError struct {
+	Context string
+	Err     error
+}
+
+func (e *ContextualError) Error() string { return e.Err.Error() }
+func (e *ContextualError) Unwrap() error { return e.Err }

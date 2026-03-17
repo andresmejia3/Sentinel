@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/andresmejia3/sentinel/internal/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -22,8 +21,7 @@ var labelIdentityCmd = &cobra.Command{
 		cmd.SilenceUsage = true
 		id, err := strconv.Atoi(args[0])
 		if err != nil {
-			utils.ShowError("Invalid identity ID", err, nil)
-			return err
+			return fmt.Errorf("invalid identity ID: %q is not an integer", args[0])
 		}
 		name := args[1]
 		return runLabelIdentity(id, name)
@@ -38,8 +36,7 @@ var labelVariantCmd = &cobra.Command{
 		cmd.SilenceUsage = true
 		id, err := strconv.Atoi(args[0])
 		if err != nil {
-			utils.ShowError("Invalid variant ID", err, nil)
-			return err
+			return fmt.Errorf("invalid variant ID: %q is not an integer", args[0])
 		}
 		identityName := args[1]
 		variantName := args[2]
@@ -57,8 +54,7 @@ func runLabelIdentity(id int, name string) error {
 	ctx := context.Background()
 
 	if err := DB.RenameIdentity(ctx, id, name); err != nil {
-		utils.ShowError("Failed to label identity", err, nil)
-		return err
+		return fmt.Errorf("failed to label identity: %w", err)
 	}
 
 	fmt.Printf("✅ Identity %d has been labeled as '%s'\n", id, name)
@@ -69,8 +65,7 @@ func runLabelVariant(id int, identityName, variantName string) error {
 	ctx := context.Background()
 
 	if err := DB.SetVariantLabel(ctx, id, identityName, variantName); err != nil {
-		utils.ShowError("Failed to label variant", err, nil)
-		return err
+		return fmt.Errorf("failed to label variant: %w", err)
 	}
 
 	fmt.Printf("✅ Variant %d linked to '%s' as '%s'\n", id, identityName, variantName)

@@ -2,12 +2,14 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/andresmejia3/sentinel/internal/store"
+	"github.com/andresmejia3/sentinel/internal/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -87,7 +89,17 @@ func Execute() {
 	rootCmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
 
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		// If the error has already been displayed (SilentError), just exit.
+		var silent *utils.SilentError
+		if errors.As(err, &silent) {
+			os.Exit(1)
+		}
+		var contextual *utils.ContextualError
+		if errors.As(err, &contextual) {
+			utils.ShowError(contextual.Context, contextual.Unwrap(), nil)
+			os.Exit(1)
+		}
+		utils.ShowError("Execution Failed", err, nil)
 		os.Exit(1)
 	}
 }

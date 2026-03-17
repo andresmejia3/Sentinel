@@ -27,9 +27,8 @@ func runRollback(ctx context.Context, commitID string) error {
 
 	// Atomic Rollback via Store
 	if err := DB.RevertCommit(ctx, commitID); err != nil {
-		// Error message is safe to display as it comes from the transaction logic
-		utils.ShowError("Rollback Failed", err, nil)
-		return err
+		// The root handler will now display the formatted error.
+		return fmt.Errorf("rollback failed: %w", err)
 	}
 
 	fmt.Println("✅ Rollback Successful.")
