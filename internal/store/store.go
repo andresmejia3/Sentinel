@@ -948,7 +948,7 @@ func (s *Store) GetIntervalsForIdentity(ctx context.Context, identityID int) ([]
 		JOIN variants va ON f.variant_id = va.id
 		JOIN video_metadata v ON f.video_id = v.id
 		WHERE va.identity_id = $1
-		ORDER BY v.path, f.start_time
+		ORDER BY v.path, f.video_id, f.start_time
 	`
 	rows, err := s.pool.Query(ctx, query, identityID)
 	if err != nil {

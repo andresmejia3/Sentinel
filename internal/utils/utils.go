@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // --- Process Safety & Command Wrapping ---
@@ -298,4 +299,13 @@ func GetProcessRSS(pid int) uint64 {
 	// Second field is RSS in pages
 	rssPages, _ := strconv.ParseUint(fields[1], 10, 64)
 	return rssPages * uint64(os.Getpagesize())
+}
+
+// FmtTime formats a float64 of seconds into an HH:MM:SS string.
+func FmtTime(seconds float64) string {
+	duration := time.Duration(seconds * float64(time.Second))
+	h := int(duration.Hours())
+	m := int(duration.Minutes()) % 60
+	s := int(duration.Seconds()) % 60
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }

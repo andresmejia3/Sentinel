@@ -167,23 +167,6 @@ func TestScanPersistence(t *testing.T) {
 	}
 }
 
-func TestFmtTime(t *testing.T) {
-	tests := []struct {
-		seconds float64
-		want    string
-	}{
-		{0, "00:00:00"},
-		{65, "00:01:05"},
-		{3661, "01:01:01"},
-	}
-
-	for _, tt := range tests {
-		if got := fmtTime(tt.seconds); got != tt.want {
-			t.Errorf("fmtTime(%v) = %v, want %v", tt.seconds, got, tt.want)
-		}
-	}
-}
-
 func TestValidateScanFlags(t *testing.T) {
 	// Create a temp file for valid input
 	tmpFile, err := os.CreateTemp("", "video.mp4")

@@ -115,19 +115,18 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	}
 
 	fmt.Println("") // Spacing
-	currentVideo := ""
+	currentVideoID := ""
 	for _, inv := range intervals {
-		baseName := filepath.Base(inv.VideoPath)
-		if baseName != currentVideo {
-			if currentVideo != "" {
+		if inv.VideoID != currentVideoID {
+			if currentVideoID != "" {
 				fmt.Println("")
 			}
-			fmt.Printf("🎬 %s\n", baseName)
-			currentVideo = baseName
+			fmt.Printf("🎬 %s\n", filepath.Base(inv.VideoPath))
+			currentVideoID = inv.VideoID
 		}
 
 		duration := inv.End - inv.Start
-		fmt.Printf("   👉 %s - %s (%.1fs)\n", fmtTime(inv.Start), fmtTime(inv.End), duration)
+		fmt.Printf("   👉 %s - %s (%.1fs)\n", utils.FmtTime(inv.Start), utils.FmtTime(inv.End), duration)
 	}
 
 	return nil

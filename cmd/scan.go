@@ -992,7 +992,7 @@ Loop:
 
 			fmt.Fprintf(os.Stderr, "   👉 Variant: %s (ID: %d)\n", vName, vid)
 			for _, r := range summary[vid] {
-				fmt.Fprintf(os.Stderr, "      %s -> %s\n", fmtTime(r.Start), fmtTime(r.End))
+				fmt.Fprintf(os.Stderr, "      %s -> %s\n", utils.FmtTime(r.Start), utils.FmtTime(r.End))
 			}
 		}
 	}
@@ -1080,12 +1080,4 @@ func validateScanFlags(opts *Options) error {
 	}
 
 	return nil
-}
-
-func fmtTime(seconds float64) string {
-	duration := time.Duration(seconds * float64(time.Second))
-	h := int(duration.Hours())
-	m := int(duration.Minutes()) % 60
-	s := int(duration.Seconds()) % 60
-	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }

@@ -73,3 +73,20 @@ func TestGenerateVideoID(t *testing.T) {
 		t.Error("Hash did not change after file modification")
 	}
 }
+
+func TestFmtTime(t *testing.T) {
+	tests := []struct {
+		seconds float64
+		want    string
+	}{
+		{0, "00:00:00"},
+		{65, "00:01:05"},
+		{3661, "01:01:01"},
+	}
+
+	for _, tt := range tests {
+		if got := FmtTime(tt.seconds); got != tt.want {
+			t.Errorf("FmtTime(%v) = %v, want %v", tt.seconds, got, tt.want)
+		}
+	}
+}
