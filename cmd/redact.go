@@ -22,14 +22,15 @@ import (
 )
 
 var (
-	redactOpts       Options
-	redactOutput     string
-	redactMode       string
-	redactTargets    string
-	redactStyle      string
-	redactLinger     string
-	redactParanoid   bool
-	redactBufferSize int
+	redactOpts           Options
+	redactOutput         string
+	redactMode           string
+	redactTargets        string
+	redactStyle          string
+	redactLinger         string
+	redactParanoid       bool
+	redactParanoidStrict bool
+	redactBufferSize     int
 )
 
 var redactCmd = &cobra.Command{
@@ -49,6 +50,7 @@ func init() {
 	redactCmd.Flags().StringVar(&redactStyle, "style", "black", "Redaction style: pixel, black, gauss, secure")
 	redactCmd.Flags().StringVar(&redactLinger, "linger", "1s", "How long to keep blurring after a targeted face is lost")
 	redactCmd.Flags().BoolVar(&redactParanoid, "paranoid", false, "Enable paranoid mode: blur ALL faces if a targeted face is lost")
+	redactCmd.Flags().BoolVar(&redactParanoidStrict, "paranoid-strict", false, "In paranoid mode, trigger blurring even if a target has not appeared yet")
 
 	redactCmd.Flags().IntVarP(&redactOpts.NumEngines, "engines", "e", 1, "Number of parallel engine workers")
 	redactCmd.Flags().Float64VarP(&redactOpts.MatchThreshold, "threshold", "t", 0.6, "Face matching threshold")
@@ -382,7 +384,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 				}
 				delete(buffer, nextFrame)
 
-				outData, err := tracker.apply(ctx, frame.Data, width, height, nextFrame, frame.Faces, redactMode, redactStyle, redactParanoid, lingerFrames)
+				outData, err := tracker.apply(ctx, frame.Data, width, height, nextFrame, frame.Faces, redactMode, redactStyle, redactParanoid, redactParanoidStrict, lingerFrames)
 				if err != nil {
 					return fmt.Errorf("redaction failed: %w", err)
 				}
@@ -426,7 +428,7 @@ Flush:
 	return nil
 }
 
-func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, height, frameIndex int, faces []types.FaceResult, mode, style string, paranoid bool, lingerFrames int) ([]byte, error) {
+func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, height, frameIndex int, faces []types.FaceResult, mode, style string, paranoid bool, paranoidStrict bool, lingerFrames int) ([]byte, error) {
 	// Zero-Copy: Wrap the raw bytes in an image.RGBA struct
 	m := &image.RGBA{
 		Pix:    imgData,
@@ -440,7 +442,7 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 	missingTargets := make(map[int]bool)
 	if mode == "targeted" {
 		for _, v := range p.targetVariants {
-			missingTargets[v.MasterID] = true
+			missingTargets[v.IdentityID] = true
 		}
 	}
 
@@ -459,7 +461,7 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 				dist := utils.CosineDist(face.Vec, v.Vec)
 				if dist < minDist {
 					minDist = dist
-					bestID = v.MasterID
+					bestID = v.IdentityID
 				}
 			}
 
@@ -474,7 +476,23 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 
 	isParanoidActive := false
 	if paranoid && mode == "targeted" && len(missingTargets) > 0 {
-		isParanoidActive = true
+		if paranoidStrict {
+			// Strict mode: trigger if any target is missing, period.
+			isParanoidActive = true
+		} else {
+			// Default behavior: only trigger if a *tracked* target is missing.
+			for id := range missingTargets {
+				for _, track := range p.activeTracks {
+					if track.ID == id {
+						isParanoidActive = true
+						break
+					}
+				}
+				if isParanoidActive {
+					break
+				}
+			}
+		}
 	}
 
 	for i, face := range faces {

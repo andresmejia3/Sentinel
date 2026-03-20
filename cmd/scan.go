@@ -69,7 +69,7 @@ func runScan(ctx context.Context, opts Options) error {
 	defer cancel()
 
 	// Error channel to catch failures from background goroutines
-	errChan := make(chan error, opts.NumEngines+2)
+	errChan := make(chan error, opts.NumEngines+5) // Increased buffer to ensure we never drop critical errors (e.g. Staging failure)
 
 	if err := validateScanFlags(&opts); err != nil {
 		return err
@@ -82,10 +82,11 @@ func runScan(ctx context.Context, opts Options) error {
 
 	// Flow Control: Prevent OOM by limiting in-flight frames.
 	// Limits buffering in the aggregator if a worker stalls.
-	if scanBufferSize < 1 {
-		scanBufferSize = 1
+	semSize := scanBufferSize
+	if semSize < 1 {
+		semSize = 1
 	}
-	inflightSem := make(chan struct{}, scanBufferSize)
+	inflightSem := make(chan struct{}, semSize)
 
 	// Memory Monitoring
 	var peakMemory uint64    // Atomic
@@ -153,6 +154,9 @@ func runScan(ctx context.Context, opts Options) error {
 	fps, err := utils.GetVideoFPS(ctx, opts.InputPath)
 	if err != nil {
 		return fmt.Errorf("failed to determine video FPS: %w", err)
+	}
+	if fps <= 0 || math.IsNaN(fps) || math.IsInf(fps, 0) {
+		return fmt.Errorf("invalid video FPS: %f (must be > 0)", fps)
 	}
 
 	totalVideoFrames := utils.GetTotalFrames(ctx, opts.InputPath)
@@ -328,10 +332,25 @@ func runScan(ctx context.Context, opts Options) error {
 
 	intervals := <-finalIntervalsChan
 
+	// Safety Check: Verify the aggregator finished successfully before committing.
+	// This prevents wiping the database if an error (e.g. MkdirAll) occurred early in processResults.
+	select {
+	case err := <-errChan:
+		return err
+	default:
+	}
+
 	// If Staging Mode is active, we skip the DB commit
 	if opts.StagingFile != "" {
-		fmt.Fprintf(os.Stderr, "\n📝 Staging file generated at: %s\n", opts.StagingFile)
-		return nil
+		// Final check for staging file write errors
+		select {
+		case err := <-errChan:
+			return err
+		default:
+			// Success
+			fmt.Fprintf(os.Stderr, "\n📝 Staging file generated at: %s\n", opts.StagingFile)
+			return nil
+		}
 	}
 
 	// Atomic Commit: All intervals are inserted in a single transaction.
@@ -486,55 +505,12 @@ type timeRange struct {
 }
 
 func processResults(ctx context.Context, results <-chan scanResult, db *store.Store, videoID string, fps float64, opts Options, errChan chan<- error, finalIntervalsChan chan<- []store.IntervalData, inflightSem chan struct{}) {
-	// Buffer for re-ordering frames (Worker 2 might finish before Worker 1)
-	buffer := make(map[int]scanResult)
-	nextFrame := 0
-
-	// Holds all final interval data to be batch-inserted at the end
+	var stagingFileReadyToWrite bool
 	var finalIntervals []store.IntervalData
-
-	var tracks []*activeTrack
-
-	// Global stats for identities to track extremes across multiple tracks
-	globalBestScore := make(map[int]float64)
-	globalLowestScore := make(map[int]float64)
-	firstDetectionWritten := make(map[int]bool)
-	identityDirsCreated := make(map[int]bool)
-
-	variantToIdentityID := make(map[int]int)
-	idNames := make(map[int]identityNameData)
-	newlyCreated := make(map[int]bool) // Track which IDs were generated in this session
-	tempIDCounter := -1                // Negative IDs for pending tracks
-
-	summary := make(map[int][]timeRange)
-	totalDetections := 0
 	var stagingItems []StagingItem
 
 	var consumerWg sync.WaitGroup
 	var producerWg sync.WaitGroup
-
-	gracePeriod, _ := time.ParseDuration(opts.GracePeriod)
-	blipDuration, _ := time.ParseDuration(opts.BlipDuration)
-	maxGapFrames := int(gracePeriod.Seconds() * fps)
-	if maxGapFrames < 1 {
-		maxGapFrames = 1 // Ensure at least 1 frame gap to prevent instant closing
-	}
-
-	// If /data exists (Docker volume), use it. Otherwise use relative "data" (Local)
-	outputBase := "data"
-	if _, err := os.Stat("/data"); err == nil {
-		outputBase = "/data"
-	}
-	// Optimization: Ensure output directory exists ONCE, not per-track
-	resultsDir := filepath.Join(outputBase, "results", videoID)
-	if err := os.MkdirAll(resultsDir, 0755); err != nil {
-		select {
-		case errChan <- fmt.Errorf("failed to create output directory: %w", err):
-		default:
-		}
-		return
-	}
-	fmt.Fprintf(os.Stderr, "📂 Output Directory: %s\n", resultsDir)
 
 	// We use a buffered channel to offload thumbnail disk I/O without blocking the main loop,
 	// while ensuring that writes for the same ID happen in order.
@@ -546,6 +522,28 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 	}
 	// Buffer increased to 1024 to prevent blocking the main loop during heavy track persistence
 	thumbChan := make(chan thumbOp, 1024)
+
+	// Ensure cleanup happens even if we return early due to error (e.g. DB failure or MkdirAll)
+	defer func() {
+		producerWg.Wait()
+		close(thumbChan)
+		consumerWg.Wait()
+
+		// Only write staging file if the process completed successfully
+		if stagingFileReadyToWrite && opts.StagingFile != "" {
+			if err := writeStagingFile(opts.StagingFile, stagingItems); err != nil {
+				// Try to send the error back to the main routine.
+				// Use a non-blocking send in case the channel is already full or closed.
+				select {
+				case errChan <- err:
+				default:
+				}
+			}
+		}
+
+		finalIntervalsChan <- finalIntervals
+	}()
+
 	consumerWg.Add(1)
 	go func() {
 		defer consumerWg.Done()
@@ -575,18 +573,49 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		}
 	}()
 
-	// Ensure cleanup happens even if we return early due to error (e.g. DB failure)
-	defer func() {
-		producerWg.Wait()
-		close(thumbChan)
-		consumerWg.Wait()
+	// 2. Initialize processing variables
+	// Buffer for re-ordering frames (Worker 2 might finish before Worker 1)
+	buffer := make(map[int]scanResult)
+	nextFrame := 0
 
-		if opts.StagingFile != "" {
-			writeStagingFile(opts.StagingFile, stagingItems)
+	var tracks []*activeTrack
+
+	// Global stats for identities to track extremes across multiple tracks
+	globalBestScore := make(map[int]float64)
+	globalLowestScore := make(map[int]float64)
+	firstDetectionWritten := make(map[int]bool)
+	identityDirsCreated := make(map[int]bool)
+
+	variantToIdentityID := make(map[int]int)
+	idNames := make(map[int]identityNameData)
+	newlyCreated := make(map[int]bool) // Track which IDs were generated in this session
+	tempIDCounter := -1                // Negative IDs for pending tracks
+
+	summary := make(map[int][]timeRange)
+	totalDetections := 0
+
+	gracePeriod, _ := time.ParseDuration(opts.GracePeriod)
+	blipDuration, _ := time.ParseDuration(opts.BlipDuration)
+	maxGapFrames := int(gracePeriod.Seconds() * fps)
+	if maxGapFrames < 1 {
+		maxGapFrames = 1 // Ensure at least 1 frame gap to prevent instant closing
+	}
+
+	// If /data exists (Docker volume), use it. Otherwise use relative "data" (Local)
+	outputBase := "data"
+	if _, err := os.Stat("/data"); err == nil {
+		outputBase = "/data"
+	}
+	// Optimization: Ensure output directory exists ONCE, not per-track
+	resultsDir := filepath.Join(outputBase, "results", videoID)
+	if err := os.MkdirAll(resultsDir, 0755); err != nil {
+		select {
+		case errChan <- fmt.Errorf("failed to create output directory: %w", err):
+		default:
 		}
-
-		finalIntervalsChan <- finalIntervals
-	}()
+		return
+	}
+	fmt.Fprintf(os.Stderr, "📂 Output Directory: %s\n", resultsDir)
 
 	fmt.Fprintf(os.Stderr, "⚙️  Tracker initialized with Cosine Distance (Threshold: %.2f)\n", opts.MatchThreshold)
 
@@ -629,7 +658,14 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 
 			// Ranked k-NN Logic
 			// 1. Get Top 2 matches (as requested)
-			matches, _ := db.FindTopIdentities(ctx, t.MeanVec, 2)
+			matches, err := db.FindTopIdentities(ctx, t.MeanVec, 2)
+			if err != nil {
+				select {
+				case errChan <- fmt.Errorf("failed to find top identities for staging: %w", err):
+				default:
+				}
+				return
+			}
 
 			item := StagingItem{
 				TrackID:        fmt.Sprintf("Track_%d", t.ID),
@@ -693,6 +729,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 		}
 
 		if isNewIdentity {
+			originalTempID := t.ID // Capture the temporary ID before it's updated
 			// Create Identity Synchronously. If we do this async, a race condition exists
 			// where the person reappears before the DB commit, causing a duplicate identity.
 			var err error
@@ -712,6 +749,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			variantToIdentityID[finalVariantID] = t.IdentityID
 			idNames[finalVariantID] = identityNameData{IdentityName: fmt.Sprintf("Identity %d", t.IdentityID), VariantName: "Default"}
 			t.ID = finalVariantID               // Update track ID with VariantID
+			delete(idNames, originalTempID)     // Fix: Prevent memory leak by cleaning up temporary ID
 			newlyCreated[finalVariantID] = true // Mark as new for the summary report
 		}
 
@@ -1020,17 +1058,20 @@ Loop:
 	fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
 	fmt.Fprintf(os.Stderr, "👁️  Total Face Detections:   %d\n", totalDetections)
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
+	stagingFileReadyToWrite = true
 }
 
-func writeStagingFile(path string, items []StagingItem) {
+func writeStagingFile(path string, items []StagingItem) error {
 	f, err := os.Create(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create staging file: %v\n", err)
-		return
+		return fmt.Errorf("failed to create staging file: %w", err)
 	}
 	defer f.Close()
 	enc := yaml.NewEncoder(f)
-	enc.Encode(items)
+	if err := enc.Encode(items); err != nil {
+		return fmt.Errorf("failed to encode staging YAML: %w", err)
+	}
+	return nil
 }
 
 func newActiveTrack(id, identityID, frameIndex int, vec []float64, thumb []byte, quality float64, name, variantName string, isKnown bool, loc []int) *activeTrack {
@@ -1085,14 +1126,20 @@ func validateScanFlags(opts *Options) error {
 	if opts.DetectionThreshold <= 0 || opts.DetectionThreshold > 1.0 {
 		return fmt.Errorf("invalid detection threshold: must be between 0.0 and 1.0, got %f", opts.DetectionThreshold)
 	}
-	if _, err := time.ParseDuration(opts.BlipDuration); err != nil {
+	if d, err := time.ParseDuration(opts.BlipDuration); err != nil {
 		return fmt.Errorf("invalid blip-duration format: %w (use '100ms', '1s')", err)
+	} else if d <= 0 {
+		return fmt.Errorf("blip-duration must be positive")
 	}
-	if _, err := time.ParseDuration(opts.GracePeriod); err != nil {
+	if d, err := time.ParseDuration(opts.GracePeriod); err != nil {
 		return fmt.Errorf("invalid grace-period format: %w (use '2s', '500ms')", err)
+	} else if d <= 0 {
+		return fmt.Errorf("grace-period must be positive")
 	}
-	if _, err := time.ParseDuration(opts.WorkerTimeout); err != nil {
+	if d, err := time.ParseDuration(opts.WorkerTimeout); err != nil {
 		return fmt.Errorf("invalid worker-timeout format: %w (use '30s', '1m')", err)
+	} else if d <= 0 {
+		return fmt.Errorf("worker-timeout must be positive")
 	}
 
 	return nil

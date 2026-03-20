@@ -8,7 +8,6 @@ import (
 	"strconv"
 
 	"github.com/andresmejia3/sentinel/internal/store"
-	"github.com/andresmejia3/sentinel/internal/utils"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"

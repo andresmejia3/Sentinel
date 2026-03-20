@@ -260,17 +260,34 @@ func (w *ScanWorker) ProcessScanFrame(data []byte) ([]types.FaceResult, error) {
 	cursor++
 
 	if status == 1 {
+		if cursor+4 > len(resp) {
+			return nil, fmt.Errorf("malformed response: insufficient data for error length")
+		}
 		msgLen := binary.BigEndian.Uint32(resp[cursor:])
 		cursor += 4
 		if msgLen > 1<<20 { // Safety check: Max 1MB error message
 			return nil, fmt.Errorf("python worker returned oversized error message: %d bytes", msgLen)
 		}
+		if cursor+int(msgLen) > len(resp) {
+			return nil, fmt.Errorf("malformed response: error message truncated")
+		}
 		msg := resp[cursor : cursor+int(msgLen)]
 		return nil, fmt.Errorf("python worker error: %s", string(msg))
 	}
 
+	if cursor+4 > len(resp) {
+		return nil, fmt.Errorf("malformed response: insufficient data for face count")
+	}
 	numFaces := binary.BigEndian.Uint32(resp[cursor:])
 	cursor += 4
+
+	// Safety Check: Ensure numFaces is plausible given the remaining data.
+	// Each face requires at least: 16 (Box) + 2048 (Vec) + 4 (Quality) + 4 (ImgLen) = 2072 bytes
+	// If the buffer is smaller than this * numFaces, the count is corrupt.
+	minBytesPerFace := 2072
+	if int(numFaces)*minBytesPerFace > len(resp)-cursor {
+		return nil, fmt.Errorf("malformed response: stated face count %d exceeds available data", numFaces)
+	}
 
 	results := make([]types.FaceResult, numFaces)
 
@@ -281,6 +298,9 @@ func (w *ScanWorker) ProcessScanFrame(data []byte) ([]types.FaceResult, error) {
 
 	for i := 0; i < int(numFaces); i++ {
 		// [Box: 16B]
+		if cursor+16 > len(resp) {
+			return nil, fmt.Errorf("malformed response: truncated face box")
+		}
 		x1 := int32(binary.BigEndian.Uint32(resp[cursor:]))
 		y1 := int32(binary.BigEndian.Uint32(resp[cursor+4:]))
 		x2 := int32(binary.BigEndian.Uint32(resp[cursor+8:]))
@@ -289,6 +309,9 @@ func (w *ScanWorker) ProcessScanFrame(data []byte) ([]types.FaceResult, error) {
 
 		// [Vec: 2048B]
 		// Slice from our pre-allocated backing array
+		if cursor+2048 > len(resp) {
+			return nil, fmt.Errorf("malformed response: truncated face vector")
+		}
 		vec64 := allVecs[i*512 : (i+1)*512]
 		for j := 0; j < 512; j++ {
 			bits := binary.BigEndian.Uint32(resp[cursor:])
@@ -297,15 +320,24 @@ func (w *ScanWorker) ProcessScanFrame(data []byte) ([]types.FaceResult, error) {
 		}
 
 		// [Quality: 4B]
+		if cursor+4 > len(resp) {
+			return nil, fmt.Errorf("malformed response: truncated quality score")
+		}
 		qualityBits := binary.BigEndian.Uint32(resp[cursor:])
 		quality := math.Float32frombits(qualityBits)
 		cursor += 4
 
 		// [ImgLen: 4B] + [ImgData]
+		if cursor+4 > len(resp) {
+			return nil, fmt.Errorf("malformed response: truncated thumbnail length")
+		}
 		imgLen := binary.BigEndian.Uint32(resp[cursor:])
 		cursor += 4
 
 		// Copy image data to a new slice to prevent corruption when readBuf is reused
+		if cursor+int(imgLen) > len(resp) {
+			return nil, fmt.Errorf("malformed response: truncated thumbnail data")
+		}
 		imgData := make([]byte, imgLen)
 		copy(imgData, resp[cursor:cursor+int(imgLen)])
 		cursor += int(imgLen)
@@ -337,23 +369,41 @@ func (w *RedactWorker) ProcessRedactFrame(data []byte) ([]types.FaceResult, erro
 	cursor++
 
 	if status == 1 {
+		if cursor+4 > len(resp) {
+			return nil, fmt.Errorf("malformed response: insufficient data for error length")
+		}
 		msgLen := binary.BigEndian.Uint32(resp[cursor:])
 		cursor += 4
 		if msgLen > 1<<20 {
 			return nil, fmt.Errorf("python worker returned oversized error message: %d bytes", msgLen)
 		}
+		if cursor+int(msgLen) > len(resp) {
+			return nil, fmt.Errorf("malformed response: error message truncated")
+		}
 		msg := resp[cursor : cursor+int(msgLen)]
 		return nil, fmt.Errorf("python worker error: %s", string(msg))
 	}
 
+	if cursor+4 > len(resp) {
+		return nil, fmt.Errorf("malformed response: insufficient data for face count")
+	}
 	numFaces := binary.BigEndian.Uint32(resp[cursor:])
 	cursor += 4
+
+	// Safety Check for Redaction: Box (16) + Vec (2048) = 2064 bytes minimum
+	minBytesPerFace := 2064
+	if int(numFaces)*minBytesPerFace > len(resp)-cursor {
+		return nil, fmt.Errorf("malformed response: stated face count %d exceeds available data", numFaces)
+	}
 
 	results := make([]types.FaceResult, numFaces)
 	allVecs := make([]float64, int(numFaces)*512)
 
 	for i := 0; i < int(numFaces); i++ {
 		// [Box: 16B]
+		if cursor+16 > len(resp) {
+			return nil, fmt.Errorf("malformed response: truncated face box")
+		}
 		x1 := int32(binary.BigEndian.Uint32(resp[cursor:]))
 		y1 := int32(binary.BigEndian.Uint32(resp[cursor+4:]))
 		x2 := int32(binary.BigEndian.Uint32(resp[cursor+8:]))
@@ -361,6 +411,9 @@ func (w *RedactWorker) ProcessRedactFrame(data []byte) ([]types.FaceResult, erro
 		cursor += 16
 
 		// [Vec: 2048B]
+		if cursor+2048 > len(resp) {
+			return nil, fmt.Errorf("malformed response: truncated face vector")
+		}
 		vec64 := allVecs[i*512 : (i+1)*512]
 		for j := 0; j < 512; j++ {
 			bits := binary.BigEndian.Uint32(resp[cursor:])

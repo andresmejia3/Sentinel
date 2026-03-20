@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/andresmejia3/sentinel/internal/utils"
 	"github.com/spf13/cobra"
 )
 
