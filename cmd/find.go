@@ -85,15 +85,16 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 
 	// Pick largest face if multiple
 	bestFace := faces[0]
+
+	getArea := func(loc []int) float64 {
+		if len(loc) < 4 {
+			return 0
+		}
+		return math.Abs(float64(loc[2]-loc[0]) * float64(loc[3]-loc[1]))
+	}
+
 	if len(faces) > 1 {
 		fmt.Fprintf(os.Stderr, "⚠️  Multiple faces detected (%d). Using the largest face.\n", len(faces))
-
-		getArea := func(loc []int) float64 {
-			if len(loc) < 4 {
-				return 0
-			}
-			return math.Abs(float64(loc[2]-loc[0]) * float64(loc[3]-loc[1]))
-		}
 
 		maxArea := getArea(bestFace.Loc)
 		for _, f := range faces[1:] {
@@ -103,6 +104,11 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 				bestFace = f
 			}
 		}
+	}
+
+	// Ensure the chosen face has valid coordinates before proceeding
+	if len(bestFace.Loc) < 4 {
+		return fmt.Errorf("AI engine returned malformed face coordinates")
 	}
 
 	// Safety Check: Verify vector dimension of the chosen face before DB query
@@ -134,11 +140,12 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	}
 
 	if len(intervals) == 0 {
-		fmt.Fprintln(os.Stderr, "No recorded intervals found.")
+		fmt.Fprintln(os.Stderr, "ℹ️  No historical occurrences found in the database.")
 		return nil
 	}
 
-	// Ensure results are grouped by video and ordered by time for intuitive display
+	// Sort by Path for humans, then by ID to keep file versions together,
+	// and finally by Start time for a chronological timeline.
 	sort.Slice(intervals, func(i, j int) bool {
 		if intervals[i].VideoPath != intervals[j].VideoPath {
 			return intervals[i].VideoPath < intervals[j].VideoPath
@@ -150,14 +157,23 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	})
 
 	fmt.Println("") // Spacing
-	currentVideoID := ""
-	for _, inv := range intervals {
-		if inv.VideoID != currentVideoID {
-			if currentVideoID != "" {
+	var lastVideoID string
+	for i, inv := range intervals {
+		// Content Hash (VideoID) is the definitive grouping key.
+		// Even if paths are the same, different IDs mean different videos.
+		if i == 0 || inv.VideoID != lastVideoID {
+			if i > 0 {
 				fmt.Println("")
 			}
-			fmt.Printf("🎬 %s\n", filepath.Base(inv.VideoPath))
-			currentVideoID = inv.VideoID
+
+			// If the VideoID is different but the path is the same as the last one,
+			// we append a short hash to alert the user that these are different files.
+			header := inv.VideoPath
+			if i > 0 && inv.VideoPath == intervals[i-1].VideoPath {
+				header = fmt.Sprintf("%s [hash: %s]", inv.VideoPath, inv.VideoID[:8])
+			}
+			fmt.Printf("🎬 %s\n", header)
+			lastVideoID = inv.VideoID
 		}
 
 		duration := inv.End - inv.Start
