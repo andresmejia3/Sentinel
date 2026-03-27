@@ -1120,10 +1120,10 @@ func validateScanFlags(opts *Options) error {
 	if opts.NumEngines < 1 {
 		opts.NumEngines = 1
 	}
-	if opts.MatchThreshold <= 0 || opts.MatchThreshold > 1.0 {
+	if opts.MatchThreshold < 0 || opts.MatchThreshold > 1.0 {
 		return fmt.Errorf("invalid match threshold: must be between 0.0 and 1.0, got %f", opts.MatchThreshold)
 	}
-	if opts.DetectionThreshold <= 0 || opts.DetectionThreshold > 1.0 {
+	if opts.DetectionThreshold < 0 || opts.DetectionThreshold > 1.0 {
 		return fmt.Errorf("invalid detection threshold: must be between 0.0 and 1.0, got %f", opts.DetectionThreshold)
 	}
 	if d, err := time.ParseDuration(opts.BlipDuration); err != nil {

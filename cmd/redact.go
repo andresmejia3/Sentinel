@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -98,9 +99,21 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 		return err
 	}
 
+	// Ensure paranoid mode is active if strict mode is requested
+	activeParanoid := redactParanoid
+	if redactParanoidStrict {
+		activeParanoid = true
+	}
+
 	// Safety Check: Prevent overwriting input file which causes corruption
-	inAbs, _ := filepath.Abs(opts.InputPath)
-	outAbs, _ := filepath.Abs(redactOutput)
+	inAbs, err := filepath.Abs(opts.InputPath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve absolute path for input: %w", err)
+	}
+	outAbs, err := filepath.Abs(redactOutput)
+	if err != nil {
+		return fmt.Errorf("failed to resolve absolute path for output: %w", err)
+	}
 	if inAbs == outAbs {
 		return fmt.Errorf("input and output paths must be different to prevent file corruption")
 	}
@@ -129,6 +142,9 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("failed to determine video FPS: %w", err)
 	}
+	if fps <= 0 || math.IsNaN(fps) || math.IsInf(fps, 0) {
+		return fmt.Errorf("invalid video FPS: %f (must be > 0)", fps)
+	}
 	width, height, err := utils.GetVideoDimensions(ctx, opts.InputPath)
 	if err != nil {
 		return fmt.Errorf("failed to determine video dimensions: %w", err)
@@ -137,10 +153,58 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 
 	taskChan := make(chan types.FrameTask, opts.NumEngines)
 	resultsChan := make(chan redactResult, opts.NumEngines*2)
+	writeChan := make(chan []byte, opts.NumEngines*2)
+	writeErrChan := make(chan error, 1)
 	errChan := make(chan error, opts.NumEngines+2)
 
 	var wg sync.WaitGroup
+	var writerWg sync.WaitGroup
 	readyChan := make(chan bool, opts.NumEngines)
+
+	// Safety Net: Cleanup Deferred Block to prevent Memory Leaks (Dangling Rows) & Deadlocks
+	defer func() {
+		cancel()        // 1. Signal shutdown
+		wg.Wait()       // 2. Wait for workers
+		writerWg.Wait() // 3. Wait for writer
+
+		// 4. Drain Channels (Return buffers to pool)
+	DrainTask:
+		for {
+			select {
+			case t, ok := <-taskChan:
+				if !ok {
+					break DrainTask
+				}
+				frameBufferPool.Put(t.Data)
+			default:
+				break DrainTask
+			}
+		}
+	DrainResults:
+		for {
+			select {
+			case r, ok := <-resultsChan:
+				if !ok {
+					break DrainResults
+				}
+				frameBufferPool.Put(r.Data)
+			default:
+				break DrainResults
+			}
+		}
+	DrainWrite:
+		for {
+			select {
+			case d, ok := <-writeChan:
+				if !ok {
+					break DrainWrite
+				}
+				frameBufferPool.Put(d)
+			default:
+				break DrainWrite
+			}
+		}
+	}()
 
 	// Optimization: Load all target variant embeddings into memory
 	targetVariants, err := DB.GetVariantsForIdentities(ctx, targetIDs)
@@ -148,7 +212,24 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 		return fmt.Errorf("failed to load target embeddings: %w", err)
 	}
 
-	lingerDuration, _ := time.ParseDuration(redactLinger)
+	// Critical Safety Check: Ensure ALL requested targets actually exist in the DB.
+	// If a target is missing, we must abort to prevent accidental leakage (unredacted faces).
+	if redactMode == "targeted" {
+		foundIdentityIDs := make(map[int]bool)
+		for _, v := range targetVariants {
+			foundIdentityIDs[v.IdentityID] = true
+		}
+		for _, id := range targetIDs {
+			if !foundIdentityIDs[id] {
+				return fmt.Errorf("aborting: target Identity ID %d not found in database", id)
+			}
+		}
+	}
+
+	lingerDuration, err := time.ParseDuration(redactLinger)
+	if err != nil {
+		return fmt.Errorf("failed to parse linger duration: %w", err)
+	}
 	lingerFrames := int(lingerDuration.Seconds() * fps)
 	tracker := &paranoidTracker{
 		targetVariants: targetVariants,
@@ -156,38 +237,42 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 		opts:           &opts,
 	}
 
-	workerTimeout, _ := time.ParseDuration(opts.WorkerTimeout)
+	workerTimeout, err := time.ParseDuration(opts.WorkerTimeout)
+	if err != nil {
+		return fmt.Errorf("failed to parse worker timeout: %w", err)
+	}
 
 	// Flow Control: Prevent OOM by limiting in-flight frames.
 	// This is a CAP (Semaphore), not an upfront allocation. However, since decoding is faster
 	// than inference, the buffer will typically fill up to this limit during operation.
+	bufferSize := redactBufferSize
 	if !cmd.Flags().Changed("buffer-size") {
 
 		totalPixels := width * height
 
 		if totalPixels <= 2048*1080 { //1080p
-			redactBufferSize = 200
-			fmt.Fprintf(os.Stderr, "⚡ Standard-Res Video detected. Auto-setting buffer to %d frames (Max ~1.5GB) for performance.\n", redactBufferSize)
+			bufferSize = 200
+			fmt.Fprintf(os.Stderr, "⚡ Standard-Res Video detected. Auto-setting buffer to %d frames (Max ~1.5GB) for performance.\n", bufferSize)
 
 		} else if totalPixels <= 4096*2160 { // 4K (Cover DCI 4K)
-			redactBufferSize = 45
-			fmt.Fprintf(os.Stderr, "⚠️  4K High-Res Video detected. Auto-setting buffer to %d frames (Max ~1.5GB) to prevent OOM.\n", redactBufferSize)
+			bufferSize = 45
+			fmt.Fprintf(os.Stderr, "⚠️  4K High-Res Video detected. Auto-setting buffer to %d frames (Max ~1.5GB) to prevent OOM.\n", bufferSize)
 
 		} else if totalPixels <= 8192*4320 { // 8K (Cover DCI 8K)
-			redactBufferSize = 11
-			fmt.Fprintf(os.Stderr, "⚠️  8K High-Res Video detected. Auto-setting buffer to %d frames (Max ~1.5GB) to prevent OOM.\n", redactBufferSize)
+			bufferSize = 11
+			fmt.Fprintf(os.Stderr, "⚠️  8K High-Res Video detected. Auto-setting buffer to %d frames (Max ~1.5GB) to prevent OOM.\n", bufferSize)
 
 		} else { // 8K+
-			redactBufferSize = 3
-			fmt.Fprintf(os.Stderr, "⚠️  Extreme-Res Video detected. Auto-setting buffer to %d frames (Max ~1.5GB for 16K) to prevent OOM.\n", redactBufferSize)
+			bufferSize = 3
+			fmt.Fprintf(os.Stderr, "⚠️  Extreme-Res Video detected. Auto-setting buffer to %d frames (Max ~1.5GB for 16K) to prevent OOM.\n", bufferSize)
 
 		}
 	}
 
-	if redactBufferSize < 1 {
-		redactBufferSize = 1
+	if bufferSize < 1 {
+		bufferSize = 1
 	}
-	inflightSem := make(chan struct{}, redactBufferSize)
+	inflightSem := make(chan struct{}, bufferSize)
 
 	for i := 0; i < opts.NumEngines; i++ {
 		wg.Add(1)
@@ -217,20 +302,30 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 			defer w.Close()
 			readyChan <- true
 
-			for task := range taskChan {
-				faces, err := w.ProcessRedactFrame(task.Data)
-				if err != nil {
-					utils.ShowError("Python crashed", err, w.Cmd)
-					select {
-					case errChan <- &utils.SilentError{Err: err}:
-					default:
-					}
-					return
-				}
+			for {
 				select {
-				case resultsChan <- redactResult{Index: task.Index, Data: task.Data, Faces: faces}:
 				case <-ctx.Done():
 					return
+				case task, ok := <-taskChan:
+					if !ok {
+						return
+					}
+					faces, err := w.ProcessRedactFrame(task.Data)
+					if err != nil {
+						frameBufferPool.Put(task.Data) // Return buffer on error
+						utils.ShowError("Python crashed", err, w.Cmd)
+						select {
+						case errChan <- &utils.SilentError{Err: err}:
+						default:
+						}
+						return
+					}
+					select {
+					case resultsChan <- redactResult{Index: task.Index, Data: task.Data, Faces: faces}:
+					case <-ctx.Done():
+						frameBufferPool.Put(task.Data) // Return buffer on cancellation
+						return
+					}
 				}
 			}
 		}(i)
@@ -254,6 +349,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("failed to create decoder pipe: %w", err)
 	}
+	defer decoderOut.Close()
 	if err := decoder.Start(); err != nil {
 		return fmt.Errorf("failed to start decoder: %w", err)
 	}
@@ -261,17 +357,20 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	decoderWaited := false
 	defer func() {
 		if !decoderWaited {
+			cancel() // Kill process to prevent deadlock on Wait()
 			decoder.Wait()
 		}
 	}()
 
 	var encoderStderr bytes.Buffer
-	encoder := utils.NewFFmpegEncoder(ctx, redactOutput, fps, width, height)
+	// Use the utility which now handles audio mapping correctly
+	encoder := utils.NewFFmpegEncoder(ctx, opts.InputPath, redactOutput, fps, width, height)
 	encoder.Stderr = &encoderStderr
 	encoderIn, err := encoder.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create encoder pipe: %w", err)
 	}
+	defer encoderIn.Close()
 	if err := encoder.Start(); err != nil {
 		return fmt.Errorf("failed to start encoder: %w", err)
 	}
@@ -279,6 +378,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	encoderWaited := false
 	defer func() {
 		if !encoderWaited {
+			cancel() // Kill process to prevent deadlock on Wait()
 			encoder.Wait()
 		}
 	}()
@@ -306,6 +406,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 			select {
 			case inflightSem <- struct{}{}:
 			case <-ctx.Done():
+				frameBufferPool.Put(buf)
 				return
 			}
 
@@ -313,12 +414,22 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 			case taskChan <- types.FrameTask{Index: idx, Data: buf}:
 				idx++
 			case <-ctx.Done():
+				// We acquired the semaphore, but are exiting before the frame is processed.
+				// Release the semaphore and the buffer to prevent leaks.
+				<-inflightSem
+				frameBufferPool.Put(buf)
 				return
 			}
 		}
 	}()
 
 	buffer := make(map[int]redactResult)
+	// Ensure buffered frames are returned to the pool if we exit early on error
+	defer func() {
+		for _, res := range buffer {
+			frameBufferPool.Put(res.Data)
+		}
+	}()
 	nextFrame := 0
 	var barTotal int64 = int64(totalFrames)
 	if barTotal <= 0 {
@@ -329,6 +440,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 		progressbar.OptionSetWriter(os.Stderr),
 		progressbar.OptionShowCount(),
 	)
+	defer bar.Finish()
 
 	go func() {
 		wg.Wait()
@@ -336,9 +448,6 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	}()
 
 	// Decoupled writer to prevent deadlock
-	writeChan := make(chan []byte, opts.NumEngines*2)
-	writeErrChan := make(chan error, 1)
-	var writerWg sync.WaitGroup
 	writerWg.Add(1)
 	go func() {
 		defer writerWg.Done()
@@ -384,16 +493,20 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 				}
 				delete(buffer, nextFrame)
 
-				outData, err := tracker.apply(ctx, frame.Data, width, height, nextFrame, frame.Faces, redactMode, redactStyle, redactParanoid, redactParanoidStrict, lingerFrames)
+				outData, err := tracker.apply(ctx, frame.Data, width, height, nextFrame, frame.Faces, redactMode, redactStyle, activeParanoid, redactParanoidStrict, lingerFrames)
 				if err != nil {
+					frameBufferPool.Put(frame.Data)
 					return fmt.Errorf("redaction failed: %w", err)
 				}
 
 				select {
 				case writeChan <- outData:
 				case err := <-writeErrChan:
+					frameBufferPool.Put(outData)
 					return err
 				case <-ctx.Done():
+					// The frame was processed but not sent to the encoder. Recycle the buffer before exiting.
+					frameBufferPool.Put(outData)
 					return ctx.Err()
 				}
 
@@ -410,7 +523,16 @@ Flush:
 	close(writeChan)
 	writerWg.Wait()
 
-	encoderIn.Close()
+	// Check for any errors that occurred in the writer during the final flush
+	select {
+	case err := <-writeErrChan:
+		return err
+	default:
+	}
+
+	if err := encoderIn.Close(); err != nil {
+		return fmt.Errorf("failed to close encoder pipe: %w", err)
+	}
 	encoderWaited = true
 	if err := encoder.Wait(); err != nil {
 		if encoderStderr.Len() > 0 {
@@ -587,15 +709,15 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 		imgMinX, imgMinY := img.Rect.Min.X, img.Rect.Min.Y
 
 		for x := rect.Min.X; x < rect.Max.X; x++ {
-			if y := rect.Min.Y - 1; y >= img.Bounds().Min.Y { // Top
-				off := (y-imgMinY)*stride + (x-imgMinX)*4
+			if edgeY := rect.Min.Y - 1; edgeY >= img.Bounds().Min.Y { // Top
+				off := (edgeY-imgMinY)*stride + (x-imgMinX)*4
 				r += uint64(pix[off])
 				g += uint64(pix[off+1])
 				b += uint64(pix[off+2])
 				count++
 			}
-			if y := rect.Max.Y; y < img.Bounds().Max.Y { // Bottom
-				off := (y-imgMinY)*stride + (x-imgMinX)*4
+			if edgeY := rect.Max.Y; edgeY < img.Bounds().Max.Y { // Bottom
+				off := (edgeY-imgMinY)*stride + (x-imgMinX)*4
 				r += uint64(pix[off])
 				g += uint64(pix[off+1])
 				b += uint64(pix[off+2])
@@ -603,15 +725,15 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 			}
 		}
 		for y := rect.Min.Y; y < rect.Max.Y; y++ {
-			if x := rect.Min.X - 1; x >= img.Bounds().Min.X { // Left
-				off := (y-imgMinY)*stride + (x-imgMinX)*4
+			if edgeX := rect.Min.X - 1; edgeX >= img.Bounds().Min.X { // Left
+				off := (y-imgMinY)*stride + (edgeX-imgMinX)*4
 				r += uint64(pix[off])
 				g += uint64(pix[off+1])
 				b += uint64(pix[off+2])
 				count++
 			}
-			if x := rect.Max.X; x < img.Bounds().Max.X { // Right
-				off := (y-imgMinY)*stride + (x-imgMinX)*4
+			if edgeX := rect.Max.X; edgeX < img.Bounds().Max.X { // Right
+				off := (y-imgMinY)*stride + (edgeX-imgMinX)*4
 				r += uint64(pix[off])
 				g += uint64(pix[off+1])
 				b += uint64(pix[off+2])
@@ -648,11 +770,13 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 
 		neededSize := w * h * 4
 		bufPtr := blurBufferPool.Get().([]uint8)
+
 		if cap(bufPtr) < neededSize {
-			bufPtr = make([]uint8, neededSize)
+			bufPtr = make([]uint8, 0, neededSize)
 		}
+		defer blurBufferPool.Put(bufPtr[:0])
+
 		buf := bufPtr[:neededSize]
-		defer blurBufferPool.Put(bufPtr)
 
 		stride := img.Stride
 		pix := img.Pix
@@ -706,6 +830,7 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 				pix[dstOff] = uint8(rSum / uint32(count))
 				pix[dstOff+1] = uint8(gSum / uint32(count))
 				pix[dstOff+2] = uint8(bSum / uint32(count))
+				pix[dstOff+3] = 255
 			}
 		}
 
@@ -782,12 +907,16 @@ func validateRedactFlags(opts *Options) error {
 		opts.NumEngines = 1
 	}
 
-	if opts.MatchThreshold <= 0 || opts.MatchThreshold > 1.0 {
+	if opts.MatchThreshold < 0 || opts.MatchThreshold > 1.0 {
 		return fmt.Errorf("invalid match threshold: must be between 0.0 and 1.0, got %f", opts.MatchThreshold)
 	}
 
-	if opts.DetectionThreshold <= 0 || opts.DetectionThreshold > 1.0 {
+	if opts.DetectionThreshold < 0 || opts.DetectionThreshold > 1.0 {
 		return fmt.Errorf("invalid detection threshold: must be between 0.0 and 1.0, got %f", opts.DetectionThreshold)
+	}
+
+	if opts.BlurStrength < 0 {
+		return fmt.Errorf("invalid strength: must be non-negative, got %d", opts.BlurStrength)
 	}
 
 	if _, err := time.ParseDuration(opts.WorkerTimeout); err != nil {

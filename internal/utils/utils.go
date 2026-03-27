@@ -152,20 +152,24 @@ func NewFFmpegRawDecoder(ctx context.Context, inputPath string) *exec.Cmd {
 }
 
 // NewFFmpegEncoder creates a command to encode raw JPEG frames from Stdin into a video file.
-func NewFFmpegEncoder(ctx context.Context, outputPath string, fps float64, width, height int) *exec.Cmd {
-	return exec.CommandContext(ctx, "ffmpeg",
+func NewFFmpegEncoder(ctx context.Context, audioInputPath, outputPath string, fps float64, width, height int) *exec.Cmd {
+	args := []string{
 		"-y", // Overwrite output
 		"-f", "rawvideo",
 		"-pix_fmt", "rgba",
 		"-s", fmt.Sprintf("%dx%d", width, height),
 		"-r", fmt.Sprintf("%f", fps),
 		"-i", "-", // Read from Stdin
-		"-c:v", "libx264",
-		"-preset", "fast",
-		"-crf", "23",
-		"-pix_fmt", "yuv420p",
-		outputPath,
-	)
+	}
+
+	// If an audio source is provided, copy the audio stream
+	if audioInputPath != "" {
+		args = append(args, "-i", audioInputPath, "-map", "0:v", "-map", "1:a?", "-c:a", "copy")
+	}
+
+	args = append(args, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p", outputPath)
+
+	return exec.CommandContext(ctx, "ffmpeg", args...)
 }
 
 // GenerateVideoID creates a deterministic hash for the video file

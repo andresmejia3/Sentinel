@@ -3,8 +3,10 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/andresmejia3/sentinel/internal/utils"
@@ -25,22 +27,36 @@ var findCmd = &cobra.Command{
 }
 
 func init() {
-	findCmd.Flags().Float64VarP(&findOpts.MatchThreshold, "threshold", "t", 0.6, "Face matching threshold")
+	findCmd.Flags().Float64VarP(&findOpts.MatchThreshold, "threshold", "t", 0.6, "Face matching threshold (lower is stricter)")
 	findCmd.Flags().Float64VarP(&findOpts.DetectionThreshold, "detection-threshold", "D", 0.5, "Face detection confidence threshold")
 	findCmd.Flags().BoolVarP(&findOpts.DebugScreenshots, "debug", "d", false, "Enable debug screenshots")
+	findCmd.Flags().StringVar(&findOpts.WorkerTimeout, "worker-timeout", "30s", "Timeout for AI worker processing per frame")
 	rootCmd.AddCommand(findCmd)
 }
 
 func runFind(ctx context.Context, imagePath string, opts Options) error {
-	if _, err := os.Stat(imagePath); os.IsNotExist(err) {
-		return fmt.Errorf("input file does not exist: %w", err)
+	absPath, err := filepath.Abs(imagePath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve absolute path for %s: %w", imagePath, err)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if err := validateFindFlags(absPath, opts); err != nil {
+		return err
+	}
+
+	workerTimeout, err := time.ParseDuration(opts.WorkerTimeout)
+	if err != nil {
+		return fmt.Errorf("failed to parse worker-timeout '%s': %w", opts.WorkerTimeout, err)
 	}
 
 	fmt.Fprintln(os.Stderr, "🚀 Starting AI Engine...")
 	cfg := worker.ScanConfig{
 		Debug:              opts.DebugScreenshots,
 		DetectionThreshold: opts.DetectionThreshold,
-		ReadTimeout:        60 * time.Second,
+		ReadTimeout:        workerTimeout,
 	}
 
 	// We use ID 0 for this ad-hoc worker
@@ -50,9 +66,9 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	}
 	defer w.Close()
 
-	imgData, err := os.ReadFile(imagePath)
+	imgData, err := os.ReadFile(absPath)
 	if err != nil {
-		return fmt.Errorf("failed to read image file: %w", err)
+		return fmt.Errorf("failed to read image file at %s: %w", absPath, err)
 	}
 
 	fmt.Fprintln(os.Stderr, "🔍 Analyzing face...")
@@ -63,22 +79,35 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	}
 
 	if len(faces) == 0 {
-		fmt.Println("❌ No faces detected in the provided image.")
+		fmt.Fprintln(os.Stderr, "❌ No faces detected in the provided image.")
 		return nil
 	}
 
 	// Pick largest face if multiple
 	bestFace := faces[0]
 	if len(faces) > 1 {
-		fmt.Printf("⚠️  Multiple faces detected (%d). Using the largest face.\n", len(faces))
-		maxArea := (bestFace.Loc[2] - bestFace.Loc[0]) * (bestFace.Loc[3] - bestFace.Loc[1])
+		fmt.Fprintf(os.Stderr, "⚠️  Multiple faces detected (%d). Using the largest face.\n", len(faces))
+
+		getArea := func(loc []int) float64 {
+			if len(loc) < 4 {
+				return 0
+			}
+			return math.Abs(float64(loc[2]-loc[0]) * float64(loc[3]-loc[1]))
+		}
+
+		maxArea := getArea(bestFace.Loc)
 		for _, f := range faces[1:] {
-			area := (f.Loc[2] - f.Loc[0]) * (f.Loc[3] - f.Loc[1])
+			area := getArea(f.Loc)
 			if area > maxArea {
 				maxArea = area
 				bestFace = f
 			}
 		}
+	}
+
+	// Safety Check: Verify vector dimension of the chosen face before DB query
+	if len(bestFace.Vec) != 512 {
+		return fmt.Errorf("AI engine error: expected 512-dimensional vector, got %d", len(bestFace.Vec))
 	}
 
 	fmt.Fprintln(os.Stderr, "🗄️  Searching database...")
@@ -88,7 +117,7 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	}
 
 	if variantID == -1 {
-		fmt.Println("❌ No match found in database.")
+		fmt.Fprintln(os.Stderr, "❌ No match found in database.")
 		return nil
 	}
 
@@ -105,9 +134,20 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	}
 
 	if len(intervals) == 0 {
-		fmt.Println("No recorded intervals found.")
+		fmt.Fprintln(os.Stderr, "No recorded intervals found.")
 		return nil
 	}
+
+	// Ensure results are grouped by video and ordered by time for intuitive display
+	sort.Slice(intervals, func(i, j int) bool {
+		if intervals[i].VideoPath != intervals[j].VideoPath {
+			return intervals[i].VideoPath < intervals[j].VideoPath
+		}
+		if intervals[i].VideoID != intervals[j].VideoID {
+			return intervals[i].VideoID < intervals[j].VideoID
+		}
+		return intervals[i].Start < intervals[j].Start
+	})
 
 	fmt.Println("") // Spacing
 	currentVideoID := ""
@@ -124,5 +164,28 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 		fmt.Printf("   👉 %s - %s (%.1fs)\n", utils.FmtTime(inv.Start), utils.FmtTime(inv.End), duration)
 	}
 
+	return nil
+}
+
+func validateFindFlags(imagePath string, opts Options) error {
+	info, err := os.Stat(imagePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("input file does not exist: %w", err)
+		}
+		return fmt.Errorf("unable to access input file: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("input path is a directory, not an image file")
+	}
+	if opts.MatchThreshold < 0 || opts.MatchThreshold > 1.0 {
+		return fmt.Errorf("invalid match threshold: must be between 0.0 and 1.0, got %f", opts.MatchThreshold)
+	}
+	if opts.DetectionThreshold < 0 || opts.DetectionThreshold > 1.0 {
+		return fmt.Errorf("invalid detection threshold: must be between 0.0 and 1.0, got %f", opts.DetectionThreshold)
+	}
+	if _, err := time.ParseDuration(opts.WorkerTimeout); err != nil {
+		return fmt.Errorf("invalid worker-timeout format: %w", err)
+	}
 	return nil
 }
