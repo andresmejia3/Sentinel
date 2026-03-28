@@ -47,6 +47,11 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 		return err
 	}
 
+	imgData, err := os.ReadFile(absPath)
+	if err != nil {
+		return fmt.Errorf("failed to read image file at %s: %w", absPath, err)
+	}
+
 	workerTimeout, err := time.ParseDuration(opts.WorkerTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to parse worker-timeout '%s': %w", opts.WorkerTimeout, err)
@@ -65,11 +70,6 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 		return &utils.ContextualError{Context: "AI Worker Failed to Start", Err: err}
 	}
 	defer w.Close()
-
-	imgData, err := os.ReadFile(absPath)
-	if err != nil {
-		return fmt.Errorf("failed to read image file at %s: %w", absPath, err)
-	}
 
 	fmt.Fprintln(os.Stderr, "🔍 Analyzing face...")
 	faces, err := w.ProcessScanFrame(imgData)
@@ -127,17 +127,23 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 		return nil
 	}
 
+	// Fallback for unlabeled identities to ensure clear output
+	if identityName == "" {
+		identityName = fmt.Sprintf("Identity %d", identityID)
+	}
+
+	// Retrieve history BEFORE printing match confirmation to ensure UI consistency
+	intervals, err := DB.GetIntervalsForIdentity(ctx, identityID)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve history: %w", err)
+	}
+
 	variantPart := ""
 	if variantName != "Default" && variantName != "" {
 		variantPart = fmt.Sprintf(" (%s)", variantName)
 	}
 
 	fmt.Printf("✅ Found Match: %s%s (ID: %d, Variant: %d)\n", identityName, variantPart, identityID, variantID)
-
-	intervals, err := DB.GetIntervalsForIdentity(ctx, identityID)
-	if err != nil {
-		return fmt.Errorf("failed to retrieve history: %w", err)
-	}
 
 	if len(intervals) == 0 {
 		fmt.Fprintln(os.Stderr, "ℹ️  No historical occurrences found in the database.")
@@ -157,27 +163,33 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	})
 
 	fmt.Println("") // Spacing
-	var lastVideoID string
-	for i, inv := range intervals {
-		// Content Hash (VideoID) is the definitive grouping key.
-		// Even if paths are the same, different IDs mean different videos.
-		if i == 0 || inv.VideoID != lastVideoID {
-			if i > 0 {
-				fmt.Println("")
-			}
-
-			// If the VideoID is different but the path is the same as the last one,
-			// we append a short hash to alert the user that these are different files.
-			header := inv.VideoPath
-			if i > 0 && inv.VideoPath == intervals[i-1].VideoPath {
-				header = fmt.Sprintf("%s [hash: %s]", inv.VideoPath, inv.VideoID[:8])
-			}
-			fmt.Printf("🎬 %s\n", header)
-			lastVideoID = inv.VideoID
+	for groupStart := 0; groupStart < len(intervals); {
+		// Identify the range of results belonging to the same physical video (Path + ID)
+		nextGroup := groupStart + 1
+		for nextGroup < len(intervals) &&
+			intervals[nextGroup].VideoID == intervals[groupStart].VideoID &&
+			intervals[nextGroup].VideoPath == intervals[groupStart].VideoPath {
+			nextGroup++
 		}
 
-		duration := inv.End - inv.Start
-		fmt.Printf("   👉 %s - %s (%.1fs)\n", utils.FmtTime(inv.Start), utils.FmtTime(inv.End), duration)
+		if groupStart > 0 {
+			fmt.Println("") // Spacing between different videos
+		}
+
+		// We always include a short hash (fingerprint) for forensic clarity.
+		displayID := intervals[groupStart].VideoID
+		if len(displayID) > 8 {
+			displayID = displayID[:8]
+		}
+		fmt.Printf("🎬 %s [hash: %s]\n", intervals[groupStart].VideoPath, displayID)
+
+		// Print all chronological occurrences for this specific video group
+		for _, interval := range intervals[groupStart:nextGroup] {
+			duration := interval.End - interval.Start
+			fmt.Printf("   👉 %s - %s (%.1fs)\n", utils.FmtTime(interval.Start), utils.FmtTime(interval.End), duration)
+		}
+
+		groupStart = nextGroup // Advance to the next video group
 	}
 
 	return nil
@@ -200,8 +212,10 @@ func validateFindFlags(imagePath string, opts Options) error {
 	if opts.DetectionThreshold < 0 || opts.DetectionThreshold > 1.0 {
 		return fmt.Errorf("invalid detection threshold: must be between 0.0 and 1.0, got %f", opts.DetectionThreshold)
 	}
-	if _, err := time.ParseDuration(opts.WorkerTimeout); err != nil {
+	if d, err := time.ParseDuration(opts.WorkerTimeout); err != nil {
 		return fmt.Errorf("invalid worker-timeout format: %w", err)
+	} else if d <= 0 {
+		return fmt.Errorf("worker-timeout must be positive")
 	}
 	return nil
 }
