@@ -291,7 +291,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 				RawWidth:           width,
 				RawHeight:          height,
 			}
-			w, err := worker.NewPythonRedactWorker(ctx, id, cfg)
+			pyWorker, err := worker.NewPythonRedactWorker(ctx, id, cfg)
 			if err != nil {
 				select {
 				case errChan <- &utils.ContextualError{Context: "Worker Startup Failed", Err: err}:
@@ -299,7 +299,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 				}
 				return
 			}
-			defer w.Close()
+			defer pyWorker.Close()
 			readyChan <- true
 
 			for {
@@ -310,10 +310,11 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 					if !ok {
 						return
 					}
-					faces, err := w.ProcessRedactFrame(task.Data)
+					faces, err := pyWorker.ProcessRedactFrame(task.Data)
 					if err != nil {
 						frameBufferPool.Put(task.Data) // Return buffer on error
-						utils.ShowError("Python crashed", err, w.Cmd)
+						pyWorker.Close()               // Reap process before diagnostics
+						utils.ShowError("Python crashed", err, pyWorker.Cmd)
 						select {
 						case errChan <- &utils.SilentError{Err: err}:
 						default:

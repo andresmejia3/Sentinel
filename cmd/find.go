@@ -65,16 +65,17 @@ func runFind(ctx context.Context, imagePath string, opts Options) error {
 	}
 
 	// We use ID 0 for this ad-hoc worker
-	w, err := worker.NewPythonScanWorker(ctx, 0, cfg)
+	pyWorker, err := worker.NewPythonScanWorker(ctx, 0, cfg)
 	if err != nil {
 		return &utils.ContextualError{Context: "AI Worker Failed to Start", Err: err}
 	}
-	defer w.Close()
+	defer pyWorker.Close()
 
 	fmt.Fprintln(os.Stderr, "🔍 Analyzing face...")
-	faces, err := w.ProcessScanFrame(imgData)
+	faces, err := pyWorker.ProcessScanFrame(imgData)
 	if err != nil {
-		utils.ShowError("AI processing failed", err, w.Cmd)
+		pyWorker.Close()
+		utils.ShowError("AI processing failed", err, pyWorker.Cmd)
 		return &utils.SilentError{Err: err}
 	}
 

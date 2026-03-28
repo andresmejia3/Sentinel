@@ -279,8 +279,10 @@ func runScan(ctx context.Context, opts Options) error {
 		select {
 		case inflightSem <- struct{}{}:
 		case err := <-errChan:
+			frameBufferPool.Put(buf) // Return buffer to pool on error
 			return err
 		case <-ctx.Done():
+			frameBufferPool.Put(buf) // Return buffer to pool on cancellation
 			return ctx.Err()
 		}
 
@@ -288,8 +290,10 @@ func runScan(ctx context.Context, opts Options) error {
 		case taskChan <- types.FrameTask{Index: virtualIndex, Data: buf}:
 			sentFrames++
 		case err := <-errChan:
+			frameBufferPool.Put(buf)
 			return err
 		case <-ctx.Done():
+			frameBufferPool.Put(buf)
 			return ctx.Err()
 		}
 	}
@@ -394,7 +398,7 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 		readTimeout = 30 * time.Second
 	}
 	cfg.ReadTimeout = readTimeout
-	worker, err := worker.NewPythonScanWorker(ctx, id, cfg)
+	pyWorker, err := worker.NewPythonScanWorker(ctx, id, cfg) // Fix shadowing: 'worker' package vs variable
 	if err != nil {
 		select {
 		case errChan <- &utils.ContextualError{Context: "Worker Startup Failed", Err: err}:
@@ -402,10 +406,10 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 		}
 		return
 	}
-	defer worker.Close()
+	defer pyWorker.Close()
 
 	// Signal to the main thread that this worker is ready
-	pidChan <- worker.Cmd.Process.Pid
+	pidChan <- pyWorker.Cmd.Process.Pid
 	ready <- true
 
 	for {
@@ -416,14 +420,14 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 			if !ok {
 				return
 			}
-			faces, err := worker.ProcessScanFrame(task.Data)
+			faces, err := pyWorker.ProcessScanFrame(task.Data)
 
 			// Return buffer to pool immediately after sending
 			frameBufferPool.Put(task.Data)
 
 			if err != nil {
-				worker.Close()
-				utils.ShowError("Python crashed", err, worker.Cmd)
+				pyWorker.Close() // Reap process before diagnostics so ExitCode is available
+				utils.ShowError("Python crashed", err, pyWorker.Cmd)
 				select {
 				case errChan <- &utils.SilentError{Err: err}:
 				default:
