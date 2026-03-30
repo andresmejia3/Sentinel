@@ -294,10 +294,11 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 			pyWorker, err := worker.NewPythonRedactWorker(ctx, id, cfg)
 			if err != nil {
 				select {
+				case <-ctx.Done():
+					return
 				case errChan <- &utils.ContextualError{Context: "Worker Startup Failed", Err: err}:
-				default:
+					return
 				}
-				return
 			}
 			defer pyWorker.Close()
 			readyChan <- true
@@ -316,10 +317,11 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 						pyWorker.Close()               // Reap process before diagnostics
 						utils.ShowError("Python crashed", err, pyWorker.Cmd)
 						select {
+						case <-ctx.Done():
+							return
 						case errChan <- &utils.SilentError{Err: err}:
-						default:
+							return
 						}
-						return
 					}
 					select {
 					case resultsChan <- redactResult{Index: task.Index, Data: task.Data, Faces: faces}:
@@ -463,8 +465,10 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 					if _, err := encoderIn.Write(data); err != nil {
 						writeError = err
 						select {
+						case <-ctx.Done():
+							return
 						case writeErrChan <- err:
-						default:
+							return
 						}
 					}
 				}
@@ -481,12 +485,16 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 			return ctx.Err()
 		case err := <-errChan:
 			return err
+		case err := <-writeErrChan:
+			return err
 		case res, ok := <-resultsChan:
 			if !ok {
 				goto Flush
 			}
 			buffer[res.Index] = res
 
+			// Keep frame order strict. The in-flight semaphore already bounds memory,
+			// so a missing frame should stall the pipeline rather than be reordered.
 			for {
 				frame, ok := buffer[nextFrame]
 				if !ok {
@@ -521,6 +529,10 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	}
 
 Flush:
+	if len(buffer) > 0 {
+		return fmt.Errorf("redaction stopped with missing frame %d; %d later frame(s) remained buffered", nextFrame, len(buffer))
+	}
+
 	close(writeChan)
 	writerWg.Wait()
 
@@ -674,6 +686,10 @@ func (p *paranoidTracker) pruneTracks(frameIndex, lingerFrames int) {
 		if frameIndex-t.LastSeen <= lingerFrames {
 			active = append(active, t)
 		}
+	}
+	// Zero out the remainder of the underlying array to prevent memory leaks
+	for i := len(active); i < len(p.activeTracks); i++ {
+		p.activeTracks[i] = nil
 	}
 	p.activeTracks = active
 }

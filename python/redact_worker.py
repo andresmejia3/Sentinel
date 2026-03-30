@@ -79,19 +79,15 @@ def process_frame(image_bytes, debug=False) -> bytes:
         face_payloads = []
 
         for face, x1, y1, x2, y2, norm in valid_faces:
-            # Protocol: [Box 16B] [Vec 2048B]
-            # Total 2064 bytes per face.
-            
             if args.inference_mode == 'full':
                 embedding_bytes = (face.embedding / norm).astype('>f4').tobytes()
+                face_payloads.append(b''.join([
+                    struct.pack('>4i', x1, y1, x2, y2),
+                    embedding_bytes
+                ]))
             else:
-                # Send zero-filled vector for detection-only mode to maintain protocol structure
-                embedding_bytes = b'\x00' * 2048
-
-            face_payloads.append(b''.join([
-                struct.pack('>4i', x1, y1, x2, y2),
-                embedding_bytes
-            ]))
+                # Detection-only mode intentionally sends boxes only.
+                face_payloads.append(struct.pack('>4i', x1, y1, x2, y2))
 
         response = [
             b'\x00', # Status OK

@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/andresmejia3/sentinel/internal/types"
@@ -22,6 +23,7 @@ type baseWorker struct {
 	DataPipe    io.ReadCloser
 	readBuf     []byte // Reusable buffer to reduce GC pressure
 	readTimeout time.Duration
+	closeOnce   sync.Once
 }
 
 // ScanWorker is a worker specialized for indexing (thumbnails, quality scores).
@@ -32,6 +34,7 @@ type ScanWorker struct {
 // RedactWorker is a worker specialized for redaction (optimized protocol, no thumbnails).
 type RedactWorker struct {
 	*baseWorker
+	inferenceMode string
 }
 
 // ScanConfig holds configuration for the ScanWorker.
@@ -71,14 +74,15 @@ func newBaseWorker(ctx context.Context, id int, script string, args []string, re
 
 	stdin, err := py.StdinPipe()
 	if err != nil {
-		w.Close() // Prevent FD leak
+		w.Close()
 		r.Close()
 		return nil, fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
 
 	if err := py.Start(); err != nil {
-		w.Close() // Close write end if start fails
+		w.Close()
 		r.Close()
+		stdin.Close()
 		return nil, fmt.Errorf("worker %d failed to start: %w", id, err)
 	}
 
@@ -88,30 +92,47 @@ func newBaseWorker(ctx context.Context, id int, script string, args []string, re
 	// --- Handshake ---
 	// Wait for the "READY" signal, respecting context cancellation to prevent hangs.
 	handshakeResult := make(chan error, 1)
+	readyCtx, readyCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer readyCancel()
+
 	go func() {
 		readyBuf := make([]byte, 5)
 		if _, err := io.ReadFull(r, readyBuf); err != nil {
-			handshakeResult <- fmt.Errorf("failed handshake read: %w", err)
+			select {
+			case handshakeResult <- fmt.Errorf("failed handshake read: %w", err):
+			default:
+			}
 			return
 		}
 		if string(readyBuf) != "READY" {
-			handshakeResult <- fmt.Errorf("bad handshake: expected 'READY', got '%s'", string(readyBuf))
+			select {
+			case handshakeResult <- fmt.Errorf("bad handshake: expected 'READY', got '%s'", string(readyBuf)):
+			default:
+			}
 			return
 		}
-		handshakeResult <- nil
+		select {
+		case handshakeResult <- nil:
+		default:
+		}
 	}()
 
 	select {
 	case err := <-handshakeResult:
 		if err != nil {
 			r.Close()
+			stdin.Close() // Signal EOF to child so it doesn't hang on read()
 			py.Cmd.Wait() // Wait for process to exit to get logs
 			return nil, fmt.Errorf("worker %d handshake failed: %w\nLogs:\n%s", id, err, py.Stderr.String())
 		}
-	case <-ctx.Done():
+	case <-readyCtx.Done():
 		r.Close()
-		py.Cmd.Wait() // Wait for the process to exit (cleaned up by CommandContext) to avoid zombies
-		return nil, fmt.Errorf("worker %d handshake cancelled: %w", id, ctx.Err())
+		stdin.Close() // Ensure pipe is closed on timeout
+		if py.Cmd.Process != nil {
+			py.Cmd.Process.Kill() // Force terminate if stuck during handshake
+		}
+		py.Cmd.Wait()
+		return nil, fmt.Errorf("worker %d handshake timed out or cancelled: %w\nLogs:\n%s", id, readyCtx.Err(), py.Stderr.String())
 	}
 
 	return &baseWorker{
@@ -183,7 +204,10 @@ func NewPythonRedactWorker(ctx context.Context, id int, cfg RedactConfig) (*Reda
 	if err != nil {
 		return nil, err
 	}
-	return &RedactWorker{baseWorker: base}, nil
+	return &RedactWorker{
+		baseWorker:    base,
+		inferenceMode: cfg.InferenceMode,
+	}, nil
 }
 
 // sendFrame writes the frame data to the worker's stdin with a length header.
@@ -390,8 +414,11 @@ func (w *RedactWorker) ProcessRedactFrame(data []byte) ([]types.FaceResult, erro
 	numFaces := binary.BigEndian.Uint32(resp[cursor:])
 	cursor += 4
 
-	// Safety Check for Redaction: Box (16) + Vec (2048) = 2064 bytes minimum
-	minBytesPerFace := 2064
+	// Safety Check for Redaction: Box (16) always exists. Vec (2048) only if not detection-only.
+	minBytesPerFace := 16
+	if w.inferenceMode != "detection-only" {
+		minBytesPerFace += 2048
+	}
 	if int(numFaces)*minBytesPerFace > len(resp)-cursor {
 		return nil, fmt.Errorf("malformed response: stated face count %d exceeds available data", numFaces)
 	}
@@ -411,14 +438,17 @@ func (w *RedactWorker) ProcessRedactFrame(data []byte) ([]types.FaceResult, erro
 		cursor += 16
 
 		// [Vec: 2048B]
-		if cursor+2048 > len(resp) {
-			return nil, fmt.Errorf("malformed response: truncated face vector")
-		}
-		vec64 := allVecs[i*512 : (i+1)*512]
-		for j := 0; j < 512; j++ {
-			bits := binary.BigEndian.Uint32(resp[cursor:])
-			vec64[j] = float64(math.Float32frombits(bits))
-			cursor += 4
+		var vec64 []float64
+		if w.inferenceMode != "detection-only" {
+			if cursor+2048 > len(resp) {
+				return nil, fmt.Errorf("malformed response: truncated face vector")
+			}
+			vec64 = allVecs[i*512 : (i+1)*512]
+			for j := 0; j < 512; j++ {
+				bits := binary.BigEndian.Uint32(resp[cursor:])
+				vec64[j] = float64(math.Float32frombits(bits))
+				cursor += 4
+			}
 		}
 
 		// No Quality, No Thumb
@@ -435,7 +465,18 @@ func (w *RedactWorker) ProcessRedactFrame(data []byte) ([]types.FaceResult, erro
 
 // Close cleans up the worker resources, closing pipes and waiting for the process to exit.
 func (w *baseWorker) Close() {
-	w.Stdin.Close()
-	w.DataPipe.Close()
-	w.Cmd.Wait()
+	if w == nil {
+		return
+	}
+	w.closeOnce.Do(func() {
+		if w.Stdin != nil {
+			w.Stdin.Close()
+		}
+		if w.DataPipe != nil {
+			w.DataPipe.Close()
+		}
+		if w.Cmd != nil && w.Cmd.Process != nil {
+			w.Cmd.Wait()
+		}
+	})
 }

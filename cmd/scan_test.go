@@ -9,11 +9,36 @@ import (
 	"time"
 
 	"github.com/andresmejia3/sentinel/internal/store"
+	"github.com/andresmejia3/sentinel/internal/types"
 	"github.com/andresmejia3/sentinel/internal/utils"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
+
+type scanDBStub struct {
+	matchVariantID   int
+	matchIdentityID  int
+	matchIdentity    string
+	matchVariantName string
+	matchErr         error
+}
+
+func (s scanDBStub) FindClosestIdentity(ctx context.Context, vec []float64, threshold float64) (int, int, string, string, error) {
+	return s.matchVariantID, s.matchIdentityID, s.matchIdentity, s.matchVariantName, s.matchErr
+}
+
+func (s scanDBStub) FindTopIdentities(ctx context.Context, vec []float64, limit int) ([]store.IdentityMatch, error) {
+	return nil, nil
+}
+
+func (s scanDBStub) CreateIdentity(ctx context.Context, vec []float64, count int) (int, int, error) {
+	return 0, 0, fmt.Errorf("unexpected CreateIdentity call in test")
+}
+
+func (s scanDBStub) UpdateIdentity(ctx context.Context, id int, newVec []float64, newCount int) error {
+	return fmt.Errorf("unexpected UpdateIdentity call in test")
+}
 
 func TestCosineDist(t *testing.T) {
 	tests := []struct {
@@ -86,7 +111,7 @@ func TestScanPersistence(t *testing.T) {
 		return
 	}()
 	if err != nil {
-		t.Fatalf("Docker not available, cannot run integration test: %v", err)
+		t.Skipf("Docker not available, skipping integration test: %v", err)
 	}
 
 	// Start Postgres Container
@@ -194,6 +219,7 @@ func TestValidateScanFlags(t *testing.T) {
 				InputPath:      tmpFile.Name(),
 				NthFrame:       1,
 				MatchThreshold: 0.5,
+				BlipDuration:   "100ms",
 				GracePeriod:    "1s",
 				WorkerTimeout:  "30s",
 			},
@@ -230,6 +256,20 @@ func TestValidateScanFlags(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "NoStaging cannot be combined with review file",
+			opts: Options{
+				InputPath:      tmpFile.Name(),
+				NthFrame:       1,
+				MatchThreshold: 0.5,
+				BlipDuration:   "100ms",
+				GracePeriod:    "1s",
+				WorkerTimeout:  "30s",
+				NoStaging:      true,
+				ReviewFile:     "scan.review.yaml",
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -248,6 +288,183 @@ func TestValidateScanFlags(t *testing.T) {
 			os.Stderr = oldStderr
 			r.Close()
 		})
+	}
+}
+
+func TestAggregateFrameResultsPrunesExpiredTracksBeforeMatching(t *testing.T) {
+	vec := make([]float64, embeddingDim)
+	vec[0] = 1.0
+
+	stale := newActiveTrack(42, 42, 0, vec, []byte("thumb"), 0.9, "Identity 42", "Default", true, []int{0, 0, 10, 10})
+	stale.LastFrame = 0
+	tracks := []*activeTrack{stale}
+
+	var persisted []*activeTrack
+	idNames := map[int]identityNameData{42: {IdentityName: "Identity 42", VariantName: "Default"}}
+	variantToIdentityID := map[int]int{42: 42}
+	tempIDCounter := -1
+
+	frame := scanResult{
+		Index: 25,
+		Faces: []types.FaceResult{{
+			Loc:     []int{0, 0, 10, 10},
+			Vec:     vec,
+			Thumb:   []byte("new"),
+			Quality: 0.8,
+		}},
+	}
+
+	aggregateFrameResults(
+		context.Background(),
+		frame,
+		&tracks,
+		new(int),
+		Options{MatchThreshold: 0.6},
+		scanDBStub{matchVariantID: -1},
+		make(chan error, 1),
+		variantToIdentityID,
+		idNames,
+		&tempIDCounter,
+		10,
+		func(t *activeTrack) { persisted = append(persisted, t) },
+	)
+
+	if len(persisted) != 1 || persisted[0].ID != 42 {
+		t.Fatalf("expected stale track 42 to be persisted before matching, got %+v", persisted)
+	}
+	if len(tracks) != 1 {
+		t.Fatalf("expected exactly one active track after processing, got %d", len(tracks))
+	}
+	if tracks[0].ID >= 0 {
+		t.Fatalf("expected reappearing face to start a new pending track, got ID %d", tracks[0].ID)
+	}
+}
+
+func TestAggregateFrameResultsDoesNotDropFaceWhenBestDBMatchIsAlreadyActive(t *testing.T) {
+	activeVec := make([]float64, embeddingDim)
+	activeVec[0] = 1.0
+
+	existingTrack := newActiveTrack(7, 7, 0, activeVec, []byte("thumb"), 0.9, "Identity 7", "Default", true, []int{0, 0, 10, 10})
+	tracks := []*activeTrack{existingTrack}
+
+	idNames := map[int]identityNameData{7: {IdentityName: "Identity 7", VariantName: "Default"}}
+	variantToIdentityID := map[int]int{7: 7}
+	tempIDCounter := -1
+	totalDetections := 0
+
+	newFaceVec := make([]float64, embeddingDim)
+	newFaceVec[1] = 1.0
+
+	frame := scanResult{
+		Index: 1,
+		Faces: []types.FaceResult{{
+			Loc:     []int{20, 20, 40, 40},
+			Vec:     newFaceVec,
+			Thumb:   []byte("new"),
+			Quality: 0.7,
+		}},
+	}
+
+	aggregateFrameResults(
+		context.Background(),
+		frame,
+		&tracks,
+		&totalDetections,
+		Options{MatchThreshold: 0.6},
+		scanDBStub{
+			matchVariantID:   7,
+			matchIdentityID:  7,
+			matchIdentity:    "Identity 7",
+			matchVariantName: "Default",
+		},
+		make(chan error, 1),
+		variantToIdentityID,
+		idNames,
+		&tempIDCounter,
+		10,
+		func(*activeTrack) {},
+	)
+
+	if totalDetections != 1 {
+		t.Fatalf("expected one detection to be processed, got %d", totalDetections)
+	}
+	if len(tracks) != 2 {
+		t.Fatalf("expected active track plus a new pending track, got %d track(s)", len(tracks))
+	}
+	if tracks[1].ID >= 0 {
+		t.Fatalf("expected second face to become a pending track, got ID %d", tracks[1].ID)
+	}
+}
+
+func TestAggregateFrameResultsResolvesTrackConflictsWithoutFaceOrderBias(t *testing.T) {
+	trackVec := make([]float64, embeddingDim)
+	trackVec[0] = 1.0
+
+	existingTrack := newActiveTrack(11, 11, 0, trackVec, []byte("existing"), 0.8, "Identity 11", "Default", true, []int{0, 0, 10, 10})
+	tracks := []*activeTrack{existingTrack}
+
+	idNames := map[int]identityNameData{11: {IdentityName: "Identity 11", VariantName: "Default"}}
+	variantToIdentityID := map[int]int{11: 11}
+	tempIDCounter := -1
+	totalDetections := 0
+
+	weakerVec := make([]float64, embeddingDim)
+	weakerVec[0] = 0.8
+	weakerVec[1] = 0.6
+
+	strongerVec := make([]float64, embeddingDim)
+	strongerVec[0] = 1.0
+
+	frame := scanResult{
+		Index: 1,
+		Faces: []types.FaceResult{
+			{
+				Loc:     []int{20, 20, 40, 40},
+				Vec:     weakerVec,
+				Thumb:   []byte("weaker"),
+				Quality: 0.7,
+			},
+			{
+				Loc:     []int{50, 50, 70, 70},
+				Vec:     strongerVec,
+				Thumb:   []byte("stronger"),
+				Quality: 0.95,
+			},
+		},
+	}
+
+	aggregateFrameResults(
+		context.Background(),
+		frame,
+		&tracks,
+		&totalDetections,
+		Options{MatchThreshold: 0.6},
+		scanDBStub{matchVariantID: -1},
+		make(chan error, 1),
+		variantToIdentityID,
+		idNames,
+		&tempIDCounter,
+		10,
+		func(*activeTrack) {},
+	)
+
+	if totalDetections != 2 {
+		t.Fatalf("expected two detections to be processed, got %d", totalDetections)
+	}
+	if len(tracks) != 2 {
+		t.Fatalf("expected one resolved track and one pending conflict track, got %d tracks", len(tracks))
+	}
+	if tracks[0].ID != 11 {
+		t.Fatalf("expected existing track to keep ID 11, got %d", tracks[0].ID)
+	}
+	if tracks[0].LastScore != 0.95 {
+		t.Fatalf("expected strongest claimant to win the active track, got last score %.2f", tracks[0].LastScore)
+	}
+	if tracks[1].ID >= 0 {
+		t.Fatalf("expected weaker conflicting face to become a pending track, got ID %d", tracks[1].ID)
+	}
+	if tracks[1].LastScore != 0.7 {
+		t.Fatalf("expected pending track to preserve weaker conflicting face, got last score %.2f", tracks[1].LastScore)
 	}
 }
 

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,7 +33,7 @@ func TestStoreIntegration(t *testing.T) {
 		return
 	}()
 	if err != nil {
-		t.Fatalf("Docker not available, cannot run integration test: %v", err)
+		t.Skipf("Docker not available, skipping integration test: %v", err)
 	}
 
 	// Start Postgres Container with pgvector
@@ -49,6 +50,9 @@ func TestStoreIntegration(t *testing.T) {
 		testcontainers.WithLogger(noopLogger{}),
 	)
 	if err != nil {
+		if isDockerUnavailable(err) {
+			t.Skipf("Docker not available, skipping integration test: %v", err)
+		}
 		t.Fatalf("Failed to start postgres container: %v", err)
 	}
 	defer func() {
@@ -118,7 +122,9 @@ func TestStoreIntegration(t *testing.T) {
 	// or just check the DB directly. For this test, let's assume we know the Master ID is 1 (since it's the first).
 	// A better way is to check the variant update logic.
 	// Let's use FindClosestIdentity to verify the vector has moved.
-	matchID, _, _, _, err = s.FindClosestIdentity(ctx, vecB, 0.01)
+	// After averaging vecA and vecB, the stored embedding is no longer an
+	// exact match for vecB, so the threshold needs to allow that expected drift.
+	matchID, _, _, _, err = s.FindClosestIdentity(ctx, vecB, 0.3)
 	if err != nil {
 		t.Fatalf("FindClosestIdentity failed after update: %v", err)
 	}
@@ -147,6 +153,272 @@ func TestStoreIntegration(t *testing.T) {
 	}
 }
 
+func TestRevertCommitRestoresVideoState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	err := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("testcontainers panicked: %v", r)
+			}
+		}()
+		_, err = testcontainers.NewDockerClientWithOpts(ctx)
+		return
+	}()
+	if err != nil {
+		t.Skipf("Docker not available, skipping integration test: %v", err)
+	}
+
+	pgContainer, err := postgres.Run(ctx,
+		"pgvector/pgvector:pg16",
+		postgres.WithDatabase("sentinel_test"),
+		postgres.WithUsername("user"),
+		postgres.WithPassword("password"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(5*time.Second)),
+		testcontainers.WithLogger(noopLogger{}),
+	)
+	if err != nil {
+		if isDockerUnavailable(err) {
+			t.Skipf("Docker not available, skipping integration test: %v", err)
+		}
+		t.Fatalf("Failed to start postgres container: %v", err)
+	}
+	defer func() {
+		if err := pgContainer.Terminate(ctx); err != nil {
+			t.Fatalf("Failed to terminate container: %v", err)
+		}
+	}()
+
+	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("Failed to get connection string: %v", err)
+	}
+
+	s, err := New(ctx, connStr)
+	if err != nil {
+		t.Fatalf("Failed to connect to store: %v", err)
+	}
+	defer s.Close(ctx)
+
+	originalVec := make([]float64, 512)
+	originalVec[0] = 1.0
+	originalVariantID, _, err := s.CreateIdentity(ctx, originalVec, 3)
+	if err != nil {
+		t.Fatalf("CreateIdentity failed: %v", err)
+	}
+
+	const videoID = "vid_restore"
+	if err := s.EnsureVideoMetadata(ctx, videoID, "/tmp/original.mp4"); err != nil {
+		t.Fatalf("EnsureVideoMetadata failed: %v", err)
+	}
+	if err := s.InsertInterval(ctx, videoID, 1.0, 2.5, 3, originalVariantID); err != nil {
+		t.Fatalf("InsertInterval failed: %v", err)
+	}
+
+	newVec := make([]float64, 512)
+	newVec[1] = 1.0
+	commitID := "commit_restore_test"
+	actions := []CommitAction{
+		{
+			TrackID: "Track_1",
+			Action:  "new_identity",
+			Vector:  newVec,
+			Count:   4,
+		},
+	}
+	intervals := []CommitInterval{
+		{
+			TrackID:   "Track_1",
+			Start:     10.0,
+			End:       12.0,
+			FaceCount: 4,
+		},
+	}
+
+	if err := s.ApplyCommitBatch(ctx, commitID, actions, videoID, "/tmp/updated.mp4", intervals); err != nil {
+		t.Fatalf("ApplyCommitBatch failed: %v", err)
+	}
+
+	var committedPath string
+	if err := s.pool.QueryRow(ctx, "SELECT path FROM video_metadata WHERE id = $1", videoID).Scan(&committedPath); err != nil {
+		t.Fatalf("failed to read committed metadata: %v", err)
+	}
+	if committedPath != "/tmp/updated.mp4" {
+		t.Fatalf("video path after commit = %q, want %q", committedPath, "/tmp/updated.mp4")
+	}
+
+	var committedIntervals int
+	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM face_intervals WHERE video_id = $1", videoID).Scan(&committedIntervals); err != nil {
+		t.Fatalf("failed to count committed intervals: %v", err)
+	}
+	if committedIntervals != 1 {
+		t.Fatalf("expected 1 committed interval, got %d", committedIntervals)
+	}
+
+	if err := s.RevertCommit(ctx, commitID); err != nil {
+		t.Fatalf("RevertCommit failed: %v", err)
+	}
+
+	var restoredPath string
+	if err := s.pool.QueryRow(ctx, "SELECT path FROM video_metadata WHERE id = $1", videoID).Scan(&restoredPath); err != nil {
+		t.Fatalf("failed to read restored metadata: %v", err)
+	}
+	if restoredPath != "/tmp/original.mp4" {
+		t.Fatalf("video path after rollback = %q, want %q", restoredPath, "/tmp/original.mp4")
+	}
+
+	var start, end float64
+	var faceCount, variantID int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT start_time, end_time, face_count, variant_id
+		FROM face_intervals
+		WHERE video_id = $1
+	`, videoID).Scan(&start, &end, &faceCount, &variantID); err != nil {
+		t.Fatalf("failed to load restored interval: %v", err)
+	}
+	if start != 1.0 || end != 2.5 || faceCount != 3 || variantID != originalVariantID {
+		t.Fatalf("restored interval = (%v, %v, %d, %d), want (%v, %v, %d, %d)", start, end, faceCount, variantID, 1.0, 2.5, 3, originalVariantID)
+	}
+
+	var variantCount int
+	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM variants").Scan(&variantCount); err != nil {
+		t.Fatalf("failed to count variants after rollback: %v", err)
+	}
+	if variantCount != 1 {
+		t.Fatalf("expected rollback to remove newly created variant, got %d variants", variantCount)
+	}
+}
+
+func TestRevertCommitRejectsOlderVideoCommitWhenNewerOneIsActive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	err := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("testcontainers panicked: %v", r)
+			}
+		}()
+		_, err = testcontainers.NewDockerClientWithOpts(ctx)
+		return
+	}()
+	if err != nil {
+		t.Skipf("Docker not available, skipping integration test: %v", err)
+	}
+
+	pgContainer, err := postgres.Run(ctx,
+		"pgvector/pgvector:pg16",
+		postgres.WithDatabase("sentinel_test"),
+		postgres.WithUsername("user"),
+		postgres.WithPassword("password"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(5*time.Second)),
+		testcontainers.WithLogger(noopLogger{}),
+	)
+	if err != nil {
+		if isDockerUnavailable(err) {
+			t.Skipf("Docker not available, skipping integration test: %v", err)
+		}
+		t.Fatalf("Failed to start postgres container: %v", err)
+	}
+	defer func() {
+		if err := pgContainer.Terminate(ctx); err != nil {
+			t.Fatalf("Failed to terminate container: %v", err)
+		}
+	}()
+
+	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("Failed to get connection string: %v", err)
+	}
+
+	s, err := New(ctx, connStr)
+	if err != nil {
+		t.Fatalf("Failed to connect to store: %v", err)
+	}
+	defer s.Close(ctx)
+
+	baseVec := make([]float64, 512)
+	baseVec[0] = 1.0
+	baseVariantID, _, err := s.CreateIdentity(ctx, baseVec, 2)
+	if err != nil {
+		t.Fatalf("CreateIdentity failed: %v", err)
+	}
+
+	const videoID = "vid_shared"
+	if err := s.EnsureVideoMetadata(ctx, videoID, "/tmp/original.mp4"); err != nil {
+		t.Fatalf("EnsureVideoMetadata failed: %v", err)
+	}
+	if err := s.InsertInterval(ctx, videoID, 0.0, 1.0, 2, baseVariantID); err != nil {
+		t.Fatalf("InsertInterval failed: %v", err)
+	}
+
+	vecA := make([]float64, 512)
+	vecA[1] = 1.0
+	if err := s.ApplyCommitBatch(ctx, "commit_a", []CommitAction{{
+		TrackID: "Track_A",
+		Action:  "new_identity",
+		Vector:  vecA,
+		Count:   3,
+	}}, videoID, "/tmp/a.mp4", []CommitInterval{{
+		TrackID:   "Track_A",
+		Start:     5.0,
+		End:       6.0,
+		FaceCount: 3,
+	}}); err != nil {
+		t.Fatalf("ApplyCommitBatch(commit_a) failed: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	vecB := make([]float64, 512)
+	vecB[2] = 1.0
+	if err := s.ApplyCommitBatch(ctx, "commit_b", []CommitAction{{
+		TrackID: "Track_B",
+		Action:  "new_identity",
+		Vector:  vecB,
+		Count:   4,
+	}}, videoID, "/tmp/b.mp4", []CommitInterval{{
+		TrackID:   "Track_B",
+		Start:     8.0,
+		End:       9.0,
+		FaceCount: 4,
+	}}); err != nil {
+		t.Fatalf("ApplyCommitBatch(commit_b) failed: %v", err)
+	}
+
+	err = s.RevertCommit(ctx, "commit_a")
+	if err == nil {
+		t.Fatal("expected rollback of older commit to be rejected")
+	}
+	if !strings.Contains(err.Error(), "newer active commit") {
+		t.Fatalf("unexpected rollback error: %v", err)
+	}
+}
+
 type noopLogger struct{}
 
 func (n noopLogger) Printf(format string, v ...interface{}) {}
+
+func isDockerUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "cannot connect to the docker daemon") ||
+		strings.Contains(msg, "docker.sock") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "permission denied")
+}

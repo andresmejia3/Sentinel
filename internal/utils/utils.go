@@ -55,7 +55,7 @@ func ShowError(context string, err error, s *SafeCommand) {
 			fmt.Fprintf(os.Stderr, "\n📉 MEMORY ERROR: The worker was killed by the OS (OOM).\n")
 			fmt.Fprintf(os.Stderr, "   Your Docker container ran out of RAM spawning multiple AI models.\n")
 			fmt.Fprintf(os.Stderr, "   👉 SOLUTION: Run with fewer engines using the '-e' flag.\n")
-			fmt.Fprintf(os.Stderr, "      Example: ./sentinel scan -i ... -e 1\n")
+			fmt.Fprintf(os.Stderr, "      Example: sentinel scan -i ... -e 1\n")
 		}
 	}
 
@@ -151,7 +151,7 @@ func NewFFmpegRawDecoder(ctx context.Context, inputPath string) *exec.Cmd {
 		"-vcodec", "rawvideo", "-")
 }
 
-// NewFFmpegEncoder creates a command to encode raw JPEG frames from Stdin into a video file.
+// NewFFmpegEncoder creates a command to encode raw RGBA frames from stdin into a video file.
 func NewFFmpegEncoder(ctx context.Context, audioInputPath, outputPath string, fps float64, width, height int) *exec.Cmd {
 	args := []string{
 		"-y", // Overwrite output
@@ -162,9 +162,14 @@ func NewFFmpegEncoder(ctx context.Context, audioInputPath, outputPath string, fp
 		"-i", "-", // Read from Stdin
 	}
 
-	// If an audio source is provided, copy the audio stream
+	// If an audio source is provided, add it with a container-safe codec choice.
 	if audioInputPath != "" {
-		args = append(args, "-i", audioInputPath, "-map", "0:v", "-map", "1:a?", "-c:a", "copy")
+		args = append(args, "-i", audioInputPath, "-map", "0:v", "-map", "1:a?")
+		if needsAudioTranscode(outputPath) {
+			args = append(args, "-c:a", "aac", "-b:a", "192k")
+		} else {
+			args = append(args, "-c:a", "copy")
+		}
 	}
 
 	args = append(args, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p", outputPath)
@@ -172,8 +177,28 @@ func NewFFmpegEncoder(ctx context.Context, audioInputPath, outputPath string, fp
 	return exec.CommandContext(ctx, "ffmpeg", args...)
 }
 
+func needsAudioTranscode(outputPath string) bool {
+	switch strings.ToLower(filepath.Ext(outputPath)) {
+	case ".mp4", ".m4v", ".mov":
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	videoIDChunkSize       int64 = 1 << 20  // 1MB
+	videoIDFullHashMax     int64 = 16 << 20 // Small files are cheap enough to hash entirely.
+	videoIDLargeFileCutoff int64 = 8 << 30  // 8GB+
+)
+
 // GenerateVideoID creates a deterministic hash for the video file
-// based on its path, size, and modification time.
+// using a fast sampled fingerprint for large videos.
+//
+// We intentionally hash the basename, file size, and 8-16 evenly spaced 1MB
+// chunks instead of the full file for large inputs. That keeps startup snappy
+// on multi-hour videos while being much stronger than the old head/tail-only
+// fingerprint.
 func GenerateVideoID(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -186,58 +211,121 @@ func GenerateVideoID(path string) (string, error) {
 		return "", err
 	}
 
-	// Read first 32KB (Header)
-	headBuf := make([]byte, 32*1024)
-	nHead, err := f.Read(headBuf)
-	if err != nil && err != io.EOF {
-		return "", err
-	}
-
-	// Read last 32KB (Footer/Metadata)
-	// Useful because some formats put critical unique info at the end
-	tailBuf := make([]byte, 32*1024)
-	var nTail int
-	if info.Size() > 64*1024 {
-		if _, err := f.Seek(-32*1024, io.SeekEnd); err == nil {
-			nTail, _ = f.Read(tailBuf)
-		}
-	}
-
-	// Hash: Filename + Size + Header + Footer
-	// We use filepath.Base to allow moving the file without changing ID
 	hash := sha256.New()
 	fmt.Fprintf(hash, "%s|%d|", strings.ToLower(filepath.Base(path)), info.Size())
-	hash.Write(headBuf[:nHead])
-	hash.Write(tailBuf[:nTail])
+
+	if info.Size() <= videoIDFullHashMax {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return "", err
+		}
+		if _, err := io.Copy(hash, f); err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(hash.Sum(nil)), nil
+	}
+
+	chunkCount := videoIDSampleCount(info.Size())
+	for _, offset := range videoIDChunkOffsets(info.Size(), chunkCount) {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return "", err
+		}
+		fmt.Fprintf(hash, "|chunk@%d|", offset)
+		if _, err := io.CopyN(hash, f, videoIDChunkSize); err != nil {
+			return "", err
+		}
+	}
 
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-// GetVideoFPS returns the average frame rate of the video.
+func videoIDSampleCount(size int64) int {
+	if size >= videoIDLargeFileCutoff {
+		return 16
+	}
+	return 8
+}
+
+func videoIDChunkOffsets(size int64, chunkCount int) []int64 {
+	if chunkCount <= 0 {
+		return nil
+	}
+
+	maxOffset := size - videoIDChunkSize
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+
+	offsets := make([]int64, 0, chunkCount)
+	if chunkCount == 1 || maxOffset == 0 {
+		return append(offsets, 0)
+	}
+
+	for i := 0; i < chunkCount; i++ {
+		offset := (int64(i) * maxOffset) / int64(chunkCount-1)
+		offsets = append(offsets, offset)
+	}
+	return offsets
+}
+
+func parseFPSString(raw string) (float64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "N/A" {
+		return 0, fmt.Errorf("invalid framerate format: %s", raw)
+	}
+
+	parts := strings.Split(raw, "/")
+	if len(parts) == 1 {
+		return strconv.ParseFloat(parts[0], 64)
+	}
+	if len(parts) == 2 {
+		num, err1 := strconv.ParseFloat(parts[0], 64)
+		den, err2 := strconv.ParseFloat(parts[1], 64)
+		if err1 != nil || err2 != nil || den == 0 {
+			return 0, fmt.Errorf("invalid framerate format: %s", raw)
+		}
+		return num / den, nil
+	}
+	return 0, fmt.Errorf("unknown framerate format: %s", raw)
+}
+
+// GetVideoFPS returns the average frame rate of the video, falling back to
+// the nominal stream rate only when the average is unavailable or invalid.
 func GetVideoFPS(ctx context.Context, path string) (float64, error) {
 	if _, err := exec.LookPath("ffprobe"); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠️  ffprobe not found. It is required for processing.\n")
 		return 0, err
 	}
-	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", path)
+
+	type fpsProbeOutput struct {
+		Streams []struct {
+			AvgFrameRate string `json:"avg_frame_rate"`
+			RFrameRate   string `json:"r_frame_rate"`
+		} `json:"streams"`
+	}
+
+	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate,r_frame_rate", "-of", "json", path)
 	out, err := cmd.Output()
 	if err != nil {
 		return 0, err
 	}
 
-	// Output is typically "30/1" or "30000/1001"
-	parts := strings.Split(strings.TrimSpace(string(out)), "/")
-	if len(parts) == 1 {
-		return strconv.ParseFloat(parts[0], 64)
-	} else if len(parts) == 2 {
-		num, err1 := strconv.ParseFloat(parts[0], 64)
-		den, err2 := strconv.ParseFloat(parts[1], 64)
-		if err1 != nil || err2 != nil || den == 0 {
-			return 0, fmt.Errorf("invalid framerate format: %s", string(out))
-		}
-		return num / den, nil
+	var res fpsProbeOutput
+	if err := json.Unmarshal(out, &res); err != nil {
+		return 0, fmt.Errorf("failed to parse ffprobe framerate output: %w", err)
 	}
-	return 0, fmt.Errorf("unknown framerate format: %s", string(out))
+	if len(res.Streams) == 0 {
+		return 0, fmt.Errorf("ffprobe returned no video stream data")
+	}
+
+	stream := res.Streams[0]
+	if fps, err := parseFPSString(stream.AvgFrameRate); err == nil && fps > 0 && !math.IsNaN(fps) && !math.IsInf(fps, 0) {
+		return fps, nil
+	}
+	if fps, err := parseFPSString(stream.RFrameRate); err == nil && fps > 0 && !math.IsNaN(fps) && !math.IsInf(fps, 0) {
+		return fps, nil
+	}
+
+	return 0, fmt.Errorf("invalid framerate data from ffprobe: avg=%q r=%q", stream.AvgFrameRate, stream.RFrameRate)
 }
 
 // GetVideoDimensions returns the width and height of the video stream.

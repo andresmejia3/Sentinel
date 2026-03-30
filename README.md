@@ -1,226 +1,348 @@
-# Sentinel: Enterprise Biometric Security & Redaction Engine
+# Sentinel: Biometric Video Indexing and Redaction
 
 [![CI Pipeline](https://github.com/andresmejia3/sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/andresmejia3/sentinel/actions)
+[![Go Report Card](https://goreportcard.com/badge/github.com/andresmejia3/sentinel)](https://goreportcard.com/report/github.com/andresmejia3/sentinel)
 [![Go Version](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go)](https://go.dev/)
 [![Python Version](https://img.shields.io/badge/Python-3.11-3776AB?logo=python)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED?logo=docker)](https://www.docker.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-**Sentinel** is a production-grade, hybrid-architecture system designed to bridge the gap between high-performance systems engineering and state-of-the-art computer vision. It transforms unstructured **"Dark Data"** (raw video) into searchable mathematical vectors.
+Sentinel is a high-performance biometric video indexing and redaction engine built with a hybrid Go + Python architecture. It scans video, extracts face embeddings with InsightFace, stores them in PostgreSQL with `pgvector`, and supports human-reviewed identity indexing, similarity search, and targeted redaction.
 
-Traditional search engines cannot "see" inside video files. Sentinel addresses this by indexing faces into a **PostgreSQL (pgvector)** database, enabling sub-second identity retrieval across thousands of hours of footage. It features a unique hybrid AI-Tracking pipeline to ensure 100% redaction continuity without sacrificing performance.
+Under the hood, Sentinel is designed like a real systems project: Go orchestrates concurrency, worker lifecycles, FFmpeg streaming, and database coordination, while persistent Python workers handle ML inference over a custom binary IPC pipeline. The result is a zero-disk frame-processing workflow built for long-form video, human-in-the-loop accuracy, and production-style data integrity.
 
----
+## Highlights
 
-## 🚀 Engineering Philosophy & Architecture
+- Zero-Disk Video Pipeline: Streams frames from FFmpeg through Go into warm Python workers without writing temporary frame images to disk.
+- Hybrid Go + Python Architecture: Uses Go for concurrency, orchestration, cancellation, and database coordination, while Python stays focused on InsightFace inference.
+- Warm Worker Pool + Binary IPC: Keeps inference workers alive and communicates over a custom binary protocol so the system avoids per-frame Python startup and model warmup overhead.
+- Human-in-the-Loop Identity Review: `scan` stages review YAML by default so ambiguous matches can be reviewed before they affect stored identities or intervals.
+- Representative Thumbnail Selection via Embedding Centroid: Sentinel does not just keep the sharpest face crop. For each track, it retains high-quality candidate frames, maintains a running mean embedding, and then selects the candidate whose embedding is closest to that centroid. That makes the chosen thumbnail the most representative view of that track or appearance cluster, not just the loudest frame. Because the selection happens in embedding space instead of using hand-tuned pose-specific rules, the same logic works across different people, looks, poses, lighting conditions, and variants.
+- Transaction-Safe Commit / Rollback: Reviewed identity updates are applied with a ledgered vector-delta model so changes can be committed atomically and rolled back cleanly.
+- Targeted Redaction with Temporal Safety Net: Supports linger and paranoid modes so temporary detection loss is less likely to cause privacy leaks.
 
-Sentinel was built to demonstrate **Systems Programming** proficiency, specifically focusing on the interoperability between **Go** (for high-concurrency orchestration) and **Python** (for tensor-heavy inference).
+## What Sentinel Actually Does
 
-### 1. The Hybrid Architecture (Go + Python)
-Instead of a monolithic Python application (which suffers from the GIL) or a pure C++ application (which lacks ML flexibility), Sentinel utilizes a **Centralized Worker-Pool Pattern**:
+- Go handles orchestration, worker lifecycle, FFmpeg streaming, concurrency, and database access.
+- Python handles face detection and recognition through InsightFace.
+- FFmpeg streams frames through pipes instead of writing them to disk first.
+- PostgreSQL stores 512-dimensional face embeddings plus appearance intervals.
 
-*   **The Orchestrator (Go):** Manages the lifecycle of the application, handles OS signals, manages database connections pool, and spawns worker processes.
-*   **The Inference Engine (Python):** Runs as persistent subprocesses. We avoid the overhead of Python startup time by keeping workers "warm" and communicating via **Standard Streams (Stdin/Stdout)**.
-*   **IPC Protocol:** A custom binary protocol (4-byte Big-Endian headers) ensures strict message framing between Go and Python, preventing stream desynchronization.
+The worker IPC is a custom binary protocol. Go sends frames over stdin and reads structured responses from a dedicated side pipe, not from normal stdout.
 
-### 2. Zero-Disk I/O Pipeline
-Traditional video processing often writes frames to disk (`.jpg`) before reading them back for inference. Sentinel utilizes **Unix Pipes** to stream raw frame bytes directly from **FFmpeg** $\rightarrow$ **Go** $\rightarrow$ **Python**, keeping data entirely in RAM. This **Zero-Disk I/O** approach maximizes throughput and prevents **disk burnout** (NVMe wear) associated with high-frequency frame writes.
+## Default Workflow
 
-### 3. Vector Search at Scale
-Identities are stored as 512-dimensional vectors in **PostgreSQL** using the `pgvector` extension. We utilize **HNSW (Hierarchical Navigable Small World)** indexing to enable sub-millisecond similarity searches across millions of vectors.
+Sentinel is review-first by default.
 
----
+1. Run `sentinel scan`.
+2. Sentinel writes a review YAML file and thumbnails.
+3. You review or edit the file.
+4. Run `sentinel commit <review.yaml>` to apply it to Postgres.
 
-## 🛠 Tech Stack
+This is the safest workflow because it keeps ambiguous matches out of the database until a human confirms them.
 
-The system is built on a "Right Tool for the Job" philosophy. We use **Go 1.25** to leverage the latest scheduler improvements for high-concurrency orchestration, while sticking to **Python 3.11** for the inference engine to ensure maximum compatibility with the stable ML ecosystem.
+### Important: `--no-staging` Is Unsafe
 
-| Component | Technology | Justification |
-| :--- | :--- | :--- |
-| **Core Logic** | **Go 1.25** | Goroutines for parallel processing; static typing for reliability. |
-| **AI Inference** | **Python 3.11** | Access to `InsightFace` and `ONNX Runtime`. |
-| **Acceleration** | **CUDA / ONNX** | GPU-accelerated inference for real-time performance. |
-| **Database** | **PostgreSQL 16** | ACID compliance combined with vector search capabilities. |
-| **Containerization** | **Docker** | Multi-stage builds for small, secure production images. |
-| **CI/CD** | **GitHub Actions** | Automated testing, linting, and build verification. |
+`sentinel scan --no-staging` skips review and writes identities and intervals directly to Postgres.
 
----
+That mode is intentionally faster and riskier. In plain terms, it can save the wrong person under a new identity or variant when a scene is ambiguous.
 
-## ⚡ Key Features
+Examples of when that can happen:
 
-*   **Temporal Redaction (Linger):** Implements a temporal buffer for redaction. If a targeted face is momentarily lost by the tracker, the system continues to redact its last known position to prevent privacy leaks (flicker).
-*   **Paranoid Redaction:** An optional safety net that blurs *all* detected faces if a targeted identity is temporarily lost, ensuring maximum privacy at the cost of broader redaction.
-*   **Tracking by Detection:** Utilizes high-frequency re-identification (every $N$ frames) combined with temporal smoothing to maintain identity continuity without the drift associated with pure visual trackers.
-*   **Interval Debouncing:** Optimizes storage by merging contiguous detections into time intervals (e.g., "Person A: 00:01:05 - 00:01:10") rather than storing per-frame rows.
+- crowded scenes with many similar-looking people
+- occlusion or fast motion
+- difficult lighting
+- scene cuts and unstable detections
+- one person getting split into multiple unknown identities
 
----
+If you care about correctness, use the default staged workflow. Treat `--no-staging` as a convenience mode for quick experiments, not the safe production path.
 
-## 📚 Command Reference
+## Architecture
 
-Sentinel exposes a robust CLI interface. Below are the available commands and their flags.
+### Hybrid Design
+
+- Go: orchestration, cancellation, worker pools, DB writes, CLI
+- Python: InsightFace inference
+- FFmpeg: decode and encode video streams
+- PostgreSQL + pgvector: embedding storage and nearest-neighbor search
+
+### Zero-Disk Frame Flow
+
+Sentinel does not dump frames to disk as part of the main processing path. Video flows from FFmpeg into Go, then into warm Python workers over pipes. This keeps the hot path in memory.
+
+### Review and Commit Model
+
+- `scan` in default mode creates a review file and leaves Postgres untouched for identities and intervals
+- `commit` applies reviewed actions atomically and records a rollback ledger
+- `rollback` reverts a specific commit, with guards to prevent rolling back older video commits after newer ones touched the same video
+
+## Command Reference
+
+Global flag:
+
+- `--db <postgres-connection-string>` overrides `.env` / default DB connection resolution
 
 ### `scan`
-Ingests a video file, detects faces, and indexes them into the vector database.
+
+Scans a video and produces a review file by default.
 
 | Flag | Short | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--input` | `-i` | (Required) | Path to the video file. |
-| `--engines` | `-e` | `1` | Number of parallel AI worker processes. |
-| `--nth-frame` | `-n` | `10` | Process every Nth frame (lower = more accuracy, slower). |
-| `--threshold` | `-t` | `0.6` | Face matching cosine distance threshold (lower is stricter). |
-| `--detection-threshold` | `-D` | `0.5` | Minimum confidence for face detection. |
-| `--grace-period` | `-g` | `2s` | Time a face can be missing before the track is closed. |
-| `--blip-duration` | `-b` | `100ms` | Minimum duration for a track to be saved (filters noise). |
-| `--buffer-size` | `-B` | `200` | Max frames to buffer in memory. |
-| `--worker-timeout` | | `30s` | Timeout for AI worker processing per frame. |
-| `--debug-screenshots` | `-d` | `false` | Save frames with bounding boxes to `/data/debug_frames/`. |
+| `--input` | `-i` | required | Path to video |
+| `--engines` | `-e` | `1` | Number of Python workers |
+| `--nth-frame` | `-n` | `10` | Process every Nth frame |
+| `--threshold` | `-t` | `0.6` | Face matching cosine distance threshold |
+| `--detection-threshold` | `-D` | `0.5` | Detection confidence threshold |
+| `--grace-period` | `-g` | `2s` | How long a track can disappear before closing |
+| `--blip-duration` | `-b` | `100ms` | Minimum saved track length |
+| `--buffer-size` | `-B` | `200` | Max in-flight frames in memory |
+| `--worker-timeout` |  | `30s` | Per-frame worker timeout |
+| `--debug-screenshots` | `-d` | `false` | Save debug frames |
+| `--review-file` |  | auto | Custom output path for the review YAML |
+| `--no-staging` |  | `false` | Bypass review and write directly to Postgres. Unsafe. |
+
+Behavior:
+
+- default: writes `data/reviews/<video>.review.yaml` and thumbnails
+- `--review-file`: same staged behavior, custom review file path
+- `--no-staging`: skips review and writes directly to the DB
+
+### `commit`
+
+Applies a reviewed scan file to Postgres.
+
+```bash
+sentinel commit data/reviews/video.review.yaml
+```
+
+### `rollback`
+
+Rolls back a previously committed batch by commit ID.
+
+```bash
+sentinel rollback <commit_id>
+```
 
 ### `redact`
-Redacts faces in a video based on detection or specific identities.
+
+Redacts faces from a video.
 
 | Flag | Short | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--input` | `-i` | (Required) | Path to input video. |
-| `--output` | `-o` | `output/redacted.mp4` | Path to output video. |
-| `--mode` | `-m` | `blur-all` | Redaction mode: `blur-all` or `targeted`. |
-| `--target` | | | Comma-separated list of Identity IDs (required for `targeted`). |
-| `--style` | | `black` | Redaction style: `pixel`, `black`, `gauss`, `secure`. |
-| `--strength` | `-s` | `15` | Intensity of the blur/pixelation. |
-| `--linger` | | `1s` | Continue redacting area for X time after face is lost. |
-| `--paranoid` | | `false` | If a target is lost, switch to blurring ALL faces temporarily. |
-| `--engines` | `-e` | `1` | Number of parallel AI worker processes. |
-| `--threshold` | `-t` | `0.6` | Face matching threshold (for targeted mode). |
-| `--detection-threshold` | `-D` | `0.5` | Minimum confidence for face detection. |
-| `--buffer-size` | `-B` | `35` | Max frames to buffer (lower than scan to prevent OOM). |
-| `--worker-timeout` | | `30s` | Timeout for AI worker processing per frame. |
+| `--input` | `-i` | required | Path to input video |
+| `--output` | `-o` | `output/redacted.mp4` | Output path |
+| `--mode` | `-m` | `blur-all` | `blur-all` or `targeted` |
+| `--target` |  |  | Comma-separated identity IDs for targeted mode |
+| `--style` |  | `black` | `pixel`, `black`, `gauss`, `secure` |
+| `--strength` | `-s` | `15` | Pixel/block strength |
+| `--linger` |  | `1s` | Keep redacting briefly after loss |
+| `--paranoid` |  | `false` | Blur all faces if a tracked target is lost |
+| `--paranoid-strict` |  | `false` | In paranoid mode, trigger even before a target has appeared |
+| `--engines` | `-e` | `1` | Number of Python workers |
+| `--threshold` | `-t` | `0.6` | Targeted re-ID threshold |
+| `--detection-threshold` | `-D` | `0.5` | Detection threshold |
+| `--buffer-size` | `-B` | `35` | Max in-flight frames |
+| `--worker-timeout` |  | `30s` | Per-frame worker timeout |
 
 ### `find`
-Search for a person in the database using a reference image.
 
-| Flag | Short | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--threshold` | `-t` | `0.6` | Face matching cosine distance threshold. |
-| `--detection-threshold` | `-D` | `0.5` | Minimum confidence for face detection. |
-| `--debug` | `-d` | `false` | Save debug screenshots. |
+Searches the database using a reference image.
 
 ```bash
-sentinel find -t 0.5 /data/suspect.jpg
+sentinel find suspect.jpg
+sentinel find suspect.jpg -t 0.5
 ```
+
+Flags:
+
+- `-t, --threshold`
+- `-D, --detection-threshold`
+- `-d, --debug`
+- `--worker-timeout`
 
 ### `label`
-Assign names to master identities or variants.
 
-**Label a Master Identity:**
+Administrative relabeling commands.
+
+Rename an identity:
+
 ```bash
-sentinel label identity <master_id> <new_name>
+sentinel label identity <identity_id> <new_name>
 ```
 
-**Label a Variant:** Links a detected variant to a master identity and gives the variant a specific name.
+Link a variant to an identity and rename the variant:
+
 ```bash
-sentinel label variant <variant_id> <master_name> <variant_name>
+sentinel label variant <variant_id> <identity_name> <variant_name>
 ```
 
+### `delete`
+
+Destructive admin commands for removing identities or variants.
+
+Delete an identity, all of its variants, and linked intervals:
+
+```bash
+sentinel delete identity <identity_id>
+sentinel delete identity <identity_id> --yes
+```
+
+Delete a single variant and the intervals linked to that variant:
+
+```bash
+sentinel delete variant <variant_id>
+sentinel delete variant <variant_id> --yes
+```
+
+Notes:
+
+- `delete identity` cascades through all variants under that identity
+- `delete variant` removes only that variant
+- if you delete the last variant, Sentinel will ask whether you also want to delete the now-empty identity
+- both commands delete linked face intervals through foreign keys
+- both commands ask for confirmation unless you pass `--yes`
+- `--yes` only skips prompts for the explicit command you ran. It will not auto-delete the parent identity after a last-variant delete.
 
 ### `list`
-List all stored identities and their metadata.
+
+List stored data.
+
 ```bash
 sentinel list
+sentinel list --name Monica
+sentinel list variants <identity_id>
+sentinel list commits
 ```
 
 ### `reset`
-Wipe system data. By default, clears everything.
 
-| Flag | Description |
-| :--- | :--- |
-| `--db` | Drop all database tables. |
-| `--files` | Delete generated thumbnails and output videos. |
-| `--debug` | Delete debug frames. |
+Dangerous admin command. By default it clears everything.
 
----
+Flags:
 
-## 🏗 Production Readiness
+- `--db` drops application tables
+- `--files` removes generated thumbnails and output videos
+- `--debug` removes debug frames
 
-This repository demonstrates a "Day 1 Ready" codebase structure:
+## Delete Behavior
 
-### 1. CI/CD Pipeline
-A robust GitHub Actions workflow (`.github/workflows/ci.yml`) enforces quality gates on every push:
-*   **Static Analysis:** Runs `go vet` and `flake8` to catch logical and stylistic errors.
-*   **Unit Testing:** Runs Go and Python test suites in parallel.
-*   **Build Verification:** Verifies that the Docker image builds successfully with all dependencies.
+Sentinel now supports targeted deletion.
 
-### 2. Testing Strategy
-We employ a **Mock-Heavy** testing approach to ensure CI speed and reliability:
-*   **Protocol Isolation:** Go tests verify the binary IPC protocol using `io.Reader` mocks, ensuring data integrity without spawning real processes.
-*   **Dependency Injection:** Python tests mock `sys.modules` to simulate heavy libraries (`insightface`, `numpy`) allowing tests to run in milliseconds without GPU requirements.
+- `sentinel delete identity <id>` removes that identity, its variants, and linked intervals
+- `sentinel delete variant <id>` removes that single variant and its linked intervals
+- if the deleted variant was the last one, Sentinel can also delete the now-empty identity after asking you
+- these delete commands are destructive admin actions
+- `sentinel rollback` is for reviewed commit batches. It is not the undo path for manual deletes.
+- `sentinel reset --db` still wipes the entire application schema
 
-### 3. Docker & Deployment
-*   **Multi-Stage Builds:** The `Dockerfile` separates the build environment (Go compiler) from the runtime environment (Python + FFmpeg), resulting in a minimal final image.
-*   **Infrastructure as Code:** `docker-compose.yml` defines the entire stack (App + DB + GPU config) for one-command deployment.
-*   **Security:** Secrets are managed via `.env` files and never committed to version control.
+## Installation and Usage
 
----
+### Docker Recommended
 
-## 🚦 Installation & Usage
+`./launch` is the easiest way to run Sentinel locally.
 
-Sentinel can be run in a containerized environment (recommended) or compiled locally.
+Useful launcher commands:
 
-### Option A: Docker (Recommended)
-No dependencies required other than Docker Desktop.
+- `./launch`
+- `./launch --build`
+- `./launch stop`
+- `./launch wipe`
+- `./launch clean`
+- `./launch prune`
 
-1.  **Start the Environment:**
-    ```bash
-    ./docker.sh
-    ```
-    This will start the database, build the image, and drop you into a **Sentinel Shell**.
+Inside the launched shell:
 
-2.  **Run Commands:**
-    Inside the shell, the `sentinel` binary is already added to your `$PATH`.
-    ```bash
-    # Scan a video
-    sentinel scan -i /data/video.mp4
+```bash
+# Safe default: create a review file
+sentinel scan -i /data/video.mp4
 
-    # List identified people
-    sentinel list
-    ```
+# Apply the reviewed scan to Postgres
+sentinel commit /data/reviews/video.review.yaml
 
-### Option B: Local Installation
-If you prefer to run Sentinel natively, you must install the following dependencies:
+# Fast but unsafe direct-write mode
+sentinel scan -i /data/video.mp4 --no-staging
 
-1.  **System Requirements:**
-    *   **Go 1.25+**
-    *   **Python 3.11**
-    *   **FFmpeg** (Must be in `$PATH`)
-    *   **PostgreSQL 16** with `pgvector` extension enabled.
+# List identities
+sentinel list
 
-2.  **Python Dependencies:**
-    ```bash
-    pip install insightface onnxruntime numpy opencv-python-headless
-    ```
-    *(Note: Use `onnxruntime-gpu` if you have an NVIDIA GPU)*
+# Search for someone with an image
+sentinel find /data/suspect.jpg
 
-3.  **Compile:**
-    ```bash
-    go build -o sentinel
-    ```
+# Targeted redaction
+sentinel redact -i /data/video.mp4 -m targeted --target 3 -o /data/output/redacted.mp4
+```
 
-4.  **Run:**
-    Ensure your `.env` file connects to your local Postgres instance.
-    ```bash
-    ./sentinel scan -i video.mp4
-    ```
+### Native Local Installation
 
----
+Requirements:
 
-## 🔮 Future Roadmap
+- Go 1.25+
+- Python 3.11
+- FFmpeg in `$PATH`
+- PostgreSQL 16 with `pgvector`
 
-*   **Live RTSP Ingestion:** Ring-buffer implementation for processing live IP camera feeds.
-*   **Multimodal Audio Redaction:** Visual redaction is insufficient if a subject speaks their name. We plan to integrate **OpenAI Whisper** to generate timestamped transcripts, aligning them with the video track to silence sensitive keywords (PII) via FFmpeg re-encoding.
-*   **Unsupervised Clustering:** Using DBSCAN on vector embeddings to discover unique identities without prior knowledge.
+Python packages:
 
----
+```bash
+pip install insightface onnxruntime numpy opencv-python-headless
+```
+
+Use `onnxruntime-gpu` instead of `onnxruntime` if you want GPU inference and your environment supports it.
+
+Build:
+
+```bash
+go build -o sentinel ./cmd/sentinel
+```
+
+Run:
+
+```bash
+./sentinel scan -i video.mp4
+./sentinel commit data/reviews/video.review.yaml
+```
+
+Important local DB note:
+
+- the repo `.env` is Docker-oriented by default and commonly uses `POSTGRES_HOST=db`
+- for native local runs, use a local Postgres host in `.env` or pass `--db`
+
+Example:
+
+```bash
+./sentinel --db "postgres://user:password@localhost:5432/sentinel" list
+```
+
+## Data Model Notes
+
+- identities are the top-level people
+- variants are appearance clusters under an identity, such as different looks
+- intervals point to variants, not directly to identities
+- `find` searches nearest variants and then shows intervals for the parent identity
+
+## Current Tradeoffs
+
+- staged review is the safe path
+- `--no-staging` is faster but can save wrong identities in ambiguous scenes
+- manual delete commands are destructive admin actions and separate from the review/commit workflow
+- startup expects a Postgres environment that already works for Sentinel's schema needs
+
+## Development
+
+Useful local sanity checks:
+
+```bash
+env GOCACHE=/tmp/sentinel-gocache go test ./...
+env GOCACHE=/tmp/sentinel-gocache go build ./cmd/sentinel
+```
+
+## Roadmap
+
+- live RTSP ingestion
+- audio-aware redaction
+- improved clustering and review tooling
 
 ### Contact
 
-**Andres Mejia**  
-*Systems Engineer | Go & Python Specialist*
-GitHub Profile
+Andres Mejia  
+Systems Engineer | Go & Python

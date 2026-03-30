@@ -24,7 +24,7 @@ var labelIdentityCmd = &cobra.Command{
 			return fmt.Errorf("invalid identity ID: %q is not an integer", args[0])
 		}
 		name := args[1]
-		return runLabelIdentity(id, name)
+		return runLabelIdentity(cmd.Context(), id, name)
 	},
 }
 
@@ -40,7 +40,7 @@ var labelVariantCmd = &cobra.Command{
 		}
 		identityName := args[1]
 		variantName := args[2]
-		return runLabelVariant(id, identityName, variantName)
+		return runLabelVariant(cmd.Context(), id, identityName, variantName)
 	},
 }
 
@@ -50,20 +50,14 @@ func init() {
 	labelCmd.AddCommand(labelVariantCmd)
 }
 
-func runLabelIdentity(id int, name string) error {
-	ctx := context.Background()
-
+func runLabelIdentity(ctx context.Context, id int, name string) error {
 	if err := DB.RenameIdentity(ctx, id, name); err != nil {
 		return fmt.Errorf("failed to label identity: %w", err)
 	}
-
 	fmt.Printf("✅ Identity %d has been labeled as '%s'\n", id, name)
 	return nil
 }
-
-func runLabelVariant(id int, identityName, variantName string) error {
-	ctx := context.Background()
-
+func runLabelVariant(ctx context.Context, id int, identityName, variantName string) error {
 	if err := DB.SetVariantLabel(ctx, id, identityName, variantName); err != nil {
 		return fmt.Errorf("failed to label variant: %w", err)
 	}

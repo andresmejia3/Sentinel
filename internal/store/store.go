@@ -24,7 +24,8 @@ func New(ctx context.Context, connString string) (*Store, error) {
 	for i := 0; i < 15; i++ {
 		pool, err = pgxpool.New(ctx, connString)
 		if err == nil {
-			if pool.Ping(ctx) == nil {
+			err = pool.Ping(ctx)
+			if err == nil {
 				break
 			}
 			pool.Close() // Fix: Close the pool if Ping fails to prevent resource leak
@@ -105,6 +106,26 @@ func initSchema(ctx context.Context, pool *pgxpool.Pool) error {
 			status TEXT NOT NULL DEFAULT 'processing', -- 'processing', 'active', 'rolling_back', 'rolled_back', 'failed'
 			created_at TIMESTAMPTZ DEFAULT NOW()
 		);
+
+		CREATE TABLE IF NOT EXISTS commit_video_snapshots (
+			commit_id TEXT PRIMARY KEY REFERENCES commits(id) ON DELETE CASCADE,
+			video_id TEXT NOT NULL,
+			had_metadata BOOLEAN NOT NULL,
+			previous_path TEXT,
+			previous_indexed_at TIMESTAMPTZ
+		);
+		CREATE INDEX IF NOT EXISTS commit_video_snapshots_video_id_idx ON commit_video_snapshots (video_id);
+
+		CREATE TABLE IF NOT EXISTS commit_interval_snapshots (
+			id BIGSERIAL PRIMARY KEY,
+			commit_id TEXT NOT NULL REFERENCES commits(id) ON DELETE CASCADE,
+			video_id TEXT NOT NULL,
+			start_time DOUBLE PRECISION NOT NULL,
+			end_time DOUBLE PRECISION NOT NULL,
+			face_count INT NOT NULL,
+			variant_id INT REFERENCES variants(id) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS commit_interval_snapshots_commit_id_idx ON commit_interval_snapshots (commit_id);
 	`
 	_, err := pool.Exec(ctx, query)
 	return err
@@ -451,9 +472,12 @@ func (s *Store) SetVariantLabel(ctx context.Context, variantID int, identityName
 	}
 
 	// Update Variant
-	_, err = tx.Exec(ctx, "UPDATE variants SET identity_id = $1, name = $2 WHERE id = $3", identityID, variantName, variantID)
+	tag, err := tx.Exec(ctx, "UPDATE variants SET identity_id = $1, name = $2 WHERE id = $3", identityID, variantName, variantID)
 	if err != nil {
 		return fmt.Errorf("failed to update variant: %w", err)
+	}
+	if err := requireRowUpdated(tag.RowsAffected(), "variant", variantID); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }
@@ -497,21 +521,47 @@ func (s *Store) UpdateIdentity(ctx context.Context, id int, newVec []float64, ne
 
 // RenameIdentity renames an Identity directly by its ID.
 func (s *Store) RenameIdentity(ctx context.Context, identityID int, newName string) error {
-	_, err := s.pool.Exec(ctx, "UPDATE identities SET name = $1 WHERE id = $2", newName, identityID)
-	return err
+	tag, err := s.pool.Exec(ctx, "UPDATE identities SET name = $1 WHERE id = $2", newName, identityID)
+	if err != nil {
+		return err
+	}
+	return requireRowUpdated(tag.RowsAffected(), "identity", identityID)
 }
 
 // RenameVariant updates the name of a specific variant.
 func (s *Store) RenameVariant(ctx context.Context, variantID int, newName string) error {
-	_, err := s.pool.Exec(ctx, "UPDATE variants SET name = $1 WHERE id = $2", newName, variantID)
-	return err
+	tag, err := s.pool.Exec(ctx, "UPDATE variants SET name = $1 WHERE id = $2", newName, variantID)
+	if err != nil {
+		return err
+	}
+	return requireRowUpdated(tag.RowsAffected(), "variant", variantID)
+}
+
+func requireRowUpdated(rowsAffected int64, entity string, id int) error {
+	if rowsAffected == 0 {
+		return fmt.Errorf("%s %d not found", entity, id)
+	}
+	return nil
 }
 
 // DeleteIdentity removes an identity from the database.
-// Used for cleaning up "ghost" identities that were created but filtered out as blips.
+// Cascades to its variants and any linked intervals through foreign keys.
 func (s *Store) DeleteIdentity(ctx context.Context, id int) error {
-	_, err := s.pool.Exec(ctx, "DELETE FROM identities WHERE id = $1", id)
-	return err
+	tag, err := s.pool.Exec(ctx, "DELETE FROM identities WHERE id = $1", id)
+	if err != nil {
+		return err
+	}
+	return requireRowUpdated(tag.RowsAffected(), "identity", id)
+}
+
+// DeleteVariant removes a single variant from the database.
+// Cascades to any linked intervals through foreign keys.
+func (s *Store) DeleteVariant(ctx context.Context, id int) error {
+	tag, err := s.pool.Exec(ctx, "DELETE FROM variants WHERE id = $1", id)
+	if err != nil {
+		return err
+	}
+	return requireRowUpdated(tag.RowsAffected(), "variant", id)
 }
 
 // ApplyVariantDelta updates an identity by adding (or subtracting) a sum vector and frame count.
@@ -535,7 +585,7 @@ func (s *Store) applyVariantDeltaTx(ctx context.Context, tx pgx.Tx, variantID in
 	var oldVec []float32
 	var oldCount int
 	var identityID int
-	err = tx.QueryRow(ctx, "SELECT embedding::real[], face_count, identity_id FROM variants WHERE id = $1 FOR UPDATE", variantID).Scan(&oldVec, &oldCount, &identityID)
+	err := tx.QueryRow(ctx, "SELECT embedding::real[], face_count, identity_id FROM variants WHERE id = $1 FOR UPDATE", variantID).Scan(&oldVec, &oldCount, &identityID)
 	if err != nil {
 		return fmt.Errorf("failed to fetch variant %d: %w", variantID, err)
 	}
@@ -710,6 +760,197 @@ func (s *Store) GetLedgerEntries(ctx context.Context, commitID string) ([]Ledger
 	return entries, nil
 }
 
+type commitVideoSnapshot struct {
+	VideoID           string
+	HadMetadata       bool
+	PreviousPath      string
+	PreviousIndexedAt time.Time
+}
+
+func snapshotVideoStateTx(ctx context.Context, tx pgx.Tx, commitID, videoID string) error {
+	if videoID == "" {
+		return nil
+	}
+
+	var snapshot commitVideoSnapshot
+	snapshot.VideoID = videoID
+
+	err := tx.QueryRow(ctx, "SELECT path, indexed_at FROM video_metadata WHERE id = $1", videoID).Scan(&snapshot.PreviousPath, &snapshot.PreviousIndexedAt)
+	switch err {
+	case nil:
+		snapshot.HadMetadata = true
+	case pgx.ErrNoRows:
+		snapshot.HadMetadata = false
+	default:
+		return fmt.Errorf("failed to snapshot video metadata for %s: %w", videoID, err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO commit_video_snapshots (commit_id, video_id, had_metadata, previous_path, previous_indexed_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`, commitID, snapshot.VideoID, snapshot.HadMetadata, snapshot.PreviousPath, snapshot.PreviousIndexedAt); err != nil {
+		return fmt.Errorf("failed to save video snapshot for %s: %w", videoID, err)
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT start_time, end_time, face_count, variant_id
+		FROM face_intervals
+		WHERE video_id = $1
+		ORDER BY start_time, end_time, id
+	`, videoID)
+	if err != nil {
+		return fmt.Errorf("failed to snapshot intervals for %s: %w", videoID, err)
+	}
+	defer rows.Close()
+
+	batch := &pgx.Batch{}
+	snapshotCount := 0
+	for rows.Next() {
+		var start, end float64
+		var faceCount, variantID int
+		if err := rows.Scan(&start, &end, &faceCount, &variantID); err != nil {
+			return fmt.Errorf("failed to scan interval snapshot for %s: %w", videoID, err)
+		}
+		batch.Queue(`
+			INSERT INTO commit_interval_snapshots (commit_id, video_id, start_time, end_time, face_count, variant_id)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, commitID, videoID, start, end, faceCount, variantID)
+		snapshotCount++
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed reading interval snapshots for %s: %w", videoID, err)
+	}
+	if snapshotCount == 0 {
+		return nil
+	}
+
+	br := tx.SendBatch(ctx, batch)
+	for i := 0; i < snapshotCount; i++ {
+		if _, err := br.Exec(); err != nil {
+			br.Close()
+			return fmt.Errorf("failed to store interval snapshot %d for %s: %w", i, videoID, err)
+		}
+	}
+	if err := br.Close(); err != nil {
+		return fmt.Errorf("failed to finalize interval snapshots for %s: %w", videoID, err)
+	}
+
+	return nil
+}
+
+func restoreVideoStateTx(ctx context.Context, tx pgx.Tx, commitID string) (bool, error) {
+	var snapshot commitVideoSnapshot
+	err := tx.QueryRow(ctx, `
+		SELECT video_id, had_metadata, previous_path, previous_indexed_at
+		FROM commit_video_snapshots
+		WHERE commit_id = $1
+	`, commitID).Scan(&snapshot.VideoID, &snapshot.HadMetadata, &snapshot.PreviousPath, &snapshot.PreviousIndexedAt)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to load video snapshot for commit %s: %w", commitID, err)
+	}
+
+	if _, err := tx.Exec(ctx, "DELETE FROM face_intervals WHERE video_id = $1", snapshot.VideoID); err != nil {
+		return false, fmt.Errorf("failed to clear current intervals for %s: %w", snapshot.VideoID, err)
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT start_time, end_time, face_count, variant_id
+		FROM commit_interval_snapshots
+		WHERE commit_id = $1
+		ORDER BY id ASC
+	`, commitID)
+	if err != nil {
+		return false, fmt.Errorf("failed to load interval snapshots for commit %s: %w", commitID, err)
+	}
+	defer rows.Close()
+
+	batch := &pgx.Batch{}
+	restoreCount := 0
+	for rows.Next() {
+		var start, end float64
+		var faceCount, variantID int
+		if err := rows.Scan(&start, &end, &faceCount, &variantID); err != nil {
+			return false, fmt.Errorf("failed to scan restored interval for commit %s: %w", commitID, err)
+		}
+		batch.Queue(`
+			INSERT INTO face_intervals (video_id, start_time, end_time, face_count, variant_id)
+			VALUES ($1, $2, $3, $4, $5)
+		`, snapshot.VideoID, start, end, faceCount, variantID)
+		restoreCount++
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("failed reading interval snapshots for commit %s: %w", commitID, err)
+	}
+	if restoreCount > 0 {
+		br := tx.SendBatch(ctx, batch)
+		for i := 0; i < restoreCount; i++ {
+			if _, err := br.Exec(); err != nil {
+				br.Close()
+				return false, fmt.Errorf("failed to restore interval %d for commit %s: %w", i, commitID, err)
+			}
+		}
+		if err := br.Close(); err != nil {
+			return false, fmt.Errorf("failed to finalize interval restore for commit %s: %w", commitID, err)
+		}
+	}
+
+	if snapshot.HadMetadata {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO video_metadata (id, path, indexed_at)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (id) DO UPDATE
+			SET path = EXCLUDED.path, indexed_at = EXCLUDED.indexed_at
+		`, snapshot.VideoID, snapshot.PreviousPath, snapshot.PreviousIndexedAt); err != nil {
+			return false, fmt.Errorf("failed to restore video metadata for %s: %w", snapshot.VideoID, err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx, "DELETE FROM video_metadata WHERE id = $1", snapshot.VideoID); err != nil {
+			return false, fmt.Errorf("failed to remove video metadata for %s: %w", snapshot.VideoID, err)
+		}
+	}
+
+	return true, nil
+}
+
+func newerActiveCommitForSameVideoTx(ctx context.Context, tx pgx.Tx, commitID string) (videoID string, newerCommitID string, exists bool, err error) {
+	var createdAt time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT c.created_at, s.video_id
+		FROM commits c
+		JOIN commit_video_snapshots s ON s.commit_id = c.id
+		WHERE c.id = $1
+	`, commitID).Scan(&createdAt, &videoID)
+	if err == pgx.ErrNoRows {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, fmt.Errorf("failed to load video snapshot metadata for commit %s: %w", commitID, err)
+	}
+
+	err = tx.QueryRow(ctx, `
+		SELECT c.id
+		FROM commits c
+		JOIN commit_video_snapshots s ON s.commit_id = c.id
+		WHERE s.video_id = $1
+		  AND c.id <> $2
+		  AND c.created_at > $3
+		  AND c.status IN ('active', 'processing', 'rolling_back')
+		ORDER BY c.created_at ASC
+		LIMIT 1
+	`, videoID, commitID, createdAt).Scan(&newerCommitID)
+	if err == pgx.ErrNoRows {
+		return videoID, "", false, nil
+	}
+	if err != nil {
+		return "", "", false, fmt.Errorf("failed checking newer commits for video %s: %w", videoID, err)
+	}
+
+	return videoID, newerCommitID, true, nil
+}
+
 // RevertCommit performs an atomic rollback of a commit.
 func (s *Store) RevertCommit(ctx context.Context, commitID string) error {
 	tx, err := s.pool.Begin(ctx)
@@ -733,6 +974,14 @@ func (s *Store) RevertCommit(ctx context.Context, commitID string) error {
 	}
 	if status == "processing" {
 		return fmt.Errorf("commit is still processing (or crashed); mark as 'failed' manually before rolling back")
+	}
+
+	videoID, newerCommitID, hasNewerVideoCommit, err := newerActiveCommitForSameVideoTx(ctx, tx, commitID)
+	if err != nil {
+		return err
+	}
+	if hasNewerVideoCommit {
+		return fmt.Errorf("cannot roll back commit %s: newer active commit %s also modified video %s", commitID, newerCommitID, videoID)
 	}
 
 	// 2. Fetch Ledger Entries (We can fetch inside the transaction for consistency)
@@ -759,8 +1008,16 @@ func (s *Store) RevertCommit(ctx context.Context, commitID string) error {
 		entries = append(entries, e)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error reading ledger entries: %w", err)
+	}
 
-	if len(entries) == 0 {
+	videoStateSnapshotted, err := restoreVideoStateTx(ctx, tx, commitID)
+	if err != nil {
+		return err
+	}
+
+	if len(entries) == 0 && !videoStateSnapshotted {
 		// Empty commit? Just mark it rolled back.
 		_, err = tx.Exec(ctx, "UPDATE commits SET status = 'rolled_back' WHERE id = $1", commitID)
 		if err != nil {

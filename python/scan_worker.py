@@ -45,7 +45,8 @@ def read_exactly(stream, n):
 
 def compute_iqs(face, frame_array, w_size=1.0, w_sharp=1.5):
     # 1. Get Area (Resolution)
-    x1, y1, x2, y2 = face.bbox.astype(int)
+    box = face.bbox.astype(int)
+    x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
     area = (x2 - x1) * (y2 - y1)
     
     # 2. Get Sharpness (Laplacian Variance)

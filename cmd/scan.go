@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,7 +31,7 @@ var scanBufferSize int
 
 var scanCmd = &cobra.Command{
 	Use:   "scan",
-	Short: "Scan video with parallel engines",
+	Short: "Scan video in staging mode by default",
 	// Use RunE so we can return errors to the root command for proper exit codes
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true // Don't show help text on runtime errors
@@ -50,7 +51,8 @@ func init() {
 
 	scanCmd.Flags().StringVar(&scanOpts.WorkerTimeout, "worker-timeout", "30s", "Timeout for a worker to process a single frame")
 	scanCmd.Flags().IntVarP(&scanBufferSize, "buffer-size", "B", 200, "Max number of frames to buffer in memory")
-	scanCmd.Flags().StringVar(&scanOpts.StagingFile, "staging-file", "", "Output path for staging YAML (enables review mode, skips DB commit)")
+	scanCmd.Flags().StringVar(&scanOpts.ReviewFile, "review-file", "", "Custom output path for the staging review YAML (default: data/reviews/<video>.review.yaml)")
+	scanCmd.Flags().BoolVar(&scanOpts.NoStaging, "no-staging", false, "Bypass staging mode and write identities and intervals directly to Postgres")
 
 	scanCmd.MarkFlagRequired("input")
 	rootCmd.AddCommand(scanCmd)
@@ -60,6 +62,13 @@ func init() {
 // Buffer pool to reduce GC pressure during scanning
 var frameBufferPool = sync.Pool{
 	New: func() interface{} { return make([]byte, 0, megabyte) },
+}
+
+type scanDB interface {
+	FindClosestIdentity(ctx context.Context, vec []float64, threshold float64) (variantID int, identityID int, identityName string, variantName string, err error)
+	FindTopIdentities(ctx context.Context, vec []float64, limit int) ([]store.IdentityMatch, error)
+	CreateIdentity(ctx context.Context, vec []float64, count int) (variantID int, identityID int, err error)
+	UpdateIdentity(ctx context.Context, id int, newVec []float64, newCount int) error
 }
 
 // runScan orchestrates the video scanning process: DB setup, Worker Pool, FFmpeg streaming, and Progress tracking.
@@ -74,11 +83,45 @@ func runScan(ctx context.Context, opts Options) error {
 	if err := validateScanFlags(&opts); err != nil {
 		return err
 	}
+	if !opts.NoStaging && opts.ReviewFile == "" {
+		opts.ReviewFile = defaultReviewFilePath(opts.InputPath)
+	}
+
+	dbOps := scanDB(DB)
+	var scanSession *store.ScanSession
+	if opts.NoStaging {
+		session, err := DB.BeginScanSession(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to start scan transaction: %w", err)
+		}
+		scanSession = session
+		defer scanSession.Rollback(context.Background())
+		dbOps = scanSession
+	}
 
 	// Initialize channels early so we can start workers immediately
 	taskChan := make(chan types.FrameTask, opts.NumEngines)
 	resultsChan := make(chan scanResult, opts.NumEngines*2)
 	var wg sync.WaitGroup
+
+	// Ensure we return all buffered frames to the pool if we exit early on error
+	defer func() {
+		cancel()
+		wg.Wait()
+
+	DrainTask:
+		for {
+			select {
+			case t, ok := <-taskChan:
+				if !ok {
+					break DrainTask
+				}
+				frameBufferPool.Put(t.Data)
+			default:
+				break DrainTask
+			}
+		}
+	}()
 
 	// Flow Control: Prevent OOM by limiting in-flight frames.
 	// Limits buffering in the aggregator if a worker stalls.
@@ -142,14 +185,16 @@ func runScan(ctx context.Context, opts Options) error {
 		}(i)
 	}
 
+	fmt.Fprintln(os.Stderr, "🔐 Fingerprinting video for dedupe and interval tracking...")
 	videoID, err := utils.GenerateVideoID(opts.InputPath)
 	if err != nil {
 		return fmt.Errorf("failed to generate video ID: %w", err)
 	}
-	if err := DB.EnsureVideoMetadata(ctx, videoID, opts.InputPath); err != nil {
-		return fmt.Errorf("failed to register video metadata: %w", err)
+	if opts.NoStaging {
+		if err := DB.EnsureVideoMetadata(ctx, videoID, opts.InputPath); err != nil {
+			return fmt.Errorf("failed to register video metadata: %w", err)
+		}
 	}
-	fmt.Fprintf(os.Stderr, "📼 Processing Video ID: %s\n", videoID[:12])
 
 	fps, err := utils.GetVideoFPS(ctx, opts.InputPath)
 	if err != nil {
@@ -194,7 +239,7 @@ func runScan(ctx context.Context, opts Options) error {
 	aggDone := make(chan struct{})
 	finalIntervalsChan := make(chan []store.IntervalData, 1)
 	go func() {
-		processResults(ctx, resultsChan, DB, videoID, fps, opts, errChan, finalIntervalsChan, inflightSem)
+		processResults(ctx, resultsChan, dbOps, videoID, fps, opts, errChan, finalIntervalsChan, inflightSem)
 		close(aggDone)
 	}()
 
@@ -279,10 +324,10 @@ func runScan(ctx context.Context, opts Options) error {
 		select {
 		case inflightSem <- struct{}{}:
 		case err := <-errChan:
-			frameBufferPool.Put(buf) // Return buffer to pool on error
+			frameBufferPool.Put(buf)
 			return err
 		case <-ctx.Done():
-			frameBufferPool.Put(buf) // Return buffer to pool on cancellation
+			frameBufferPool.Put(buf)
 			return ctx.Err()
 		}
 
@@ -344,22 +389,25 @@ func runScan(ctx context.Context, opts Options) error {
 	default:
 	}
 
-	// If Staging Mode is active, we skip the DB commit
-	if opts.StagingFile != "" {
-		// Final check for staging file write errors
+	// Review mode is the default. It writes a YAML file and leaves Postgres untouched.
+	if !opts.NoStaging {
+		// Final check for review file write errors
 		select {
 		case err := <-errChan:
 			return err
 		default:
 			// Success
-			fmt.Fprintf(os.Stderr, "\n📝 Staging file generated at: %s\n", opts.StagingFile)
+			fmt.Fprintf(os.Stderr, "\n📝 Review file generated at: %s\n", opts.ReviewFile)
 			return nil
 		}
 	}
 
 	// Atomic Commit: All intervals are inserted in a single transaction.
 	fmt.Fprintf(os.Stderr, "🗄️  Committing %d intervals to database...\n", len(intervals))
-	if err := DB.CommitScan(ctx, videoID, intervals); err != nil {
+	if scanSession == nil {
+		return fmt.Errorf("scan transaction was not initialized")
+	}
+	if err := scanSession.FinalizeScan(ctx, videoID, intervals); err != nil {
 		return fmt.Errorf("failed to commit scan results: %w", err)
 	}
 
@@ -388,23 +436,24 @@ type scanResult struct {
 // startWorker manages the lifecycle of a single Python worker process.
 // It reads tasks from the channel, sends them to Python, and persists the results to the DB.
 func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, results chan<- scanResult, ready chan<- bool, opts Options, errChan chan<- error, pidChan chan<- int) {
-	cfg := worker.ScanConfig{
-		Debug:              opts.DebugScreenshots,
-		DetectionThreshold: opts.DetectionThreshold,
-	}
 	readTimeout, err := time.ParseDuration(opts.WorkerTimeout)
 	if err != nil {
 		// This should have been caught by validateScanFlags, but as a fallback:
 		readTimeout = 30 * time.Second
 	}
-	cfg.ReadTimeout = readTimeout
+	cfg := worker.ScanConfig{
+		Debug:              opts.DebugScreenshots,
+		DetectionThreshold: opts.DetectionThreshold,
+		ReadTimeout:        readTimeout,
+	}
 	pyWorker, err := worker.NewPythonScanWorker(ctx, id, cfg) // Fix shadowing: 'worker' package vs variable
 	if err != nil {
 		select {
+		case <-ctx.Done():
+			return
 		case errChan <- &utils.ContextualError{Context: "Worker Startup Failed", Err: err}:
-		default:
+			return
 		}
-		return
 	}
 	defer pyWorker.Close()
 
@@ -429,10 +478,11 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 				pyWorker.Close() // Reap process before diagnostics so ExitCode is available
 				utils.ShowError("Python crashed", err, pyWorker.Cmd)
 				select {
+				case <-ctx.Done():
+					return
 				case errChan <- &utils.SilentError{Err: err}:
-				default:
+					return
 				}
-				return
 			}
 
 			// Send to aggregator instead of DB
@@ -448,6 +498,8 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 // StagingItem represents a track to be reviewed in YAML.
 type StagingItem struct {
 	TrackID           string  `yaml:"track_id"`
+	StartTime         float64 `yaml:"start_time"`
+	EndTime           float64 `yaml:"end_time"`
 	SuggestedIdentity string  `yaml:"suggested_identity"`
 	SuggestedVariant  string  `yaml:"suggested_variant"`
 	Confidence        float64 `yaml:"confidence"`
@@ -456,6 +508,12 @@ type StagingItem struct {
 	// Internal data for the commit process
 	InternalVector []float64 `yaml:"internal_vector,omitempty"`
 	InternalCount  int       `yaml:"internal_count,omitempty"`
+}
+
+type ReviewDocument struct {
+	VideoID   string        `yaml:"video_id,omitempty"`
+	InputPath string        `yaml:"input_path,omitempty"`
+	Tracks    []StagingItem `yaml:"tracks"`
 }
 
 // --- Aggregation & Tracking Logic ---
@@ -508,13 +566,12 @@ type timeRange struct {
 	End   float64
 }
 
-func processResults(ctx context.Context, results <-chan scanResult, db *store.Store, videoID string, fps float64, opts Options, errChan chan<- error, finalIntervalsChan chan<- []store.IntervalData, inflightSem chan struct{}) {
-	var stagingFileReadyToWrite bool
+func processResults(ctx context.Context, results <-chan scanResult, db scanDB, videoID string, fps float64, opts Options, errChan chan<- error, finalIntervalsChan chan<- []store.IntervalData, inflightSem chan struct{}) {
+	var reviewFileReadyToWrite bool
 	var finalIntervals []store.IntervalData
-	var stagingItems []StagingItem
+	var reviewItems []StagingItem
 
 	var consumerWg sync.WaitGroup
-	var producerWg sync.WaitGroup
 
 	// We use a buffered channel to offload thumbnail disk I/O without blocking the main loop,
 	// while ensuring that writes for the same ID happen in order.
@@ -529,13 +586,17 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 
 	// Ensure cleanup happens even if we return early due to error (e.g. DB failure or MkdirAll)
 	defer func() {
-		producerWg.Wait()
 		close(thumbChan)
 		consumerWg.Wait()
 
-		// Only write staging file if the process completed successfully
-		if stagingFileReadyToWrite && opts.StagingFile != "" {
-			if err := writeStagingFile(opts.StagingFile, stagingItems); err != nil {
+		// Only write the review file if the process completed successfully.
+		if reviewFileReadyToWrite && opts.ReviewFile != "" {
+			doc := ReviewDocument{
+				VideoID:   videoID,
+				InputPath: opts.InputPath,
+				Tracks:    reviewItems,
+			}
+			if err := writeReviewFile(opts.ReviewFile, doc); err != nil {
 				// Try to send the error back to the main routine.
 				// Use a non-blocking send in case the channel is already full or closed.
 				select {
@@ -613,10 +674,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 	// Optimization: Ensure output directory exists ONCE, not per-track
 	resultsDir := filepath.Join(outputBase, "results", videoID)
 	if err := os.MkdirAll(resultsDir, 0755); err != nil {
-		select {
-		case errChan <- fmt.Errorf("failed to create output directory: %w", err):
-		default:
-		}
+		sendErr(ctx, errChan, fmt.Errorf("failed to create output directory: %w", err))
 		return
 	}
 	fmt.Fprintf(os.Stderr, "📂 Output Directory: %s\n", resultsDir)
@@ -648,8 +706,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			return
 		}
 
-		// --- Staging Mode Logic ---
-		if opts.StagingFile != "" {
+		// --- Review Mode Logic ---
+		if opts.ReviewFile != "" {
 			// Save best thumbnail to disk for review
 			thumbFilename := fmt.Sprintf("%s_thumb.jpg", fmt.Sprintf("Track_%d", t.ID))
 			if !sendThumbOp(thumbOp{
@@ -664,15 +722,14 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			// 1. Get Top 2 matches (as requested)
 			matches, err := db.FindTopIdentities(ctx, t.MeanVec, 2)
 			if err != nil {
-				select {
-				case errChan <- fmt.Errorf("failed to find top identities for staging: %w", err):
-				default:
-				}
+				sendErr(ctx, errChan, fmt.Errorf("failed to find top identities for staging: %w", err))
 				return
 			}
 
 			item := StagingItem{
 				TrackID:        fmt.Sprintf("Track_%d", t.ID),
+				StartTime:      startSec,
+				EndTime:        endSec,
 				Thumbnail:      filepath.Join("results", videoID, thumbFilename),
 				InternalVector: t.MeanVec,
 				InternalCount:  t.Count,
@@ -708,8 +765,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 				item.Action = "new_identity"
 			}
 
-			stagingItems = append(stagingItems, item)
-			return // Skip DB persistence in staging mode
+			reviewItems = append(reviewItems, item)
+			return // Skip DB persistence in review mode
 		}
 
 		isNewIdentity := t.ID < 0
@@ -740,10 +797,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			var createdIdentityID int
 			finalVariantID, createdIdentityID, err = db.CreateIdentity(ctx, t.MeanVec, t.Count)
 			if err != nil {
-				select {
-				case errChan <- fmt.Errorf("failed to create deferred identity: %w", err):
-				default:
-				}
+				sendErr(ctx, errChan, fmt.Errorf("failed to create deferred identity: %w", err))
 				return
 			}
 			t.IdentityID = createdIdentityID
@@ -831,23 +885,13 @@ func processResults(ctx context.Context, results <-chan scanResult, db *store.St
 			}
 		}
 
-		producerWg.Add(1)
-		go func(id int, vec []float64, count int, isNew bool) {
-			defer producerWg.Done()
-
-			if !isNew {
-				// Only update vector if it was already known (accumulate average).
-				// For new identities, CreateIdentity already inserted the vector.
-				if err := db.UpdateIdentity(ctx, id, vec, count); err != nil { // `id` here is VariantID, correct for UpdateIdentity
-					select {
-					case errChan <- fmt.Errorf("failed to update variant %d: %w", id, err):
-					default:
-					}
-					return
-				}
+		if !isNewIdentity {
+			// Keep variant math inside the active scan transaction so the whole scan commits atomically.
+			if err := db.UpdateIdentity(ctx, finalVariantID, t.MeanVec, t.Count); err != nil {
+				sendErr(ctx, errChan, fmt.Errorf("failed to update variant %d: %w", finalVariantID, err))
+				return
 			}
-
-		}(finalVariantID, t.MeanVec, t.Count, isNewIdentity)
+		}
 
 		finalIntervals = append(finalIntervals, store.IntervalData{
 			Start:     startSec,
@@ -870,7 +914,8 @@ Loop:
 			}
 			buffer[res.Index] = res
 
-			// Process frames in strict order
+			// Keep frame order strict. The in-flight semaphore already bounds memory,
+			// so a missing frame should stall the pipeline rather than be reordered.
 			for {
 				frame, ok := buffer[nextFrame]
 				if !ok {
@@ -878,123 +923,16 @@ Loop:
 				}
 				delete(buffer, nextFrame)
 
-				assignedTracks := make(map[int]bool)
-
-				for _, face := range frame.Faces {
-					totalDetections++
-					bestMatch := -1
-					minDist := opts.MatchThreshold
-
-					for i, t := range tracks {
-						dist := utils.CosineDist(face.Vec, t.MeanVec)
-						if dist < minDist {
-							minDist = dist
-							bestMatch = i
-						}
-					}
-
-					if bestMatch != -1 {
-						// The best matching track was found. Check if it's already taken by another face in this frame.
-						// If so, this face cannot claim it and must become a new track.
-						if assignedTracks[tracks[bestMatch].ID] {
-							bestMatch = -1 // Invalidate the match, forcing creation of a new track below.
-						}
-					}
-
-					if bestMatch != -1 {
-						t := tracks[bestMatch]
-						t.LastFrame = frame.Index
-						t.LastLoc = face.Loc
-						assignedTracks[t.ID] = true
-
-						// Update running mean vector
-						k := float64(t.Count)
-						for j := 0; j < embeddingDim; j++ {
-							t.MeanVec[j] = (k*t.MeanVec[j] + face.Vec[j]) / (k + 1.0)
-						}
-						t.Count++
-
-						t.LastThumb = face.Thumb
-						t.LastScore = face.Quality
-
-						if face.Quality > t.BestQuality {
-							t.BestQuality = face.Quality
-							t.BestThumb = face.Thumb
-						}
-
-						// Maintain Top 10 Frames for Centroid Strategy
-						candidate := frameCandidate{Score: face.Quality, Vec: face.Vec, Thumb: face.Thumb}
-						if len(t.TopFrames) < 10 {
-							t.TopFrames = append(t.TopFrames, candidate)
-						} else {
-							minIdx := -1
-							minScore := math.MaxFloat64
-							for i, f := range t.TopFrames {
-								if f.Score < minScore {
-									minScore = f.Score
-									minIdx = i
-								}
-							}
-							if face.Quality > minScore {
-								t.TopFrames[minIdx] = candidate
-							}
-						}
-
-						if face.Quality < t.LowestScore {
-							t.LowestScore = face.Quality
-							t.LowestThumb = face.Thumb
-						}
-
-						if math.Abs(face.Quality-t.LastSavedScore)/t.LastSavedScore >= 0.10 {
-							t.PendingFrames = append(t.PendingFrames, frameData{Index: frame.Index, Score: face.Quality, Data: face.Thumb})
-							t.LastSavedScore = face.Quality
-						}
-					} else {
-						matchVariantID, matchIdentityID, matchIdentityName, matchVariantName, err := db.FindClosestIdentity(ctx, face.Vec, opts.MatchThreshold)
-						if err != nil {
-							select {
-							case errChan <- fmt.Errorf("DB identity lookup failed: %w", err):
-							default:
-							}
-							return
-						}
-
-						if matchVariantID != -1 {
-							newT := newActiveTrack(matchVariantID, matchIdentityID, frame.Index, face.Vec, face.Thumb, face.Quality, matchIdentityName, matchVariantName, true, face.Loc)
-							tracks = append(tracks, newT)
-							variantToIdentityID[matchVariantID] = matchIdentityID
-							idNames[matchVariantID] = identityNameData{IdentityName: matchIdentityName, VariantName: matchVariantName}
-							assignedTracks[matchVariantID] = true
-						} else {
-							// New Identity -> Use Temporary Negative ID. Defer DB creation until blip filter passes
-							tempID := tempIDCounter
-							tempIDCounter--
-
-							name := fmt.Sprintf("Identity %d (Pending)", tempID)
-							newT := newActiveTrack(tempID, 0, frame.Index, face.Vec, face.Thumb, face.Quality, name, "Default", false, face.Loc)
-							tracks = append(tracks, newT)
-							// We don't know the identity ID yet, so we can't add to variantToIdentityID here. It will be added in persistTrack.
-							idNames[tempID] = identityNameData{IdentityName: name, VariantName: "Default"}
-							assignedTracks[tempID] = true
-
-						}
-					}
-				}
-
-				active := tracks[:0]
-				for _, t := range tracks {
-					if frame.Index-t.LastFrame > maxGapFrames {
-						persistTrack(t)
-					} else {
-						active = append(active, t)
-					}
-				}
-				tracks = active
-
+				aggregateFrameResults(ctx, frame, &tracks, &totalDetections, opts, db, errChan, variantToIdentityID, idNames, &tempIDCounter, maxGapFrames, persistTrack)
 				<-inflightSem
 				nextFrame += opts.NthFrame
 			}
 		}
+	}
+
+	if len(buffer) > 0 {
+		sendErr(ctx, errChan, fmt.Errorf("scan stopped with missing frame %d; %d later result(s) remained buffered", nextFrame, len(buffer)))
+		return
 	}
 
 	for _, t := range tracks {
@@ -1062,18 +1000,195 @@ Loop:
 	fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
 	fmt.Fprintf(os.Stderr, "👁️  Total Face Detections:   %d\n", totalDetections)
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
-	stagingFileReadyToWrite = true
+	reviewFileReadyToWrite = true
 }
 
-func writeStagingFile(path string, items []StagingItem) error {
+// aggregateFrameResults encapsulates the core tracking and identity logic for a single frame.
+// Extracted to support both the main sequential aggregator and the final buffer flush.
+func aggregateFrameResults(ctx context.Context, frame scanResult, tracks *[]*activeTrack, totalDetections *int, opts Options, db scanDB, errChan chan<- error, variantToIdentityID map[int]int, idNames map[int]identityNameData, tempIDCounter *int, maxGapFrames int, persistTrack func(*activeTrack)) {
+	assignedTracks := make(map[int]bool)
+	isTracking := make(map[int]bool)
+
+	// Enforce the grace period before matching the current frame.
+	// Once a track is stale, it should no longer be eligible to absorb new detections.
+	active := (*tracks)[:0]
+	for _, t := range *tracks {
+		if frame.Index-t.LastFrame > maxGapFrames {
+			persistTrack(t)
+			continue
+		}
+		active = append(active, t)
+		isTracking[t.ID] = true
+	}
+	*tracks = active
+
+	startPendingTrack := func(face types.FaceResult) {
+		tempID := *tempIDCounter
+		*tempIDCounter--
+		name := fmt.Sprintf("Identity %d (Pending)", tempID)
+		newT := newActiveTrack(tempID, 0, frame.Index, face.Vec, face.Thumb, face.Quality, name, "Default", false, face.Loc)
+		*tracks = append(*tracks, newT)
+		isTracking[tempID], assignedTracks[tempID] = true, true
+		idNames[tempID] = identityNameData{IdentityName: name, VariantName: "Default"}
+	}
+
+	assignFaceToTrack := func(face types.FaceResult, t *activeTrack) {
+		t.LastFrame = frame.Index
+		t.LastLoc = face.Loc
+		assignedTracks[t.ID] = true
+
+		k := float64(t.Count)
+		for j := 0; j < embeddingDim; j++ {
+			t.MeanVec[j] = (k*t.MeanVec[j] + face.Vec[j]) / (k + 1.0)
+		}
+		t.Count++
+		t.LastThumb = face.Thumb
+		t.LastScore = face.Quality
+
+		if face.Quality > t.BestQuality {
+			t.BestQuality = face.Quality
+			t.BestThumb = face.Thumb
+		}
+
+		candidate := frameCandidate{Score: face.Quality, Vec: face.Vec, Thumb: face.Thumb}
+		if len(t.TopFrames) < 10 {
+			t.TopFrames = append(t.TopFrames, candidate)
+		} else {
+			minIdx, minScore := -1, math.MaxFloat64
+			for i, f := range t.TopFrames {
+				if f.Score < minScore {
+					minScore, minIdx = f.Score, i
+				}
+			}
+			if face.Quality > minScore {
+				t.TopFrames[minIdx] = candidate
+			}
+		}
+		if face.Quality < t.LowestScore {
+			t.LowestScore, t.LowestThumb = face.Quality, face.Thumb
+		}
+
+		// Logic Safety: Use a single robust check for sample frame capture
+		if t.LastSavedScore > 0.001 && math.Abs(face.Quality-t.LastSavedScore)/t.LastSavedScore >= 0.10 {
+			t.PendingFrames = append(t.PendingFrames, frameData{Index: frame.Index, Score: face.Quality, Data: face.Thumb})
+			t.LastSavedScore = face.Quality
+		}
+	}
+
+	type activeProposal struct {
+		faceIdx  int
+		trackIdx int
+		dist     float64
+	}
+
+	// Build all active-track proposals first so same-frame assignment is not affected
+	// by the order the detector happened to return faces in.
+	proposalsByTrack := make(map[int][]activeProposal)
+	hasActiveProposal := make([]bool, len(frame.Faces))
+	conflictedFace := make([]bool, len(frame.Faces))
+	assignedByActive := make([]bool, len(frame.Faces))
+
+	for faceIdx, face := range frame.Faces {
+		*totalDetections++
+		bestMatch := -1
+		minDist := opts.MatchThreshold
+
+		for i, t := range *tracks {
+			dist := utils.CosineDist(face.Vec, t.MeanVec)
+			if dist < minDist {
+				minDist = dist
+				bestMatch = i
+			}
+		}
+
+		if bestMatch != -1 {
+			hasActiveProposal[faceIdx] = true
+			proposalsByTrack[bestMatch] = append(proposalsByTrack[bestMatch], activeProposal{
+				faceIdx:  faceIdx,
+				trackIdx: bestMatch,
+				dist:     minDist,
+			})
+		}
+	}
+
+	// Resolve conflicts conservatively: the strongest claimant keeps the track,
+	// everyone else becomes a pending track for human review rather than risking
+	// a wrong second-choice auto-merge.
+	for trackIdx, proposals := range proposalsByTrack {
+		winner := proposals[0]
+		for _, proposal := range proposals[1:] {
+			if proposal.dist < winner.dist {
+				winner = proposal
+			}
+		}
+
+		assignFaceToTrack(frame.Faces[winner.faceIdx], (*tracks)[trackIdx])
+		assignedByActive[winner.faceIdx] = true
+
+		for _, proposal := range proposals {
+			if proposal.faceIdx == winner.faceIdx {
+				continue
+			}
+			conflictedFace[proposal.faceIdx] = true
+		}
+	}
+
+	for faceIdx, face := range frame.Faces {
+		if assignedByActive[faceIdx] {
+			continue
+		}
+
+		if conflictedFace[faceIdx] {
+			startPendingTrack(face)
+			continue
+		}
+
+		if !hasActiveProposal[faceIdx] {
+			matchVariantID, matchIdentityID, matchIdentityName, matchVariantName, err := db.FindClosestIdentity(ctx, face.Vec, opts.MatchThreshold)
+			if err != nil {
+				sendErr(ctx, errChan, fmt.Errorf("DB identity lookup failed: %w", err))
+				return
+			}
+
+			if matchVariantID != -1 {
+				if isTracking[matchVariantID] {
+					startPendingTrack(face)
+					continue
+				}
+				newT := newActiveTrack(matchVariantID, matchIdentityID, frame.Index, face.Vec, face.Thumb, face.Quality, matchIdentityName, matchVariantName, true, face.Loc)
+				*tracks = append(*tracks, newT)
+				variantToIdentityID[matchVariantID], idNames[matchVariantID] = matchIdentityID, identityNameData{matchIdentityName, matchVariantName}
+				isTracking[matchVariantID], assignedTracks[matchVariantID] = true, true
+			} else {
+				startPendingTrack(face)
+			}
+		}
+	}
+}
+
+// sendErr is a helper to perform a context-aware blocking send on an error channel.
+func sendErr(ctx context.Context, errChan chan<- error, err error) {
+	select {
+	case errChan <- err:
+	case <-ctx.Done():
+	}
+}
+
+func writeReviewFile(path string, doc ReviewDocument) error {
+	dir := filepath.Dir(path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create review directory: %w", err)
+		}
+	}
 	f, err := os.Create(path)
 	if err != nil {
-		return fmt.Errorf("failed to create staging file: %w", err)
+		return fmt.Errorf("failed to create review file: %w", err)
 	}
 	defer f.Close()
 	enc := yaml.NewEncoder(f)
-	if err := enc.Encode(items); err != nil {
-		return fmt.Errorf("failed to encode staging YAML: %w", err)
+	if err := enc.Encode(doc); err != nil {
+		return fmt.Errorf("failed to encode review YAML: %w", err)
 	}
 	return nil
 }
@@ -1127,6 +1242,9 @@ func validateScanFlags(opts *Options) error {
 	if opts.MatchThreshold < 0 || opts.MatchThreshold > 1.0 {
 		return fmt.Errorf("invalid match threshold: must be between 0.0 and 1.0, got %f", opts.MatchThreshold)
 	}
+	if opts.NoStaging && opts.ReviewFile != "" {
+		return fmt.Errorf("--no-staging cannot be combined with --review-file")
+	}
 	if opts.DetectionThreshold < 0 || opts.DetectionThreshold > 1.0 {
 		return fmt.Errorf("invalid detection threshold: must be between 0.0 and 1.0, got %f", opts.DetectionThreshold)
 	}
@@ -1147,4 +1265,23 @@ func validateScanFlags(opts *Options) error {
 	}
 
 	return nil
+}
+
+func defaultReviewFilePath(inputPath string) string {
+	outputBase := "data"
+	if _, err := os.Stat("/data"); err == nil {
+		outputBase = "/data"
+	}
+
+	base := filepath.Base(inputPath)
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	if name == "" {
+		name = base
+	}
+	if name == "" {
+		name = "scan"
+	}
+
+	return filepath.Join(outputBase, "reviews", name+".review.yaml")
 }

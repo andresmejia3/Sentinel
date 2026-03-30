@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/andresmejia3/sentinel/internal/store"
 	"github.com/andresmejia3/sentinel/internal/utils"
+	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 )
 
@@ -27,7 +29,8 @@ type Options struct {
 	DebugScreenshots   bool
 	DetectionThreshold float64
 	WorkerTimeout      string
-	StagingFile        string
+	ReviewFile         string
+	NoStaging          bool
 }
 
 var (
@@ -47,6 +50,9 @@ var rootCmd = &cobra.Command{
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		// If no flag was provided, try to build the connection string from the environment
 		if dbURL == "" {
+			if err := loadLocalEnv(); err != nil {
+				return fmt.Errorf("failed to load local environment: %w", err)
+			}
 			if host := os.Getenv("POSTGRES_HOST"); host != "" {
 				user := os.Getenv("POSTGRES_USER")
 				pass := os.Getenv("POSTGRES_PASSWORD")
@@ -106,4 +112,32 @@ func Execute() {
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&dbURL, "db", "", "PostgreSQL connection string (default: postgres://localhost:5432/sentinel)")
+}
+
+// loadLocalEnv reads a nearby .env file for native runs without overriding
+// any variables the user or container runtime has already exported.
+func loadLocalEnv() error {
+	paths := []string{".env"}
+	if exe, err := os.Executable(); err == nil {
+		exeEnv := filepath.Join(filepath.Dir(exe), ".env")
+		if exeEnv != ".env" {
+			paths = append(paths, exeEnv)
+		}
+	}
+
+	return loadLocalEnvFromPaths(paths)
+}
+
+func loadLocalEnvFromPaths(paths []string) error {
+	for _, path := range paths {
+		if err := godotenv.Load(path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+
+	return nil
 }
