@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="540" viewBox="0 0 1200 540" role="img" aria-labelledby="title desc">
+  <title id="title">Sentinel Review Workflow</title>
+  <desc id="desc">Review-first workflow showing scan, review YAML, commit, and searchable database state.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fffaf0"/>
+      <stop offset="100%" stop-color="#f7fafc"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="7" markerHeight="7" refX="6.2" refY="3.5" orient="auto-start-reverse">
+      <path d="M 0 0 L 7 3.5 L 0 7 z" fill="#4a5568"/>
+    </marker>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #1a202c; }
+      .subtitle { font: 400 16px Arial, sans-serif; fill: #4a5568; }
+      .step { font: 700 20px Arial, sans-serif; fill: #1a202c; }
+      .body { font: 400 15px Arial, sans-serif; fill: #2d3748; }
+      .body-center { font: 400 15px Arial, sans-serif; fill: #2d3748; text-anchor: middle; }
+      .step-light { font: 700 20px Arial, sans-serif; fill: #ffffff; }
+      .mono-light { font: 400 13px 'Courier New', monospace; fill: #e2e8f0; }
+      .mono-dark { font: 400 14px 'Courier New', monospace; fill: #2d3748; }
+      .small { font: 400 13px Arial, sans-serif; fill: #718096; }
+      .small-light { font: 400 13px Arial, sans-serif; fill: #cbd5e0; }
+      .small-center { font: 400 13px Arial, sans-serif; fill: #718096; text-anchor: middle; }
+      .card { rx: 18; ry: 18; stroke-width: 2; }
+      .flow { stroke: #4a5568; stroke-width: 4; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1200" height="540" fill="url(#bg)"/>
+
+  <text x="70" y="58" class="title">Review-First Workflow</text>
+  <text x="70" y="88" class="subtitle">The default path keeps ambiguous tracks out of Postgres until a human reviews the generated YAML.</text>
+
+  <rect x="70" y="140" width="290" height="270" class="card" fill="#1a202c" stroke="#2d3748"/>
+  <text x="100" y="176" class="step-light">1. Scan</text>
+  <text x="100" y="212" class="mono-light">$ sentinel scan -i test.mp4</text>
+  <text x="100" y="242" class="mono-light">[scan] Fingerprinting video ...</text>
+  <text x="100" y="272" class="mono-light">[scan] Writing review file ...</text>
+  <text x="100" y="302" class="mono-light"> reviews/test.review.yaml</text>
+  <text x="100" y="346" class="small-light">Result: thumbnails + review artifact</text>
+
+  <rect x="410" y="120" width="390" height="310" class="card" fill="#ffffff" stroke="#d69e2e"/>
+  <text x="440" y="160" class="step">2. Review YAML</text>
+  <text x="440" y="194" class="mono-dark">video_id: 7fc1...</text>
+  <text x="440" y="220" class="mono-dark">input_path: test.mp4</text>
+  <text x="440" y="254" class="mono-dark">tracks:</text>
+  <text x="460" y="280" class="mono-dark">- track_id: -1</text>
+  <text x="490" y="306" class="mono-dark">action: link</text>
+  <text x="490" y="332" class="mono-dark">identity_name: Ross</text>
+  <text x="460" y="362" class="mono-dark">- track_id: -2</text>
+  <text x="490" y="388" class="mono-dark">action: create</text>
+  <text x="490" y="414" class="mono-dark">identity_name: Cafe Extra</text>
+  <rect x="630" y="245" width="130" height="44" rx="12" ry="12" fill="#fef3c7" stroke="#d69e2e"/>
+  <text x="695" y="272" class="small-center">Human Decides</text>
+
+  <rect x="850" y="140" width="280" height="270" class="card" fill="#edf2f7" stroke="#718096"/>
+  <text x="880" y="176" class="step">3. Commit</text>
+  <text x="880" y="212" class="mono-dark">$ sentinel commit</text>
+  <text x="880" y="238" class="mono-dark">test.review.yaml</text>
+  <text x="880" y="286" class="body">Writes identities, variants,</text>
+  <text x="880" y="310" class="body">intervals, and rollback ledger</text>
+  <text x="880" y="350" class="small">Now searchable by find, list, and redact</text>
+
+  <path d="M 361 275 L 405 275" class="flow"/>
+  <path d="M 801 275 L 845 275" class="flow"/>
+
+  <rect x="350" y="462" width="500" height="54" rx="14" ry="14" fill="#e6fffa" stroke="#319795"/>
+  <text x="600" y="486" class="body-center">Safe Default: Ambiguous matches stay reviewable</text>
+  <text x="600" y="506" class="body-center">instead of silently poisoning the database.</text>
+</svg>

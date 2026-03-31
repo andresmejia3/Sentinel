@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1810" height="830" viewBox="0 0 1810 830" role="img" aria-labelledby="title desc">
+  <title id="title">Sentinel Architecture V7</title>
+  <desc id="desc">Architecture diagram showing Sentinel streaming frames through Go into persistent Python workers, tracking and re-identifying faces, staging review artifacts, and storing searchable variants and intervals in PostgreSQL with pgvector.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#edf2f7"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4a5568"/>
+    </marker>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #1a202c; }
+      .subtitle { font: 400 16px Arial, sans-serif; fill: #4a5568; }
+      .lane { font: 700 24px Arial, sans-serif; fill: #1a202c; text-anchor: middle; }
+      .label { font: 700 20px Arial, sans-serif; fill: #1a202c; text-anchor: middle; }
+      .body { font: 400 15px Arial, sans-serif; fill: #2d3748; text-anchor: middle; }
+      .bullet { font: 400 14px Arial, sans-serif; fill: #2d3748; text-anchor: start; }
+      .tag { font: 700 12px Arial, sans-serif; fill: #ffffff; text-anchor: middle; letter-spacing: 0.8px; }
+      .section { font: 700 16px Arial, sans-serif; fill: #4a5568; text-anchor: middle; letter-spacing: 1px; }
+      .box { rx: 20; ry: 20; stroke-width: 2; }
+      .flow { stroke: #4a5568; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .rule { stroke: #cbd5e0; stroke-width: 2; }
+    </style>
+  </defs>
+
+  <rect width="1810" height="830" fill="url(#bg)"/>
+  <text x="70" y="58" class="title">Sentinel Architecture</text>
+  <text x="70" y="88" class="subtitle">Sentinel streams frames through Go into persistent Python workers, tracks and re-identifies faces, stages review artifacts, and stores searchable variants and intervals in PostgreSQL with pgvector.</text>
+
+  <rect x="40" y="130" width="300" height="580" rx="26" ry="26" fill="#fffaf0" stroke="#f6ad55" stroke-width="2"/>
+  <rect x="370" y="130" width="1080" height="580" rx="26" ry="26" fill="#ebf8ff" stroke="#90cdf4" stroke-width="2"/>
+  <rect x="1480" y="130" width="300" height="580" rx="26" ry="26" fill="#faf5ff" stroke="#d6bcfa" stroke-width="2"/>
+
+  <text x="190" y="168" class="lane">Video I/O</text>
+  <text x="910" y="168" class="lane">Sentinel Core</text>
+  <text x="1630" y="168" class="lane">Storage</text>
+
+  <rect x="60" y="215" width="260" height="220" class="box" fill="#fff5f5" stroke="#f56565"/>
+  <rect x="140" y="179" width="100" height="28" rx="14" ry="14" fill="#f56565"/>
+  <text x="190" y="198" class="tag">EXTERNAL</text>
+  <text x="190" y="262" class="label">FFmpeg</text>
+  <text x="78" y="302" class="bullet">- Decode input video</text>
+  <text x="78" y="326" class="bullet">- Stream raw frames to Go</text>
+  <text x="78" y="350" class="bullet">- Mux and transcode audio</text>
+  <text x="78" y="374" class="bullet">- Encode redacted output</text>
+
+  <rect x="390" y="215" width="320" height="220" class="box" fill="#ffffff" stroke="#3182ce"/>
+  <text x="550" y="262" class="label">Go Orchestrator</text>
+  <text x="408" y="302" class="bullet">- Spawn and manage persistent</text>
+  <text x="420" y="320" class="bullet">Python workers</text>
+  <text x="408" y="344" class="bullet">- Aggregate async worker output</text>
+  <text x="420" y="362" class="bullet">into ordered frame results</text>
+  <text x="408" y="386" class="bullet">- Stream frames over custom binary IPC</text>
+  <text x="408" y="410" class="bullet">- Select centroid-based thumbnails</text>
+
+  <rect x="760" y="215" width="300" height="220" class="box" fill="#ffffff" stroke="#38a169"/>
+  <text x="910" y="262" class="label">Python Workers</text>
+  <text x="778" y="302" class="bullet">- Detect faces and landmarks</text>
+  <text x="778" y="326" class="bullet">- Generate facial embeddings</text>
+  <text x="778" y="350" class="bullet">- Score thumbnail image quality</text>
+  <text x="778" y="374" class="bullet">- Keep InsightFace warm in memory</text>
+
+  <rect x="1110" y="215" width="320" height="220" class="box" fill="#ffffff" stroke="#2b6cb0"/>
+  <text x="1270" y="262" class="label">Tracking and Review</text>
+  <text x="1128" y="302" class="bullet">- Track faces across frames</text>
+  <text x="1128" y="326" class="bullet">- Re-identify against prior variants</text>
+  <text x="1128" y="350" class="bullet">- Rank review suggestions and stage YAML</text>
+  <text x="1128" y="374" class="bullet">- Resolve same-frame identity conflicts</text>
+
+  <rect x="1500" y="215" width="260" height="220" class="box" fill="#ffffff" stroke="#2c5282"/>
+  <text x="1630" y="262" class="label">Go Store</text>
+  <text x="1518" y="302" class="bullet">- PostgreSQL + pgvector + HNSW</text>
+  <text x="1518" y="326" class="bullet">- Query nearest variants</text>
+  <text x="1518" y="350" class="bullet">- Store identities and intervals</text>
+  <text x="1518" y="374" class="bullet">- Apply commit/rollback rules</text>
+
+  <path d="M 321 325 L 381 325" class="flow"/>
+  <path d="M 711 325 L 751 325" class="flow"/>
+  <path d="M 1061 325 L 1101 325" class="flow"/>
+  <path d="M 1431 325 L 1491 325" class="flow"/>
+
+  <line x1="70" y1="520" x2="1770" y2="520" class="rule"/>
+  <text x="920" y="505" class="section">OUTPUTS</text>
+
+  <rect x="75" y="565" width="230" height="116" class="box" fill="#ffffff" stroke="#cbd5e0"/>
+  <text x="190" y="629" class="body">Redacted Output Video</text>
+  <path d="M 190 436 L 190 556" class="flow"/>
+
+  <rect x="1145" y="565" width="250" height="116" class="box" fill="#ffffff" stroke="#cbd5e0"/>
+  <text x="1163" y="601" class="bullet">- Review YAML File</text>
+  <text x="1163" y="625" class="bullet">- Ranked Identity Suggestions</text>
+  <text x="1163" y="649" class="bullet">- Best Variant Thumbnails</text>
+  <path d="M 1270 436 L 1270 556" class="flow"/>
+
+  <rect x="1505" y="565" width="250" height="116" class="box" fill="#ffffff" stroke="#cbd5e0"/>
+  <text x="1523" y="601" class="bullet">- Identity Search Results</text>
+  <text x="1523" y="625" class="bullet">- Cross-Video Face Intervals</text>
+  <text x="1523" y="649" class="bullet">- Commit/Rollback Ledger</text>
+  <path d="M 1630 436 L 1630 556" class="flow"/>
+</svg>

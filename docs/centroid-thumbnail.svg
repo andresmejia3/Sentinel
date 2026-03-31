@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="title desc">
+  <title id="title">Centroid Thumbnail Selection</title>
+  <desc id="desc">Diagram showing multiple candidate frames, a centroid embedding, and the representative thumbnail chosen by closest embedding distance.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f7fafc"/>
+      <stop offset="100%" stop-color="#fffaf0"/>
+    </linearGradient>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #1a202c; }
+      .subtitle { font: 400 16px Arial, sans-serif; fill: #4a5568; }
+      .label { font: 700 18px Arial, sans-serif; fill: #1a202c; text-anchor: middle; }
+      .body { font: 400 14px Arial, sans-serif; fill: #2d3748; text-anchor: middle; }
+      .mono { font: 400 13px 'Courier New', monospace; fill: #2d3748; text-anchor: middle; }
+      .small-mono { font: 400 12px 'Courier New', monospace; fill: #2d3748; text-anchor: middle; }
+      .frame { rx: 16; ry: 16; stroke-width: 2; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="440" fill="url(#bg)"/>
+  <text x="70" y="58" class="title">Pose Agnostic Thumbnail Selection Per Variant</text>
+  <text x="70" y="88" class="subtitle">Sentinel keeps several strong candidate frames and chooses the one whose facial embedding is closest to the track centroid.</text>
+
+  <rect x="70" y="140" width="190" height="220" class="frame" fill="#ffffff" stroke="#cbd5e0"/>
+  <rect x="100" y="175" width="130" height="110" rx="16" ry="16" fill="#e2e8f0"/>
+  <circle cx="165" cy="215" r="26" fill="#a0aec0"/>
+  <rect x="135" y="245" width="60" height="22" rx="10" ry="10" fill="#a0aec0"/>
+  <text x="165" y="318" class="mono">Candidate A</text>
+  <text x="165" y="342" class="mono">dist = 0.19</text>
+
+  <rect x="290" y="140" width="190" height="220" class="frame" fill="#ffffff" stroke="#38a169"/>
+  <rect x="320" y="175" width="130" height="110" rx="16" ry="16" fill="#c6f6d5"/>
+  <circle cx="385" cy="215" r="26" fill="#68d391"/>
+  <rect x="355" y="245" width="60" height="22" rx="10" ry="10" fill="#68d391"/>
+  <text x="385" y="318" class="mono">Candidate B</text>
+  <text x="385" y="342" class="mono">dist = 0.07</text>
+  <text x="385" y="118" class="label">Selected</text>
+
+  <rect x="510" y="140" width="190" height="220" class="frame" fill="#ffffff" stroke="#cbd5e0"/>
+  <rect x="540" y="175" width="130" height="110" rx="16" ry="16" fill="#e2e8f0"/>
+  <circle cx="605" cy="215" r="26" fill="#a0aec0"/>
+  <rect x="575" y="245" width="60" height="22" rx="10" ry="10" fill="#a0aec0"/>
+  <text x="605" y="318" class="mono">Candidate C</text>
+  <text x="605" y="342" class="mono">dist = 0.24</text>
+
+  <rect x="760" y="125" width="350" height="250" class="frame" fill="#ffffff" stroke="#d69e2e"/>
+  <text x="935" y="160" class="label">Track Centroid</text>
+  <text x="935" y="184" class="body">Running Mean Embedding</text>
+  <circle cx="935" cy="256" r="56" fill="#fef3c7" stroke="#d69e2e" stroke-width="3"/>
+  <text x="935" y="248" class="body">Mean</text>
+  <text x="935" y="267" class="small-mono">(vec1 ... vecN)</text>
+  <text x="935" y="332" class="body">Best Thumbnail = Candidate With The</text>
+  <text x="935" y="354" class="body">Smallest Cosine Distance To Centroid</text>
+
+  <text x="600" y="404" class="body">Why it matters: The chosen image is the most representative view of that appearance cluster and not just the sharpest frame.</text>
+  <text x="600" y="425" class="body">This allows us to have a pose agnostic quality score for our thumbnails.</text>
+
+</svg>

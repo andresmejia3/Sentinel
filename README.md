@@ -11,6 +11,15 @@ Sentinel is a high-performance biometric video indexing and redaction engine bui
 
 Under the hood, Sentinel is designed like a real systems project: Go orchestrates concurrency, worker lifecycles, FFmpeg streaming, and database coordination, while persistent Python workers handle ML inference over a custom binary IPC pipeline. The result is a zero-disk frame-processing workflow built for long-form video, human-in-the-loop accuracy, and production-style data integrity.
 
+## Legend
+
+| Label | Meaning |
+| :--- | :--- |
+| `Safe default` | Review-first workflow. `scan` stays out of Postgres for identities and intervals until you explicitly run `sentinel commit`. |
+| `Unsafe` | Faster convenience mode that can save ambiguous or wrong identity assignments. |
+| `Admin` | Maintenance or operator-focused command that is outside the normal scan -> review -> commit workflow. |
+| `Destructive` | Deletes or resets data. These actions are not undone by `sentinel rollback`. |
+
 ## Highlights
 
 - Zero-Disk Video Pipeline: Streams frames from FFmpeg through Go into warm Python workers without writing temporary frame images to disk.
@@ -21,7 +30,21 @@ Under the hood, Sentinel is designed like a real systems project: Go orchestrate
 - Transaction-Safe Commit / Rollback: Reviewed identity updates are applied with a ledgered vector-delta model so changes can be committed atomically and rolled back cleanly.
 - Targeted Redaction with Temporal Safety Net: Supports linger and paranoid modes so temporary detection loss is less likely to cause privacy leaks.
 
-## What Sentinel Actually Does
+## Visual Overview
+
+### Architecture
+
+![Sentinel architecture](docs/architecture.svg)
+
+### Review Workflow
+
+![Review-first workflow](docs/review-workflow.svg)
+
+### Centroid Thumbnail Selection
+
+![Centroid thumbnail selection](docs/centroid-thumbnail.svg)
+
+## Core Components
 
 - Go handles orchestration, worker lifecycle, FFmpeg streaming, concurrency, and database access.
 - Python handles face detection and recognition through InsightFace.
@@ -42,6 +65,10 @@ Sentinel is review-first by default.
 This is the safest workflow because it keeps ambiguous matches out of the database until a human confirms them.
 
 ### Important: `--no-staging` Is Unsafe
+
+> [!WARNING]
+> `sentinel scan --no-staging` bypasses review and writes identities and intervals directly to Postgres.
+> It is faster, but it is intentionally less safe.
 
 `sentinel scan --no-staging` skips review and writes identities and intervals directly to Postgres.
 
@@ -84,6 +111,8 @@ Global flag:
 
 ### `scan`
 
+Status: `Safe default` by default. `Unsafe` when `--no-staging` is used.
+
 Scans a video and produces a review file by default.
 
 | Flag | Short | Default | Description |
@@ -109,6 +138,8 @@ Behavior:
 
 ### `commit`
 
+Status: `Safe default`
+
 Applies a reviewed scan file to Postgres.
 
 ```bash
@@ -117,6 +148,8 @@ sentinel commit data/reviews/video.review.yaml
 
 ### `rollback`
 
+Status: `Admin`
+
 Rolls back a previously committed batch by commit ID.
 
 ```bash
@@ -124,6 +157,8 @@ sentinel rollback <commit_id>
 ```
 
 ### `redact`
+
+Status: normal runtime command
 
 Redacts faces from a video.
 
@@ -146,6 +181,8 @@ Redacts faces from a video.
 
 ### `find`
 
+Status: normal runtime command
+
 Searches the database using a reference image.
 
 ```bash
@@ -162,6 +199,8 @@ Flags:
 
 ### `label`
 
+Status: `Admin`
+
 Administrative relabeling commands.
 
 Rename an identity:
@@ -177,6 +216,8 @@ sentinel label variant <variant_id> <identity_name> <variant_name>
 ```
 
 ### `delete`
+
+Status: `Admin`, `Destructive`
 
 Destructive admin commands for removing identities or variants.
 
@@ -205,6 +246,8 @@ Notes:
 
 ### `list`
 
+Status: `Admin`
+
 List stored data.
 
 ```bash
@@ -216,6 +259,8 @@ sentinel list commits
 
 ### `reset`
 
+Status: `Admin`, `Destructive`
+
 Dangerous admin command. By default it clears everything.
 
 Flags:
@@ -223,17 +268,6 @@ Flags:
 - `--db` drops application tables
 - `--files` removes generated thumbnails and output videos
 - `--debug` removes debug frames
-
-## Delete Behavior
-
-Sentinel now supports targeted deletion.
-
-- `sentinel delete identity <id>` removes that identity, its variants, and linked intervals
-- `sentinel delete variant <id>` removes that single variant and its linked intervals
-- if the deleted variant was the last one, Sentinel can also delete the now-empty identity after asking you
-- these delete commands are destructive admin actions
-- `sentinel rollback` is for reviewed commit batches. It is not the undo path for manual deletes.
-- `sentinel reset --db` still wipes the entire application schema
 
 ## Installation and Usage
 
@@ -304,8 +338,9 @@ Run:
 
 Important local DB note:
 
-- the repo `.env` is Docker-oriented by default and commonly uses `POSTGRES_HOST=db`
-- for native local runs, use a local Postgres host in `.env` or pass `--db`
+> [!NOTE]
+> The repo `.env` is Docker-oriented by default and often uses `POSTGRES_HOST=db`.
+> For native local runs, change that to a local host or pass `--db`.
 
 Example:
 
