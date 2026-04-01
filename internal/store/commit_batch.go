@@ -6,7 +6,6 @@ import (
 	"regexp"
 	"strconv"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -170,21 +169,18 @@ func applyCommitActionTx(ctx context.Context, tx pgx.Tx, commitID string, action
 		}
 
 		targetVariant := action.VariantName
-		autoRename := false
 		if targetVariant == "" {
-			targetVariant = "Pending_" + uuid.New().String()
-			autoRename = true
-		} else {
-			existingVariantID, err := getVariantIDTx(ctx, tx, identityID, targetVariant)
-			if err != nil {
-				return 0, fmt.Errorf("error resolving variant '%s' for track %s: %w", targetVariant, action.TrackID, err)
-			}
-			if existingVariantID != 0 {
-				return 0, fmt.Errorf("variant '%s' already exists for identity '%s'. Use 'merge' to add to it", targetVariant, action.IdentityName)
-			}
+			return 0, fmt.Errorf("variant name is required for 'new_variant' action (track %s)", action.TrackID)
+		}
+		existingVariantID, err := getVariantIDTx(ctx, tx, identityID, targetVariant)
+		if err != nil {
+			return 0, fmt.Errorf("error resolving variant '%s' for track %s: %w", targetVariant, action.TrackID, err)
+		}
+		if existingVariantID != 0 {
+			return 0, fmt.Errorf("variant '%s' already exists for identity '%s'. Use 'merge' to add to it", targetVariant, action.IdentityName)
 		}
 
-		variantID, err := commitNewVariantTx(ctx, tx, identityID, action.Vector, action.Count, targetVariant, ledgerEntry, autoRename)
+		variantID, err := commitNewVariantTx(ctx, tx, identityID, action.Vector, action.Count, targetVariant, ledgerEntry, false)
 		if err != nil {
 			return 0, fmt.Errorf("failed to commit new variant for %s: %w", action.TrackID, err)
 		}

@@ -235,3 +235,40 @@ func TestHydrateReviewDocumentRequiresSidecarForActionableTracks(t *testing.T) {
 		t.Fatalf("expected missing sidecar path in error, got: %v", err)
 	}
 }
+
+func TestPrepareReviewArtifactsRootClearsStaleTracks(t *testing.T) {
+	t.Parallel()
+
+	resultsDir := t.TempDir()
+	staleFile := filepath.Join(resultsDir, "tracks", "1", "frames", "stale.jpg")
+	if err := os.MkdirAll(filepath.Dir(staleFile), 0755); err != nil {
+		t.Fatalf("failed to create stale artifact dir: %v", err)
+	}
+	if err := os.WriteFile(staleFile, []byte("stale"), 0644); err != nil {
+		t.Fatalf("failed to seed stale artifact: %v", err)
+	}
+
+	if err := prepareReviewArtifactsRoot(resultsDir); err != nil {
+		t.Fatalf("prepareReviewArtifactsRoot returned error: %v", err)
+	}
+
+	if _, err := os.Stat(staleFile); !os.IsNotExist(err) {
+		t.Fatalf("expected stale artifact to be removed, stat err=%v", err)
+	}
+	if info, err := os.Stat(filepath.Join(resultsDir, "tracks")); err != nil {
+		t.Fatalf("expected tracks root to be recreated, got error: %v", err)
+	} else if !info.IsDir() {
+		t.Fatalf("expected recreated tracks root to be a directory")
+	}
+}
+
+func TestReviewArtifactCommentRootMatchesRuntimeMode(t *testing.T) {
+	t.Parallel()
+
+	if got := reviewArtifactCommentRoot("/data", "vid_test"); got != filepath.Join("results", "vid_test", "tracks") {
+		t.Fatalf("expected docker comment root to be host-facing results path, got %q", got)
+	}
+	if got := reviewArtifactCommentRoot("data", "vid_test"); got != filepath.Join("data", "results", "vid_test", "tracks") {
+		t.Fatalf("expected local comment root to include data/ prefix, got %q", got)
+	}
+}

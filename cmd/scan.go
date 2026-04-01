@@ -507,22 +507,22 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 
 // StagingItem represents a track to be reviewed in YAML.
 type StagingItem struct {
-	ID                      int     `yaml:"id,omitempty"`
-	LegacyTrackID           string  `yaml:"track_id,omitempty"`
-	StartTime               float64 `yaml:"start_time"`
-	EndTime                 float64 `yaml:"end_time"`
-	NearestIdentity         string  `yaml:"nearest_identity,omitempty"`
-	NearestVariant          string  `yaml:"nearest_variant,omitempty"`
+	ID                      int                `yaml:"id,omitempty"`
+	LegacyTrackID           string             `yaml:"track_id,omitempty"`
+	StartTime               float64            `yaml:"start_time"`
+	EndTime                 float64            `yaml:"end_time"`
+	NearestIdentity         string             `yaml:"nearest_identity,omitempty"`
+	NearestVariant          string             `yaml:"nearest_variant,omitempty"`
 	NearestCandidates       []NearestCandidate `yaml:"nearest_candidates,omitempty"`
-	Identity                string  `yaml:"identity"`
-	Variant                 string  `yaml:"variant"`
-	LegacySuggestedIdentity string  `yaml:"suggested_identity,omitempty"`
-	LegacySuggestedVariant  string  `yaml:"suggested_variant,omitempty"`
-	Confidence              float64 `yaml:"confidence"`
-	Reason                  string  `yaml:"reason,omitempty"`
-	Notes                   string  `yaml:"notes,omitempty"`
-	Thumbnail               string  `yaml:"thumbnail,omitempty"`
-	Action                  string  `yaml:"action"`
+	Identity                string             `yaml:"identity"`
+	Variant                 string             `yaml:"variant"`
+	LegacySuggestedIdentity string             `yaml:"suggested_identity,omitempty"`
+	LegacySuggestedVariant  string             `yaml:"suggested_variant,omitempty"`
+	Confidence              float64            `yaml:"confidence"`
+	Reason                  string             `yaml:"reason,omitempty"`
+	Notes                   string             `yaml:"notes,omitempty"`
+	Thumbnail               string             `yaml:"thumbnail,omitempty"`
+	Action                  string             `yaml:"action"`
 	// Internal data for the commit process
 	InternalVector []float64 `yaml:"internal_vector,omitempty"`
 	InternalCount  int       `yaml:"internal_count,omitempty"`
@@ -639,6 +639,24 @@ func reviewArtifactRelativeDir(videoID string, reviewID int) string {
 
 func reviewArtifactDir(resultsDir string, reviewID int) string {
 	return filepath.Join(resultsDir, "tracks", strconv.Itoa(reviewID))
+}
+
+func reviewArtifactCommentRoot(outputBase, videoID string) string {
+	if outputBase == "/data" {
+		return filepath.Join("results", videoID, "tracks")
+	}
+	return filepath.Join(outputBase, "results", videoID, "tracks")
+}
+
+func prepareReviewArtifactsRoot(resultsDir string) error {
+	reviewTracksDir := filepath.Join(resultsDir, "tracks")
+	if err := os.RemoveAll(reviewTracksDir); err != nil {
+		return fmt.Errorf("failed to clear review artifacts: %w", err)
+	}
+	if err := os.MkdirAll(reviewTracksDir, 0755); err != nil {
+		return fmt.Errorf("failed to recreate review artifacts root: %w", err)
+	}
+	return nil
 }
 
 func stagingItemIdentity(item StagingItem) string {
@@ -781,6 +799,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 	var reviewItems []StagingItem
 	var reviewSummaryItems []reviewSummaryItem
 	var resultsDir string
+	var artifactCommentRoot string
 
 	var consumerWg sync.WaitGroup
 
@@ -806,7 +825,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 				VideoID:      videoID,
 				InputPath:    opts.InputPath,
 				Tracks:       reviewItems,
-				ArtifactRoot: filepath.Join("results", videoID, "tracks"),
+				ArtifactRoot: artifactCommentRoot,
 			}
 			if err := writeReviewArtifacts(opts.ReviewFile, doc); err != nil {
 				// Try to send the error back to the main routine.
@@ -884,11 +903,18 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 	if _, err := os.Stat("/data"); err == nil {
 		outputBase = "/data"
 	}
+	artifactCommentRoot = reviewArtifactCommentRoot(outputBase, videoID)
 	// Optimization: Ensure output directory exists ONCE, not per-track
 	resultsDir = filepath.Join(outputBase, "results", videoID)
 	if err := os.MkdirAll(resultsDir, 0755); err != nil {
 		sendErr(ctx, errChan, fmt.Errorf("failed to create output directory: %w", err))
 		return
+	}
+	if opts.ReviewFile != "" {
+		if err := prepareReviewArtifactsRoot(resultsDir); err != nil {
+			sendErr(ctx, errChan, err)
+			return
+		}
 	}
 	fmt.Fprintf(os.Stderr, "📂 Output Directory: %s\n", resultsDir)
 

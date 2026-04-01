@@ -46,6 +46,9 @@ func runCommit(ctx context.Context, stagingPath string) error {
 			return fmt.Errorf("review file is missing input_path")
 		}
 	}
+	if err := validateReviewTrackKeys(review); err != nil {
+		return err
+	}
 	review, err = hydrateReviewDocument(stagingPath, review)
 	if err != nil {
 		return err
@@ -80,6 +83,9 @@ func prepareCommitBatch(review ReviewDocument, legacyFormat bool) ([]store.Commi
 		if review.InputPath == "" {
 			return nil, nil, 0, fmt.Errorf("review file is missing input_path")
 		}
+	}
+	if err := validateReviewTrackKeys(review); err != nil {
+		return nil, nil, 0, err
 	}
 
 	var actions []store.CommitAction
@@ -171,6 +177,21 @@ func prepareCommitBatch(review ReviewDocument, legacyFormat bool) ([]store.Commi
 	}
 
 	return actions, intervals, skipCount, nil
+}
+
+func validateReviewTrackKeys(review ReviewDocument) error {
+	seen := make(map[string]int, len(review.Tracks))
+	for i, item := range review.Tracks {
+		key := stagingItemKey(item)
+		if key == "" {
+			return fmt.Errorf("validation failed on item %d: missing review track id", i)
+		}
+		if prev, ok := seen[key]; ok {
+			return fmt.Errorf("review file has duplicate track id '%s' on items %d and %d", key, prev, i+1)
+		}
+		seen[key] = i + 1
+	}
+	return nil
 }
 
 func readReviewDocument(data []byte) (ReviewDocument, bool, error) {

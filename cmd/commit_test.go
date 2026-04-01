@@ -43,6 +43,25 @@ func TestPrepareCommitBatchRejectsBlankActions(t *testing.T) {
 	}
 }
 
+func TestPrepareCommitBatchRejectsDuplicateReviewIDs(t *testing.T) {
+	review := ReviewDocument{
+		VideoID:   "vid_test",
+		InputPath: "/tmp/test.mp4",
+		Tracks: []StagingItem{
+			{ID: 1, Action: "discard"},
+			{ID: 1, Action: "discard"},
+		},
+	}
+
+	_, _, _, err := prepareCommitBatch(review, false)
+	if err == nil {
+		t.Fatal("expected duplicate review IDs to be rejected")
+	}
+	if !strings.Contains(err.Error(), "duplicate track id '1'") {
+		t.Fatalf("expected duplicate review ID error, got: %v", err)
+	}
+}
+
 func TestPrepareCommitBatchRejectsCurrentFormatWithoutVideoMetadata(t *testing.T) {
 	review := ReviewDocument{
 		Tracks: []StagingItem{
