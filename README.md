@@ -58,7 +58,7 @@ The worker IPC is a custom binary protocol. Go sends frames over stdin and reads
 Sentinel is review-first by default.
 
 1. Run `sentinel scan`.
-2. Sentinel writes a review YAML file and thumbnails.
+2. Sentinel writes a review YAML file, a sidecar review data file, and track review artifacts.
 3. You review or edit the file.
 4. Run `sentinel commit <review.yaml>` to apply it to Postgres.
 
@@ -99,7 +99,7 @@ Sentinel does not dump frames to disk as part of the main processing path. Video
 
 ### Review and Commit Model
 
-- `scan` in default mode creates a review file and leaves Postgres untouched for identities and intervals
+- `scan` in default mode creates a human-editable review YAML plus a sidecar data file, writes track review artifacts under `results/<video>/tracks/<id>/`, and leaves Postgres untouched for identities and intervals
 - `commit` applies reviewed actions atomically and records a rollback ledger
 - `rollback` reverts a specific commit, with guards to prevent rolling back older video commits after newer ones touched the same video
 
@@ -113,7 +113,7 @@ Global flag:
 
 Status: `Safe default` by default. `Unsafe` when `--no-staging` is used.
 
-Scans a video and produces a review file by default.
+Scans a video and produces a review YAML plus sidecar data file by default.
 
 | Flag | Short | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -127,14 +127,46 @@ Scans a video and produces a review file by default.
 | `--buffer-size` | `-B` | `200` | Max in-flight frames in memory |
 | `--worker-timeout` |  | `30s` | Per-frame worker timeout |
 | `--debug-screenshots` | `-d` | `false` | Save debug frames |
-| `--review-file` |  | auto | Custom output path for the review YAML |
+| `--review-file` |  | auto | Custom output path for the review YAML. Sentinel writes a sibling `.data.json` sidecar next to it. |
 | `--no-staging` |  | `false` | Bypass review and write directly to Postgres. Unsafe. |
 
 Behavior:
 
-- default: writes `data/reviews/<video>.review.yaml` and thumbnails
+- default: writes `data/reviews/<video>.review.yaml`, `data/reviews/<video>.review.data.json`, and track artifacts under `data/results/<video>/tracks/<id>/`
 - `--review-file`: same staged behavior, custom review file path
 - `--no-staging`: skips review and writes directly to the DB
+
+Review YAML shape:
+
+```yaml
+video_id: <video hash>
+input_path: samples/example.mp4
+tracks:
+
+    - id: 1
+      start_time: 0
+      end_time: 2.08
+      nearest_candidates:
+        - identity: Jenny
+          variant: Default
+          distance: 0.284
+        - identity: Jenna
+          variant: Default
+          distance: 0.317
+      confidence: 0.84
+      reason: nearest_distance=0.284 <= merge_cutoff=0.350 -> suggested merge
+      identity: Jenny
+      variant: Default
+      action: merge
+```
+
+Per-track review artifacts:
+
+- `1_First_Detection_[score].jpg`
+- `2_Last_Detection_[score].jpg`
+- `3_Highest_Confidence_[score].jpg`
+- `4_Lowest_Confidence_[score].jpg`
+- `frames/` contains sampled appearance snapshots when the face score changes materially during the track
 
 ### `commit`
 
@@ -376,6 +408,7 @@ env GOCACHE=/tmp/sentinel-gocache go build ./cmd/sentinel
 - live RTSP ingestion
 - audio-aware redaction
 - improved clustering and review tooling
+- lightweight review UI/TUI that writes back to the staged review YAML
 
 ### Contact
 

@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -234,6 +236,8 @@ func runScan(ctx context.Context, opts Options) error {
 		progressbar.OptionSetWriter(os.Stderr), // Write bar to Stderr
 		progressbar.OptionShowCount(),
 	)
+	barUpdateStop := make(chan struct{})
+	barUpdateDone := make(chan struct{})
 
 	// Start Aggregator (Consumer) concurrently to prevent deadlock on resultsChan
 	aggDone := make(chan struct{})
@@ -244,6 +248,7 @@ func runScan(ctx context.Context, opts Options) error {
 	}()
 
 	go func() {
+		defer close(barUpdateDone)
 		updateDesc := func() {
 			mem := atomic.LoadUint64(&currentMemory)
 			bufLen := len(inflightSem)
@@ -259,6 +264,8 @@ func runScan(ctx context.Context, opts Options) error {
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-barUpdateStop:
 				return
 			case <-ticker.C:
 				updateDesc()
@@ -356,6 +363,8 @@ func runScan(ctx context.Context, opts Options) error {
 	}
 
 	bar.Finish()
+	close(barUpdateStop)
+	<-barUpdateDone
 
 	close(taskChan)
 
@@ -398,6 +407,7 @@ func runScan(ctx context.Context, opts Options) error {
 		default:
 			// Success
 			fmt.Fprintf(os.Stderr, "\n📝 Review file generated at: %s\n", opts.ReviewFile)
+			fmt.Fprintf(os.Stderr, "🧠 Review data file generated at: %s\n", reviewDataFilePath(opts.ReviewFile))
 			return nil
 		}
 	}
@@ -497,23 +507,63 @@ func startWorker(ctx context.Context, id int, tasks <-chan types.FrameTask, resu
 
 // StagingItem represents a track to be reviewed in YAML.
 type StagingItem struct {
-	TrackID           string  `yaml:"track_id"`
-	StartTime         float64 `yaml:"start_time"`
-	EndTime           float64 `yaml:"end_time"`
-	SuggestedIdentity string  `yaml:"suggested_identity"`
-	SuggestedVariant  string  `yaml:"suggested_variant"`
-	Confidence        float64 `yaml:"confidence"`
-	Thumbnail         string  `yaml:"thumbnail"`
-	Action            string  `yaml:"action"`
+	ID                      int     `yaml:"id,omitempty"`
+	LegacyTrackID           string  `yaml:"track_id,omitempty"`
+	StartTime               float64 `yaml:"start_time"`
+	EndTime                 float64 `yaml:"end_time"`
+	NearestIdentity         string  `yaml:"nearest_identity,omitempty"`
+	NearestVariant          string  `yaml:"nearest_variant,omitempty"`
+	NearestCandidates       []NearestCandidate `yaml:"nearest_candidates,omitempty"`
+	Identity                string  `yaml:"identity"`
+	Variant                 string  `yaml:"variant"`
+	LegacySuggestedIdentity string  `yaml:"suggested_identity,omitempty"`
+	LegacySuggestedVariant  string  `yaml:"suggested_variant,omitempty"`
+	Confidence              float64 `yaml:"confidence"`
+	Reason                  string  `yaml:"reason,omitempty"`
+	Notes                   string  `yaml:"notes,omitempty"`
+	Thumbnail               string  `yaml:"thumbnail,omitempty"`
+	Action                  string  `yaml:"action"`
 	// Internal data for the commit process
 	InternalVector []float64 `yaml:"internal_vector,omitempty"`
 	InternalCount  int       `yaml:"internal_count,omitempty"`
 }
 
+type NearestCandidate struct {
+	Identity string  `yaml:"identity"`
+	Variant  string  `yaml:"variant,omitempty"`
+	Distance float64 `yaml:"distance"`
+}
+
 type ReviewDocument struct {
-	VideoID   string        `yaml:"video_id,omitempty"`
-	InputPath string        `yaml:"input_path,omitempty"`
-	Tracks    []StagingItem `yaml:"tracks"`
+	VideoID      string        `yaml:"video_id,omitempty"`
+	InputPath    string        `yaml:"input_path,omitempty"`
+	Tracks       []StagingItem `yaml:"tracks"`
+	ArtifactRoot string        `yaml:"-"`
+}
+
+type ReviewTrackData struct {
+	InternalVector []float64 `json:"internal_vector"`
+	InternalCount  int       `json:"internal_count"`
+}
+
+type ReviewSidecarDocument struct {
+	Tracks map[string]ReviewTrackData `json:"tracks"`
+}
+
+type reviewSummaryItem struct {
+	ID                int
+	StartTime         float64
+	EndTime           float64
+	NearestIdentity   string
+	NearestVariant    string
+	NearestCandidates []NearestCandidate
+	Identity          string
+	Variant           string
+	Confidence        float64
+	Reason            string
+	Action            string
+	KnownVariant      bool
+	ArtifactDir       string
 }
 
 // --- Aggregation & Tracking Logic ---
@@ -566,10 +616,171 @@ type timeRange struct {
 	End   float64
 }
 
+func stagingItemKey(item StagingItem) string {
+	if item.ID > 0 {
+		return strconv.Itoa(item.ID)
+	}
+	return strings.TrimSpace(item.LegacyTrackID)
+}
+
+func stagingItemLabel(item StagingItem) string {
+	if item.ID > 0 {
+		return strconv.Itoa(item.ID)
+	}
+	if item.LegacyTrackID != "" {
+		return item.LegacyTrackID
+	}
+	return "unknown"
+}
+
+func reviewArtifactRelativeDir(videoID string, reviewID int) string {
+	return filepath.Join("results", videoID, "tracks", strconv.Itoa(reviewID))
+}
+
+func reviewArtifactDir(resultsDir string, reviewID int) string {
+	return filepath.Join(resultsDir, "tracks", strconv.Itoa(reviewID))
+}
+
+func stagingItemIdentity(item StagingItem) string {
+	if item.Identity != "" {
+		return item.Identity
+	}
+	return item.LegacySuggestedIdentity
+}
+
+func stagingItemVariant(item StagingItem) string {
+	if item.Variant != "" {
+		return item.Variant
+	}
+	return item.LegacySuggestedVariant
+}
+
+func identityVariantLabel(identity, variant string) string {
+	switch {
+	case identity != "" && variant != "":
+		return fmt.Sprintf("%s / %s", identity, variant)
+	case identity != "":
+		return identity
+	default:
+		return "none"
+	}
+}
+
+func roundTo(v float64, places int) float64 {
+	if places < 0 {
+		return v
+	}
+	factor := math.Pow(10, float64(places))
+	return math.Round(v*factor) / factor
+}
+
+func candidateLabel(candidate NearestCandidate) string {
+	return identityVariantLabel(candidate.Identity, candidate.Variant)
+}
+
+func stagingNearestCandidates(item StagingItem) []NearestCandidate {
+	if len(item.NearestCandidates) > 0 {
+		return item.NearestCandidates
+	}
+	if item.NearestIdentity == "" && item.NearestVariant == "" {
+		return nil
+	}
+	return []NearestCandidate{{
+		Identity: item.NearestIdentity,
+		Variant:  item.NearestVariant,
+	}}
+}
+
+func reviewReason(matches []store.IdentityMatch, matchThreshold float64, action string) string {
+	if len(matches) == 0 {
+		return "no stored variants found -> suggested new_identity"
+	}
+
+	topDistance := roundTo(matches[0].Distance, 3)
+	switch action {
+	case "new_identity":
+		return fmt.Sprintf("nearest_distance=%.3f > threshold=%.3f -> suggested new_identity", topDistance, roundTo(matchThreshold, 3))
+	case "":
+		if len(matches) > 1 {
+			secondDistance := roundTo(matches[1].Distance, 3)
+			gap := roundTo(math.Abs(matches[1].Distance-matches[0].Distance), 3)
+			return fmt.Sprintf("nearest_distance=%.3f, second_distance=%.3f, gap=%.3f < 0.050 -> needs review", topDistance, secondDistance, gap)
+		}
+		return fmt.Sprintf("nearest_distance=%.3f -> needs review", topDistance)
+	case "new_variant":
+		return fmt.Sprintf("nearest_distance=%.3f is within threshold=%.3f but above merge_cutoff=0.350 -> suggested new_variant", topDistance, roundTo(matchThreshold, 3))
+	case "merge":
+		return fmt.Sprintf("nearest_distance=%.3f <= merge_cutoff=0.350 -> suggested merge", topDistance)
+	default:
+		return fmt.Sprintf("nearest_distance=%.3f -> suggested %s", topDistance, action)
+	}
+}
+
+func reviewActionLabel(action string) string {
+	switch action {
+	case "":
+		return "needs_review"
+	default:
+		return action
+	}
+}
+
+func printReviewSummary(videoID string, items []reviewSummaryItem, totalDetections int) {
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+
+	fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
+	fmt.Fprintf(os.Stderr, "📋 REVIEW SUMMARY\n")
+	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
+
+	for _, item := range items {
+		status := "pending track"
+		if item.KnownVariant {
+			status = "known variant"
+		}
+
+		candidates := item.NearestCandidates
+		if len(candidates) == 0 {
+			candidates = stagingNearestCandidates(StagingItem{
+				NearestIdentity: item.NearestIdentity,
+				NearestVariant:  item.NearestVariant,
+			})
+		}
+		targetVariant := item.Variant
+		if item.Action == "new_variant" && targetVariant == "" && item.Identity != "" {
+			targetVariant = "[set during review]"
+		}
+		target := identityVariantLabel(item.Identity, targetVariant)
+
+		fmt.Fprintf(os.Stderr, "\n🎞️ Track %d [%s]\n", item.ID, status)
+		fmt.Fprintf(os.Stderr, "   time: %s -> %s\n", utils.FmtTime(item.StartTime), utils.FmtTime(item.EndTime))
+		fmt.Fprintf(os.Stderr, "   action: %s\n", reviewActionLabel(item.Action))
+		if len(candidates) == 0 {
+			fmt.Fprintf(os.Stderr, "   nearest: none\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "   nearest:\n")
+			for i, candidate := range candidates {
+				fmt.Fprintf(os.Stderr, "     %d. %s (distance: %.3f)\n", i+1, candidateLabel(candidate), candidate.Distance)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "   target: %s\n", target)
+		fmt.Fprintf(os.Stderr, "   confidence: %.2f\n", item.Confidence)
+		if item.Reason != "" {
+			fmt.Fprintf(os.Stderr, "   reason: %s\n", item.Reason)
+		}
+		fmt.Fprintf(os.Stderr, "   artifacts: %s/\n", item.ArtifactDir)
+	}
+
+	fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
+	fmt.Fprintf(os.Stderr, "👁️  Total Face Detections:   %d\n", totalDetections)
+	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
+}
+
 func processResults(ctx context.Context, results <-chan scanResult, db scanDB, videoID string, fps float64, opts Options, errChan chan<- error, finalIntervalsChan chan<- []store.IntervalData, inflightSem chan struct{}) {
 	var reviewFileReadyToWrite bool
 	var finalIntervals []store.IntervalData
 	var reviewItems []StagingItem
+	var reviewSummaryItems []reviewSummaryItem
+	var resultsDir string
 
 	var consumerWg sync.WaitGroup
 
@@ -592,11 +803,12 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 		// Only write the review file if the process completed successfully.
 		if reviewFileReadyToWrite && opts.ReviewFile != "" {
 			doc := ReviewDocument{
-				VideoID:   videoID,
-				InputPath: opts.InputPath,
-				Tracks:    reviewItems,
+				VideoID:      videoID,
+				InputPath:    opts.InputPath,
+				Tracks:       reviewItems,
+				ArtifactRoot: filepath.Join("results", videoID, "tracks"),
 			}
-			if err := writeReviewFile(opts.ReviewFile, doc); err != nil {
+			if err := writeReviewArtifacts(opts.ReviewFile, doc); err != nil {
 				// Try to send the error back to the main routine.
 				// Use a non-blocking send in case the channel is already full or closed.
 				select {
@@ -655,6 +867,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 	idNames := make(map[int]identityNameData)
 	newlyCreated := make(map[int]bool) // Track which IDs were generated in this session
 	tempIDCounter := -1                // Negative IDs for pending tracks
+	nextReviewID := 1
 
 	summary := make(map[int][]timeRange)
 	totalDetections := 0
@@ -672,7 +885,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 		outputBase = "/data"
 	}
 	// Optimization: Ensure output directory exists ONCE, not per-track
-	resultsDir := filepath.Join(outputBase, "results", videoID)
+	resultsDir = filepath.Join(outputBase, "results", videoID)
 	if err := os.MkdirAll(resultsDir, 0755); err != nil {
 		sendErr(ctx, errChan, fmt.Errorf("failed to create output directory: %w", err))
 		return
@@ -708,14 +921,56 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 
 		// --- Review Mode Logic ---
 		if opts.ReviewFile != "" {
-			// Save best thumbnail to disk for review
-			thumbFilename := fmt.Sprintf("%s_thumb.jpg", fmt.Sprintf("Track_%d", t.ID))
+			reviewID := nextReviewID
+			nextReviewID++
+
+			trackDir := reviewArtifactDir(resultsDir, reviewID)
+			framesDir := filepath.Join(trackDir, "frames")
+			if err := os.MkdirAll(framesDir, 0755); err != nil {
+				sendErr(ctx, errChan, fmt.Errorf("failed to create review track directory: %w", err))
+				return
+			}
+
 			if !sendThumbOp(thumbOp{
-				dir:      resultsDir,
-				filename: thumbFilename,
-				data:     t.BestThumb,
+				dir:        trackDir,
+				filename:   fmt.Sprintf("1_First_Detection_[%.2f].jpg", t.FirstScore),
+				data:       t.FirstThumb,
+				removeGlob: "1_First_Detection_*.jpg",
 			}) {
 				return
+			}
+			if !sendThumbOp(thumbOp{
+				dir:        trackDir,
+				filename:   fmt.Sprintf("2_Last_Detection_[%.2f].jpg", t.LastScore),
+				data:       t.LastThumb,
+				removeGlob: "2_Last_Detection_*.jpg",
+			}) {
+				return
+			}
+			if !sendThumbOp(thumbOp{
+				dir:        trackDir,
+				filename:   fmt.Sprintf("3_Highest_Confidence_[%.2f].jpg", t.BestQuality),
+				data:       t.BestThumb,
+				removeGlob: "3_Highest_Confidence_*.jpg",
+			}) {
+				return
+			}
+			if !sendThumbOp(thumbOp{
+				dir:        trackDir,
+				filename:   fmt.Sprintf("4_Lowest_Confidence_[%.2f].jpg", t.LowestScore),
+				data:       t.LowestThumb,
+				removeGlob: "4_Lowest_Confidence_*.jpg",
+			}) {
+				return
+			}
+			for _, f := range t.PendingFrames {
+				if !sendThumbOp(thumbOp{
+					dir:      framesDir,
+					filename: fmt.Sprintf("frame_[%05d]_score_[%.2f].jpg", f.Index, f.Score),
+					data:     f.Data,
+				}) {
+					return
+				}
 			}
 
 			// Ranked k-NN Logic
@@ -727,22 +982,26 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 			}
 
 			item := StagingItem{
-				TrackID:        fmt.Sprintf("Track_%d", t.ID),
+				ID:             reviewID,
 				StartTime:      startSec,
 				EndTime:        endSec,
-				Thumbnail:      filepath.Join("results", videoID, thumbFilename),
 				InternalVector: t.MeanVec,
 				InternalCount:  t.Count,
 			}
 
 			if len(matches) > 0 {
 				top := matches[0]
+				for _, match := range matches {
+					item.NearestCandidates = append(item.NearestCandidates, NearestCandidate{
+						Identity: match.IdentityName,
+						Variant:  match.VariantName,
+						Distance: roundTo(match.Distance, 3),
+					})
+				}
 				// Convert distance to confidence (0.0 - 1.0)
 				// Assuming simple linear inversion for display: 1.0 - (dist / 2.0)
 				// Since cosine dist is 0..2
 				conf := 1.0 - (top.Distance / 2.0)
-				item.SuggestedIdentity = top.IdentityName
-				item.SuggestedVariant = top.VariantName
 				item.Confidence = math.Round(conf*100) / 100
 
 				// Heuristics
@@ -761,11 +1020,36 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 					// High confidence (<= 0.35) -> Merge
 					item.Action = "merge"
 				}
+
+				switch item.Action {
+				case "merge":
+					item.Identity = top.IdentityName
+					item.Variant = top.VariantName
+				case "new_variant":
+					item.Identity = top.IdentityName
+					item.Variant = ""
+				}
 			} else {
 				item.Action = "new_identity"
 			}
+			item.Reason = reviewReason(matches, opts.MatchThreshold, item.Action)
 
 			reviewItems = append(reviewItems, item)
+			reviewSummaryItems = append(reviewSummaryItems, reviewSummaryItem{
+				ID:                reviewID,
+				StartTime:         startSec,
+				EndTime:           endSec,
+				NearestIdentity:   item.NearestIdentity,
+				NearestVariant:    item.NearestVariant,
+				NearestCandidates: item.NearestCandidates,
+				Identity:          item.Identity,
+				Variant:           item.Variant,
+				Confidence:        item.Confidence,
+				Reason:            item.Reason,
+				Action:            item.Action,
+				KnownVariant:      t.IsKnown,
+				ArtifactDir:       reviewArtifactRelativeDir(videoID, reviewID),
+			})
 			return // Skip DB persistence in review mode
 		}
 
@@ -939,67 +1223,71 @@ Loop:
 		persistTrack(t)
 	}
 
-	fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
-	fmt.Fprintf(os.Stderr, "📊 SCAN SUMMARY\n")
-	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
+	if opts.ReviewFile != "" {
+		printReviewSummary(videoID, reviewSummaryItems, totalDetections)
+	} else {
+		fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
+		fmt.Fprintf(os.Stderr, "📊 SCAN SUMMARY\n")
+		fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 
-	// Group results by Identity
-	identityGroups := make(map[int][]int) // IdentityID -> []VariantID
-	for vid := range summary {
-		mid := variantToIdentityID[vid]
-		identityGroups[mid] = append(identityGroups[mid], vid)
-	}
-
-	var identityIDs []int
-	for mid := range identityGroups {
-		identityIDs = append(identityIDs, mid)
-	}
-	sort.Ints(identityIDs)
-
-	for _, mid := range identityIDs {
-		vids := identityGroups[mid]
-		sort.Ints(vids)
-
-		// Derive Identity info from the first variant
-		firstVID := vids[0]
-		names := idNames[firstVID]
-		identityName := names.IdentityName
-		if identityName == "" {
-			identityName = fmt.Sprintf("Identity %d", mid)
+		// Group results by Identity
+		identityGroups := make(map[int][]int) // IdentityID -> []VariantID
+		for vid := range summary {
+			mid := variantToIdentityID[vid]
+			identityGroups[mid] = append(identityGroups[mid], vid)
 		}
 
-		thumbNote := ""
-		if _, ok := globalBestScore[mid]; ok {
-			thumbNote = fmt.Sprintf("(See results/%s/identity_%d/)", videoID, mid)
+		var identityIDs []int
+		for mid := range identityGroups {
+			identityIDs = append(identityIDs, mid)
 		}
+		sort.Ints(identityIDs)
 
-		// Determine status based on whether any variant is new
-		status := "💾"
-		for _, vid := range vids {
-			if newlyCreated[vid] {
-				status = "✨"
-				break
+		for _, mid := range identityIDs {
+			vids := identityGroups[mid]
+			sort.Ints(vids)
+
+			// Derive Identity info from the first variant
+			firstVID := vids[0]
+			names := idNames[firstVID]
+			identityName := names.IdentityName
+			if identityName == "" {
+				identityName = fmt.Sprintf("Identity %d", mid)
+			}
+
+			thumbNote := ""
+			if _, ok := globalBestScore[mid]; ok {
+				thumbNote = fmt.Sprintf("(See results/%s/identity_%d/)", videoID, mid)
+			}
+
+			// Determine status based on whether any variant is new
+			status := "💾"
+			for _, vid := range vids {
+				if newlyCreated[vid] {
+					status = "✨"
+					break
+				}
+			}
+
+			fmt.Fprintf(os.Stderr, "\n👤 %s %s (ID: %d) Found: %s\n", identityName, status, mid, thumbNote)
+
+			for _, vid := range vids {
+				vName := idNames[vid].VariantName
+				if vName == "" {
+					vName = "Default"
+				}
+
+				fmt.Fprintf(os.Stderr, "   👉 Variant: %s (ID: %d)\n", vName, vid)
+				for _, r := range summary[vid] {
+					fmt.Fprintf(os.Stderr, "      %s -> %s\n", utils.FmtTime(r.Start), utils.FmtTime(r.End))
+				}
 			}
 		}
 
-		fmt.Fprintf(os.Stderr, "\n👤 %s %s (ID: %d) Found: %s\n", identityName, status, mid, thumbNote)
-
-		for _, vid := range vids {
-			vName := idNames[vid].VariantName
-			if vName == "" {
-				vName = "Default"
-			}
-
-			fmt.Fprintf(os.Stderr, "   👉 Variant: %s (ID: %d)\n", vName, vid)
-			for _, r := range summary[vid] {
-				fmt.Fprintf(os.Stderr, "      %s -> %s\n", utils.FmtTime(r.Start), utils.FmtTime(r.End))
-			}
-		}
+		fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
+		fmt.Fprintf(os.Stderr, "👁️  Total Face Detections:   %d\n", totalDetections)
+		fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 	}
-
-	fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
-	fmt.Fprintf(os.Stderr, "👁️  Total Face Detections:   %d\n", totalDetections)
-	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 	reviewFileReadyToWrite = true
 }
 
@@ -1174,6 +1462,54 @@ func sendErr(ctx context.Context, errChan chan<- error, err error) {
 	}
 }
 
+func writeReviewArtifacts(path string, doc ReviewDocument) error {
+	reviewDoc, reviewData, err := splitReviewDocument(doc)
+	if err != nil {
+		return err
+	}
+	if err := writeReviewFile(path, reviewDoc); err != nil {
+		return err
+	}
+	if err := writeReviewSidecarFile(reviewDataFilePath(path), reviewData); err != nil {
+		return err
+	}
+	return nil
+}
+
+func splitReviewDocument(doc ReviewDocument) (ReviewDocument, ReviewSidecarDocument, error) {
+	reviewDoc := ReviewDocument{
+		VideoID:      doc.VideoID,
+		InputPath:    doc.InputPath,
+		Tracks:       make([]StagingItem, 0, len(doc.Tracks)),
+		ArtifactRoot: doc.ArtifactRoot,
+	}
+	reviewData := ReviewSidecarDocument{
+		Tracks: make(map[string]ReviewTrackData, len(doc.Tracks)),
+	}
+
+	for _, item := range doc.Tracks {
+		sanitized := item
+		sanitized.InternalVector = nil
+		sanitized.InternalCount = 0
+		sanitized.Thumbnail = ""
+		reviewDoc.Tracks = append(reviewDoc.Tracks, sanitized)
+
+		if len(item.InternalVector) == 0 && item.InternalCount == 0 {
+			continue
+		}
+		key := stagingItemKey(item)
+		if key == "" {
+			return ReviewDocument{}, ReviewSidecarDocument{}, fmt.Errorf("cannot write review data for track with blank id")
+		}
+		reviewData.Tracks[key] = ReviewTrackData{
+			InternalVector: item.InternalVector,
+			InternalCount:  item.InternalCount,
+		}
+	}
+
+	return reviewDoc, reviewData, nil
+}
+
 func writeReviewFile(path string, doc ReviewDocument) error {
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
@@ -1186,11 +1522,78 @@ func writeReviewFile(path string, doc ReviewDocument) error {
 		return fmt.Errorf("failed to create review file: %w", err)
 	}
 	defer f.Close()
-	enc := yaml.NewEncoder(f)
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(4)
 	if err := enc.Encode(doc); err != nil {
 		return fmt.Errorf("failed to encode review YAML: %w", err)
 	}
+	if err := enc.Close(); err != nil {
+		return fmt.Errorf("failed to finalize review YAML: %w", err)
+	}
+	formatted := strings.TrimPrefix(buf.String(), "---\n")
+	header := "# Edit only `identity`, `variant`, and `action`.\n" +
+		"# Leave `id`, `start_time`, `end_time`, `nearest_candidates`, `confidence`, and `reason` unchanged.\n" +
+		"# Valid actions: merge | new_identity | new_variant | discard.\n" +
+		"# The prefilled `action` is Sentinel's best guess from scan heuristics, not final truth.\n" +
+		"# Optional: add `notes` under any track if you want to leave reviewer context.\n"
+	if doc.ArtifactRoot != "" {
+		header += "# Corresponding thumbnails and frame artifacts live under:\n"
+		header += fmt.Sprintf("#   %s/<id>/\n", doc.ArtifactRoot)
+	}
+	formatted = header + formatted
+	formatted = strings.ReplaceAll(formatted, "\n    - id:", "\n\n    # Read-only fields below are generated by scan.\n    - id:")
+	formatted = strings.ReplaceAll(formatted, "\n    - track_id:", "\n\n    # Read-only fields below are generated by scan.\n    - track_id:")
+	formatted = strings.ReplaceAll(formatted, "\n      identity:", "\n      # Editable fields below are the values that will be committed.\n      # For `new_identity`, leave `variant` blank; Sentinel will create the `Default` variant.\n      # For `new_variant`, set `identity` to the existing person and `variant` to the new variant name.\n      # Optional: add `notes` if you want to leave reviewer context for this track.\n      identity:")
+	if _, err := f.WriteString(formatted); err != nil {
+		return fmt.Errorf("failed to write review YAML: %w", err)
+	}
 	return nil
+}
+
+func writeReviewSidecarFile(path string, doc ReviewSidecarDocument) error {
+	dir := filepath.Dir(path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create review data directory: %w", err)
+		}
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("failed to create review data file: %w", err)
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(doc); err != nil {
+		return fmt.Errorf("failed to encode review data JSON: %w", err)
+	}
+	return nil
+}
+
+func readReviewSidecarFile(path string) (ReviewSidecarDocument, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ReviewSidecarDocument{}, err
+	}
+	var doc ReviewSidecarDocument
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return ReviewSidecarDocument{}, fmt.Errorf("failed to parse review data JSON: %w", err)
+	}
+	if doc.Tracks == nil {
+		doc.Tracks = make(map[string]ReviewTrackData)
+	}
+	return doc, nil
+}
+
+func reviewDataFilePath(reviewPath string) string {
+	ext := filepath.Ext(reviewPath)
+	switch ext {
+	case ".yaml", ".yml":
+		return strings.TrimSuffix(reviewPath, ext) + ".data.json"
+	default:
+		return reviewPath + ".data.json"
+	}
 }
 
 func newActiveTrack(id, identityID, frameIndex int, vec []float64, thumb []byte, quality float64, name, variantName string, isKnown bool, loc []int) *activeTrack {
