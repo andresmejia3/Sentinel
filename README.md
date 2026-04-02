@@ -162,7 +162,7 @@ tracks:
       action: merge
 ```
 
-For `new_identity`, leave `identity` blank to let Sentinel auto-name it, and leave `variant` blank so Sentinel creates the `Default` variant.
+For `new_identity`, if `identity` is left blank, then Sentinel will auto-name it. If `variant` is left blank, then Sentinel will create the `Default` variant.
 
 Review rules:
 

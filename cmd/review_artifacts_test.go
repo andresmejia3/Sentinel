@@ -77,7 +77,7 @@ func TestWriteReviewArtifactsSplitsVectorsIntoSidecar(t *testing.T) {
 	if !strings.Contains(reviewText, "# Editable fields below are the values that will be committed.") {
 		t.Fatalf("expected per-track editable guidance comment, got:\n%s", reviewText)
 	}
-	if !strings.Contains(reviewText, "# For `new_identity`, leave `identity` blank to let Sentinel auto-name it, and leave `variant` blank; Sentinel will create the `Default` variant.") {
+	if !strings.Contains(reviewText, "# For `new_identity`, if `identity` is left blank, then Sentinel will auto-name it. If `variant` is left blank, then Sentinel will create the `Default` variant.") {
 		t.Fatalf("expected new_identity variant guidance comment, got:\n%s", reviewText)
 	}
 	if !strings.Contains(reviewText, "# For `new_variant`, set `identity` to the existing person and `variant` to the new variant name.") {
@@ -91,6 +91,9 @@ func TestWriteReviewArtifactsSplitsVectorsIntoSidecar(t *testing.T) {
 	}
 	if !strings.Contains(reviewText, "reason: nearest_distance=0.284, second_distance=0.317, gap=0.033 < 0.050 -> needs review") {
 		t.Fatalf("expected concrete reason field, got:\n%s", reviewText)
+	}
+	if strings.Index(reviewText, "confidence:") > strings.Index(reviewText, "# Editable fields below are the values that will be committed.") {
+		t.Fatalf("expected confidence to remain in the read-only section above the editable-fields comment, got:\n%s", reviewText)
 	}
 	if !strings.Contains(reviewText, "identity: \"\"") || !strings.Contains(reviewText, "variant: \"\"") {
 		t.Fatalf("expected blank editable identity/variant fields to remain visible, got:\n%s", reviewText)
