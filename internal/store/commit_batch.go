@@ -27,8 +27,7 @@ type CommitInterval struct {
 }
 
 var (
-	identityNamePattern = regexp.MustCompile(`^Identity (\d+)$`)
-	systemNamePattern   = regexp.MustCompile(`^Identity \d+.*`)
+	identityNamePattern = regexp.MustCompile(`(?i)^identity (\d+)$`)
 )
 
 // ApplyCommitBatch applies an entire staging batch inside one transaction.
@@ -60,7 +59,7 @@ func (s *Store) ApplyCommitBatch(ctx context.Context, commitID string, actions [
 	}
 
 	variantByTrack := make(map[string]int, len(actions))
-	for _, action := range actions {
+	for _, action := range orderCommitActions(actions) {
 		variantID, err := applyCommitActionTx(ctx, tx, commitID, action)
 		if err != nil {
 			return err
@@ -109,6 +108,29 @@ func (s *Store) ApplyCommitBatch(ctx context.Context, commitID string, actions [
 	return tx.Commit(ctx)
 }
 
+func orderCommitActions(actions []CommitAction) []CommitAction {
+	ordered := make([]CommitAction, 0, len(actions))
+	appendPhase := func(targetAction string) {
+		for _, action := range actions {
+			if action.Action == targetAction {
+				ordered = append(ordered, action)
+			}
+		}
+	}
+
+	appendPhase("new_identity")
+	appendPhase("new_variant")
+	appendPhase("merge")
+
+	for _, action := range actions {
+		if action.Action != "new_identity" && action.Action != "new_variant" && action.Action != "merge" {
+			ordered = append(ordered, action)
+		}
+	}
+
+	return ordered
+}
+
 func applyCommitActionTx(ctx context.Context, tx pgx.Tx, commitID string, action CommitAction) (int, error) {
 	addedSum := make([]float64, len(action.Vector))
 	for i, v := range action.Vector {
@@ -149,11 +171,7 @@ func applyCommitActionTx(ctx context.Context, tx pgx.Tx, commitID string, action
 		return variantID, nil
 
 	case "new_identity":
-		nameOverride := ""
-		if action.IdentityName != "" && !systemNamePattern.MatchString(action.IdentityName) {
-			nameOverride = action.IdentityName
-		}
-		variantID, err := commitNewIdentityTx(ctx, tx, action.Vector, action.Count, ledgerEntry, nameOverride)
+		variantID, err := commitNewIdentityTx(ctx, tx, action.Vector, action.Count, ledgerEntry, action.IdentityName)
 		if err != nil {
 			return 0, fmt.Errorf("failed to commit new identity for %s: %w", action.TrackID, err)
 		}
@@ -203,7 +221,11 @@ func resolveIdentityIDTx(ctx context.Context, tx pgx.Tx, name string) (int, erro
 	matches := identityNamePattern.FindStringSubmatch(name)
 	if len(matches) == 2 {
 		parsedID, _ := strconv.Atoi(matches[1])
-		return parsedID, nil
+		existingID, err := getIdentityIDByIDTx(ctx, tx, parsedID)
+		if err != nil {
+			return 0, err
+		}
+		return existingID, nil
 	}
 
 	return 0, nil
@@ -211,16 +233,25 @@ func resolveIdentityIDTx(ctx context.Context, tx pgx.Tx, name string) (int, erro
 
 func getIdentityIDByNameTx(ctx context.Context, tx pgx.Tx, name string) (int, error) {
 	var id int
-	err := tx.QueryRow(ctx, "SELECT id FROM identities WHERE name = $1", name).Scan(&id)
+	err := tx.QueryRow(ctx, "SELECT id FROM identities WHERE LOWER(name) = LOWER($1)", name).Scan(&id)
 	if err == pgx.ErrNoRows {
 		return 0, nil
 	}
 	return id, err
 }
 
+func getIdentityIDByIDTx(ctx context.Context, tx pgx.Tx, id int) (int, error) {
+	var existingID int
+	err := tx.QueryRow(ctx, "SELECT id FROM identities WHERE id = $1", id).Scan(&existingID)
+	if err == pgx.ErrNoRows {
+		return 0, nil
+	}
+	return existingID, err
+}
+
 func getVariantIDTx(ctx context.Context, tx pgx.Tx, identityID int, name string) (int, error) {
 	var id int
-	err := tx.QueryRow(ctx, "SELECT id FROM variants WHERE identity_id = $1 AND name = $2", identityID, name).Scan(&id)
+	err := tx.QueryRow(ctx, "SELECT id FROM variants WHERE identity_id = $1 AND LOWER(name) = LOWER($2)", identityID, name).Scan(&id)
 	if err == pgx.ErrNoRows {
 		return 0, nil
 	}

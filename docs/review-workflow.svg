@@ -39,17 +39,18 @@
   <text x="100" y="302" class="mono-light"> reviews/test.review.yaml</text>
   <text x="100" y="346" class="small-light">Result: thumbnails + review artifact</text>
 
-  <rect x="410" y="120" width="390" height="310" class="card" fill="#ffffff" stroke="#d69e2e"/>
+  <rect x="410" y="120" width="390" height="340" class="card" fill="#ffffff" stroke="#d69e2e"/>
   <text x="440" y="160" class="step">2. Review YAML</text>
   <text x="440" y="194" class="mono-dark">video_id: 7fc1...</text>
   <text x="440" y="220" class="mono-dark">input_path: test.mp4</text>
   <text x="440" y="254" class="mono-dark">tracks:</text>
-  <text x="460" y="280" class="mono-dark">- track_id: -1</text>
-  <text x="490" y="306" class="mono-dark">action: link</text>
-  <text x="490" y="332" class="mono-dark">identity_name: Ross</text>
-  <text x="460" y="362" class="mono-dark">- track_id: -2</text>
-  <text x="490" y="388" class="mono-dark">action: create</text>
-  <text x="490" y="414" class="mono-dark">identity_name: Cafe Extra</text>
+  <text x="460" y="280" class="mono-dark">- id: 1</text>
+  <text x="490" y="306" class="mono-dark">action: merge</text>
+  <text x="490" y="332" class="mono-dark">identity: Ross</text>
+  <text x="490" y="358" class="mono-dark">variant: Default</text>
+  <text x="460" y="388" class="mono-dark">- id: 2</text>
+  <text x="490" y="414" class="mono-dark">action: new_identity</text>
+  <text x="490" y="440" class="mono-dark">identity: Cafe Extra</text>
   <rect x="630" y="245" width="130" height="44" rx="12" ry="12" fill="#fef3c7" stroke="#d69e2e"/>
   <text x="695" y="272" class="small-center">Human Decides</text>
 

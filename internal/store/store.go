@@ -89,6 +89,8 @@ func initSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		CREATE INDEX IF NOT EXISTS face_intervals_video_id_idx ON face_intervals (video_id);
 		CREATE INDEX IF NOT EXISTS face_intervals_variant_id_idx ON face_intervals (variant_id);
 		CREATE INDEX IF NOT EXISTS variants_embedding_idx ON variants USING hnsw (embedding vector_cosine_ops);
+		CREATE UNIQUE INDEX IF NOT EXISTS identities_name_ci_idx ON identities (LOWER(name)) WHERE name IS NOT NULL;
+		CREATE UNIQUE INDEX IF NOT EXISTS variants_identity_name_ci_idx ON variants (identity_id, LOWER(name)) WHERE name IS NOT NULL;
 
 		CREATE TABLE IF NOT EXISTS ledger_entries (
 			id BIGSERIAL PRIMARY KEY,
@@ -419,20 +421,20 @@ func (s *Store) CreateVariant(ctx context.Context, identityID int, vec []float64
 	return id, err
 }
 
-// GetIdentityIDByName looks up an identity ID by its unique name.
+// GetIdentityIDByName looks up an identity ID by name using case-insensitive matching.
 func (s *Store) GetIdentityIDByName(ctx context.Context, name string) (int, error) {
 	var id int
-	err := s.pool.QueryRow(ctx, "SELECT id FROM identities WHERE name = $1", name).Scan(&id)
+	err := s.pool.QueryRow(ctx, "SELECT id FROM identities WHERE LOWER(name) = LOWER($1)", name).Scan(&id)
 	if err == pgx.ErrNoRows {
 		return 0, nil
 	}
 	return id, err
 }
 
-// GetVariantID looks up a variant ID by identity ID and variant name.
+// GetVariantID looks up a variant ID by identity ID and variant name using case-insensitive matching.
 func (s *Store) GetVariantID(ctx context.Context, identityID int, name string) (int, error) {
 	var id int
-	err := s.pool.QueryRow(ctx, "SELECT id FROM variants WHERE identity_id = $1 AND name = $2", identityID, name).Scan(&id)
+	err := s.pool.QueryRow(ctx, "SELECT id FROM variants WHERE identity_id = $1 AND LOWER(name) = LOWER($2)", identityID, name).Scan(&id)
 	if err == pgx.ErrNoRows {
 		return 0, nil
 	}
@@ -464,11 +466,24 @@ func (s *Store) SetVariantLabel(ctx context.Context, variantID int, identityName
 	}
 	defer tx.Rollback(ctx)
 
-	// Upsert Identity
-	var identityID int
-	err = tx.QueryRow(ctx, "INSERT INTO identities (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id", identityName).Scan(&identityID)
+	identityID, err := getIdentityIDByNameTx(ctx, tx, identityName)
 	if err != nil {
-		return fmt.Errorf("failed to get/create identity: %w", err)
+		return fmt.Errorf("failed to look up identity: %w", err)
+	}
+	if identityID == 0 {
+		err = tx.QueryRow(ctx, "INSERT INTO identities (name) VALUES ($1) ON CONFLICT DO NOTHING RETURNING id", identityName).Scan(&identityID)
+		if err != nil && err != pgx.ErrNoRows {
+			return fmt.Errorf("failed to create identity: %w", err)
+		}
+		if identityID == 0 {
+			identityID, err = getIdentityIDByNameTx(ctx, tx, identityName)
+			if err != nil {
+				return fmt.Errorf("failed to resolve existing identity after insert race: %w", err)
+			}
+		}
+	}
+	if identityID == 0 {
+		return fmt.Errorf("failed to get/create identity %q", identityName)
 	}
 
 	// Update Variant

@@ -107,6 +107,61 @@ func TestStoreIntegration(t *testing.T) {
 		t.Errorf("Expected no match (-1), got %d", noMatchID)
 	}
 
+	// Commit New Identity With Explicit Name
+	vecNamed := make([]float64, 512)
+	vecNamed[2] = 1.0
+	if err := s.ApplyCommitBatch(ctx, "commit_named_identity", []CommitAction{{
+		TrackID:      "Track_named",
+		Action:       "new_identity",
+		IdentityName: "Identity 42 - Lobby",
+		Vector:       vecNamed,
+		Count:        1,
+	}}, "", "", nil); err != nil {
+		t.Fatalf("ApplyCommitBatch(commit_named_identity) failed: %v", err)
+	}
+
+	var namedIdentityCount int
+	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM identities WHERE name = $1", "Identity 42 - Lobby").Scan(&namedIdentityCount); err != nil {
+		t.Fatalf("failed to count explicitly named identity: %v", err)
+	}
+	if namedIdentityCount != 1 {
+		t.Fatalf("expected explicitly named identity to be preserved, got count=%d", namedIdentityCount)
+	}
+
+	caseInsensitiveIdentityID, err := s.GetIdentityIDByName(ctx, "identity 42 - lobby")
+	if err != nil {
+		t.Fatalf("GetIdentityIDByName(case-insensitive) failed: %v", err)
+	}
+	if caseInsensitiveIdentityID == 0 {
+		t.Fatal("expected case-insensitive identity lookup to find explicitly named identity")
+	}
+
+	glassesVec := make([]float64, 512)
+	glassesVec[3] = 1.0
+	glassesVariantID, err := s.CreateVariant(ctx, caseInsensitiveIdentityID, glassesVec, 1, "Glasses")
+	if err != nil {
+		t.Fatalf("CreateVariant failed: %v", err)
+	}
+	if glassesVariantID <= 0 {
+		t.Fatalf("expected positive glasses variant ID, got %d", glassesVariantID)
+	}
+
+	caseInsensitiveVariantID, err := s.GetVariantID(ctx, caseInsensitiveIdentityID, "glasses")
+	if err != nil {
+		t.Fatalf("GetVariantID(case-insensitive) failed: %v", err)
+	}
+	if caseInsensitiveVariantID != glassesVariantID {
+		t.Fatalf("expected case-insensitive variant lookup to find %d, got %d", glassesVariantID, caseInsensitiveVariantID)
+	}
+
+	_, err = s.CreateVariant(ctx, caseInsensitiveIdentityID, glassesVec, 1, "gLaSsEs")
+	if err == nil {
+		t.Fatal("expected case-insensitive duplicate variant name to be rejected")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+		t.Fatalf("expected duplicate variant error, got: %v", err)
+	}
+
 	// Update Identity (Weighted Average)
 	// We update ID A with a new vector that is slightly different.
 	// Old: [1.0, 0.0...] (Count 1)

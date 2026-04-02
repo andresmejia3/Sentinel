@@ -99,7 +99,7 @@ Sentinel does not dump frames to disk as part of the main processing path. Video
 
 ### Review and Commit Model
 
-- `scan` in default mode creates a human-editable review YAML plus a sidecar data file, writes track review artifacts under `results/<video>/tracks/<id>/`, and leaves Postgres untouched for identities and intervals
+- `scan` in default mode creates a human-editable review YAML plus a sidecar data file, writes track review artifacts under `results/<video>/reviews/<review_id>/tracks/<id>/`, and leaves Postgres untouched for identities and intervals
 - `commit` applies reviewed actions atomically and records a rollback ledger
 - `rollback` reverts a specific commit, with guards to prevent rolling back older video commits after newer ones touched the same video
 
@@ -132,13 +132,15 @@ Scans a video and produces a review YAML plus sidecar data file by default.
 
 Behavior:
 
-- default: writes `data/reviews/<video>.review.yaml`, `data/reviews/<video>.review.data.json`, and track artifacts under `data/results/<video>/tracks/<id>/`
+- default: writes `data/reviews/<basename>.<short-video-id>.<review_id>.review.yaml`, a sibling `.data.json` sidecar, and track artifacts under `data/results/<video>/reviews/<review_id>/tracks/<id>/`
 - `--review-file`: same staged behavior, custom review file path
 - `--no-staging`: skips review and writes directly to the DB
+- machine-only track data (`internal_vector` / `internal_count`) lives only in the sibling `.data.json` sidecar; `sentinel commit` rejects review YAML that tries to embed it
 
 Review YAML shape:
 
 ```yaml
+review_id: a1b2c3d4e5f6
 video_id: <video hash>
 input_path: samples/example.mp4
 tracks:
@@ -160,6 +162,20 @@ tracks:
       action: merge
 ```
 
+For `new_identity`, leave `identity` blank to let Sentinel auto-name it, and leave `variant` blank so Sentinel creates the `Default` variant.
+
+Review rules:
+
+- Edit only `identity`, `variant`, and `action`; the other review fields are scan-owned evidence.
+- `nearest_candidates` is the ranked shortlist of closest existing matches and is the single source of truth for nearest-match evidence.
+- The prefilled `action` is only Sentinel's heuristic suggestion, not final truth.
+- Identity and variant names are matched case-insensitively during commit.
+- `merge` requires both `identity` and `variant` to be set.
+- `new_variant` requires `identity` to be the existing person and `variant` to be the new variant name.
+- `new_identity` should leave `variant` blank; leaving `identity` blank lets Sentinel auto-name the new identity.
+- `sentinel commit` applies actions in dependency-safe phases (`new_identity` -> `new_variant` -> `merge`), so the YAML row order does not control commit behavior.
+- `sentinel commit` rejects blank actions, duplicate review IDs, edited read-only track evidence, sidecar metadata mismatches, any review/sidecar track-set mismatch, duplicate `new_identity` names within the same review batch, `new_identity` names that already exist, and exact system-label collisions like `Identity 42` when that identity already exists.
+
 Per-track review artifacts:
 
 - `1_First_Detection_[score].jpg`
@@ -167,6 +183,10 @@ Per-track review artifacts:
 - `3_Highest_Confidence_[score].jpg`
 - `4_Lowest_Confidence_[score].jpg`
 - `frames/` contains sampled appearance snapshots when the face score changes materially during the track
+
+Review artifacts live under:
+
+- `data/results/<video>/reviews/<review_id>/tracks/<id>/`
 
 ### `commit`
 
