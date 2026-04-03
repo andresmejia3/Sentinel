@@ -32,6 +32,9 @@ const megabyte = 1024 * 1024
 const embeddingDim = 512
 const reviewIDBytes = 6
 const shortDisplayIDLength = 12
+const potentialIdentityThreshold = 0.35
+const potentialIdentityStrongMatchThreshold = 0.25
+const potentialIdentityAmbiguityMargin = 0.05
 
 var scanOpts Options
 var scanBufferSize int
@@ -243,11 +246,11 @@ func runScan(ctx context.Context, opts Options) error {
 		}
 	}
 
-		bar := progressbar.NewOptions(totalVideoFrames,
-			progressbar.OptionSetDescription("🔍 Scanning"),
-			progressbar.OptionSetWriter(os.Stderr), // Write bar to Stderr
-			progressbar.OptionShowCount(),
-		)
+	bar := progressbar.NewOptions(totalVideoFrames,
+		progressbar.OptionSetDescription("🔍 Scanning"),
+		progressbar.OptionSetWriter(os.Stderr), // Write bar to Stderr
+		progressbar.OptionShowCount(),
+	)
 	barUpdateStop := make(chan struct{})
 	barUpdateDone := make(chan struct{})
 
@@ -265,10 +268,10 @@ func runScan(ctx context.Context, opts Options) error {
 			mem := atomic.LoadUint64(&currentMemory)
 			bufLen := len(inflightSem)
 			bufCap := cap(inflightSem)
-				if mem > 0 {
-					bar.Describe(fmt.Sprintf("🔍 Scanning (RAM: %.2f GB | Buffer: %d/%d)", float64(mem)/(1024*1024*1024), bufLen, bufCap))
-				}
+			if mem > 0 {
+				bar.Describe(fmt.Sprintf("🔍 Scanning (RAM: %.2f GB | Buffer: %d/%d)", float64(mem)/(1024*1024*1024), bufLen, bufCap))
 			}
+		}
 		updateDesc()
 
 		ticker := time.NewTicker(250 * time.Millisecond)
@@ -574,6 +577,53 @@ type reviewSummaryItem struct {
 	Action            string
 	KnownVariant      bool
 	ArtifactDir       string
+	Vector            []float64
+	Count             int
+}
+
+type PotentialIdentityStatus string
+
+const (
+	potentialIdentityStatusNew       PotentialIdentityStatus = "NEW"
+	potentialIdentityStatusStrong    PotentialIdentityStatus = "STRONG"
+	potentialIdentityStatusPossible  PotentialIdentityStatus = "POSSIBLE"
+	potentialIdentityStatusAmbiguous PotentialIdentityStatus = "AMBIGUOUS"
+)
+
+type PotentialIdentity struct {
+	ID         int
+	Members    []PotentialIdentityMember
+	SumVec     []float64
+	Centroid   []float64
+	TotalCount int
+}
+
+type PotentialIdentityMember struct {
+	Item reviewSummaryItem
+	Link PotentialIdentityLink
+}
+
+type PotentialIdentityLink struct {
+	Status                            PotentialIdentityStatus
+	BestPotentialIdentityID           int
+	BestPotentialIdentityScore        float64
+	BestMemberTrackID                 int
+	BestMemberDistance                float64
+	SecondBestPotentialIdentityID     int
+	SecondBestPotentialIdentityScore  float64
+	OverlapBlockedPotentialIdentityID int
+	OverlapBlockedTrackID             int
+	OverlapBlockedDistance            float64
+}
+
+type potentialIdentityCandidate struct {
+	IdentityIndex         int
+	IdentityID            int
+	Score                 float64
+	CentroidDistance      float64
+	BestMemberDistance    float64
+	BestMemberTrackID     int
+	OverlapBlockedTrackID int
 }
 
 // --- Aggregation & Tracking Logic ---
@@ -802,51 +852,483 @@ func reviewActionLabel(action string) string {
 	}
 }
 
+func cloneVector(vec []float64) []float64 {
+	return append([]float64(nil), vec...)
+}
+
+func effectiveTrackCount(item reviewSummaryItem) int {
+	if item.Count > 0 {
+		return item.Count
+	}
+	return 1
+}
+
+func weightedTrackVector(item reviewSummaryItem) []float64 {
+	weighted := cloneVector(item.Vector)
+	weight := float64(effectiveTrackCount(item))
+	for i := range weighted {
+		weighted[i] *= weight
+	}
+	return weighted
+}
+
+func recomputePotentialIdentityCentroid(identity *PotentialIdentity) {
+	if identity.TotalCount <= 0 || len(identity.SumVec) == 0 {
+		identity.SumVec = nil
+		identity.Centroid = nil
+		identity.TotalCount = 0
+		return
+	}
+
+	identity.Centroid = make([]float64, len(identity.SumVec))
+	for i := range identity.SumVec {
+		identity.Centroid[i] = identity.SumVec[i] / float64(identity.TotalCount)
+	}
+}
+
+func recomputePotentialIdentityStatsFromMembers(identity *PotentialIdentity) {
+	if len(identity.Members) == 0 {
+		identity.SumVec = nil
+		identity.Centroid = nil
+		identity.TotalCount = 0
+		return
+	}
+
+	var sumVec []float64
+	totalCount := 0
+	for _, member := range identity.Members {
+		weightedVec := weightedTrackVector(member.Item)
+		if len(sumVec) == 0 {
+			sumVec = make([]float64, len(weightedVec))
+		}
+		if len(sumVec) != len(weightedVec) {
+			continue
+		}
+		for i := range weightedVec {
+			sumVec[i] += weightedVec[i]
+		}
+		totalCount += effectiveTrackCount(member.Item)
+	}
+
+	identity.SumVec = sumVec
+	identity.TotalCount = totalCount
+	recomputePotentialIdentityCentroid(identity)
+}
+
+func recomputeAllPotentialIdentityStatsFromMembers(identities []PotentialIdentity) {
+	for i := range identities {
+		recomputePotentialIdentityStatsFromMembers(&identities[i])
+	}
+}
+
+func newPotentialIdentityWithID(id int, item reviewSummaryItem, link PotentialIdentityLink) PotentialIdentity {
+	sumVec := weightedTrackVector(item)
+	return PotentialIdentity{
+		ID: id,
+		Members: []PotentialIdentityMember{
+			{
+				Item: item,
+				Link: link,
+			},
+		},
+		SumVec:     sumVec,
+		Centroid:   cloneVector(item.Vector),
+		TotalCount: effectiveTrackCount(item),
+	}
+}
+
+func newPotentialIdentity(id int, item reviewSummaryItem, link PotentialIdentityLink) PotentialIdentity {
+	return newPotentialIdentityWithID(id, item, link)
+}
+
+func addPotentialIdentityMember(identity *PotentialIdentity, item reviewSummaryItem, link PotentialIdentityLink) {
+	weight := effectiveTrackCount(item)
+	weightedVec := weightedTrackVector(item)
+	if len(identity.SumVec) == 0 {
+		identity.SumVec = make([]float64, len(weightedVec))
+	}
+	if len(identity.SumVec) == len(weightedVec) {
+		for i := range weightedVec {
+			identity.SumVec[i] += weightedVec[i]
+		}
+	}
+	identity.TotalCount += weight
+	recomputePotentialIdentityCentroid(identity)
+	identity.Members = append(identity.Members, PotentialIdentityMember{
+		Item: item,
+		Link: link,
+	})
+}
+
+func removePotentialIdentityMember(identity *PotentialIdentity, memberIdx int) PotentialIdentityMember {
+	member := identity.Members[memberIdx]
+	weight := effectiveTrackCount(member.Item)
+	weightedVec := weightedTrackVector(member.Item)
+	if len(identity.SumVec) == len(weightedVec) {
+		for i := range weightedVec {
+			identity.SumVec[i] -= weightedVec[i]
+		}
+	}
+	identity.TotalCount -= weight
+	identity.Members = append(identity.Members[:memberIdx], identity.Members[memberIdx+1:]...)
+	recomputePotentialIdentityCentroid(identity)
+	return member
+}
+
+func trackTimesOverlap(a, b reviewSummaryItem) bool {
+	return a.StartTime < b.EndTime && b.StartTime < a.EndTime
+}
+
+func potentialIdentityCandidateForItem(item reviewSummaryItem, identity PotentialIdentity, identityIndex int) potentialIdentityCandidate {
+	candidate := potentialIdentityCandidate{
+		IdentityIndex: identityIndex,
+		IdentityID:    identity.ID,
+	}
+	if len(item.Vector) == 0 || len(identity.Centroid) == 0 {
+		candidate.Score = math.Inf(1)
+		candidate.CentroidDistance = math.Inf(1)
+		candidate.BestMemberDistance = math.Inf(1)
+		return candidate
+	}
+
+	candidate.CentroidDistance = utils.CosineDist(item.Vector, identity.Centroid)
+	candidate.BestMemberDistance = math.Inf(1)
+
+	for _, member := range identity.Members {
+		dist := utils.CosineDist(item.Vector, member.Item.Vector)
+		if dist < candidate.BestMemberDistance {
+			candidate.BestMemberDistance = dist
+			candidate.BestMemberTrackID = member.Item.ID
+		}
+		if candidate.OverlapBlockedTrackID == 0 && trackTimesOverlap(item, member.Item) {
+			candidate.OverlapBlockedTrackID = member.Item.ID
+		}
+	}
+
+	candidate.Score = math.Max(candidate.CentroidDistance, candidate.BestMemberDistance)
+	return candidate
+}
+
+func sortPotentialIdentityCandidates(candidates []potentialIdentityCandidate) {
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Score != candidates[j].Score {
+			return candidates[i].Score < candidates[j].Score
+		}
+		if candidates[i].BestMemberDistance != candidates[j].BestMemberDistance {
+			return candidates[i].BestMemberDistance < candidates[j].BestMemberDistance
+		}
+		return candidates[i].IdentityID < candidates[j].IdentityID
+	})
+}
+
+func classifyPotentialIdentityLink(item reviewSummaryItem, identities []PotentialIdentity) PotentialIdentityLink {
+	link := PotentialIdentityLink{Status: potentialIdentityStatusNew}
+	if len(item.Vector) == 0 || len(identities) == 0 {
+		return link
+	}
+
+	var eligible []potentialIdentityCandidate
+	var overlapBlocked []potentialIdentityCandidate
+
+	for idx, identity := range identities {
+		candidate := potentialIdentityCandidateForItem(item, identity, idx)
+		if candidate.OverlapBlockedTrackID != 0 {
+			overlapBlocked = append(overlapBlocked, candidate)
+			continue
+		}
+		if candidate.CentroidDistance <= potentialIdentityThreshold && candidate.BestMemberDistance <= potentialIdentityThreshold {
+			eligible = append(eligible, candidate)
+		}
+	}
+
+	sortPotentialIdentityCandidates(eligible)
+	sortPotentialIdentityCandidates(overlapBlocked)
+
+	if len(eligible) == 0 {
+		if len(overlapBlocked) > 0 && overlapBlocked[0].Score <= potentialIdentityThreshold {
+			blocked := overlapBlocked[0]
+			link.OverlapBlockedPotentialIdentityID = blocked.IdentityID
+			link.OverlapBlockedTrackID = blocked.OverlapBlockedTrackID
+			link.OverlapBlockedDistance = roundTo(blocked.Score, 3)
+		}
+		return link
+	}
+
+	best := eligible[0]
+	link.BestPotentialIdentityID = best.IdentityID
+	link.BestPotentialIdentityScore = roundTo(best.Score, 3)
+	link.BestMemberTrackID = best.BestMemberTrackID
+	link.BestMemberDistance = roundTo(best.BestMemberDistance, 3)
+
+	if len(eligible) > 1 {
+		second := eligible[1]
+		link.SecondBestPotentialIdentityID = second.IdentityID
+		link.SecondBestPotentialIdentityScore = roundTo(second.Score, 3)
+		if math.Abs(second.Score-best.Score) < potentialIdentityAmbiguityMargin {
+			link.Status = potentialIdentityStatusAmbiguous
+			return link
+		}
+	}
+
+	if best.Score <= potentialIdentityStrongMatchThreshold {
+		link.Status = potentialIdentityStatusStrong
+	} else {
+		link.Status = potentialIdentityStatusPossible
+	}
+	return link
+}
+
+func findPotentialIdentityIndexByID(identities []PotentialIdentity, id int) int {
+	for i := range identities {
+		if identities[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func findPotentialIdentityMember(identities []PotentialIdentity, trackID int) (int, int) {
+	for i := range identities {
+		for j := range identities[i].Members {
+			if identities[i].Members[j].Item.ID == trackID {
+				return i, j
+			}
+		}
+	}
+	return -1, -1
+}
+
+func removeEmptyPotentialIdentities(identities []PotentialIdentity) []PotentialIdentity {
+	filtered := identities[:0]
+	for _, identity := range identities {
+		if len(identity.Members) == 0 {
+			continue
+		}
+		filtered = append(filtered, identity)
+	}
+	return filtered
+}
+
+func sortPotentialIdentityMembers(identities []PotentialIdentity) {
+	for i := range identities {
+		sort.Slice(identities[i].Members, func(a, b int) bool {
+			if identities[i].Members[a].Item.StartTime != identities[i].Members[b].Item.StartTime {
+				return identities[i].Members[a].Item.StartTime < identities[i].Members[b].Item.StartTime
+			}
+			return identities[i].Members[a].Item.ID < identities[i].Members[b].Item.ID
+		})
+	}
+}
+
+func sortPotentialIdentityUnresolved(unresolved []PotentialIdentityMember) {
+	sort.Slice(unresolved, func(i, j int) bool {
+		if unresolved[i].Item.StartTime != unresolved[j].Item.StartTime {
+			return unresolved[i].Item.StartTime < unresolved[j].Item.StartTime
+		}
+		return unresolved[i].Item.ID < unresolved[j].Item.ID
+	})
+}
+
+func restorePotentialIdentityMember(identities []PotentialIdentity, identityID int, member PotentialIdentityMember) []PotentialIdentity {
+	if idx := findPotentialIdentityIndexByID(identities, identityID); idx >= 0 {
+		addPotentialIdentityMember(&identities[idx], member.Item, member.Link)
+		return identities
+	}
+	identities = append(identities, newPotentialIdentityWithID(identityID, member.Item, member.Link))
+	return identities
+}
+
+func collectPotentialIdentityMemberTrackIDsByStatus(identities []PotentialIdentity, status PotentialIdentityStatus) []int {
+	var trackIDs []int
+	for _, identity := range identities {
+		for _, member := range identity.Members {
+			if member.Link.Status == status {
+				trackIDs = append(trackIDs, member.Item.ID)
+			}
+		}
+	}
+	sort.Ints(trackIDs)
+	return trackIDs
+}
+
+func refinePossiblePotentialIdentityMembers(identities []PotentialIdentity) []PotentialIdentity {
+	possibleTrackIDs := collectPotentialIdentityMemberTrackIDsByStatus(identities, potentialIdentityStatusPossible)
+	for _, trackID := range possibleTrackIDs {
+		identityIdx, memberIdx := findPotentialIdentityMember(identities, trackID)
+		if identityIdx < 0 || memberIdx < 0 {
+			continue
+		}
+
+		originalIdentityID := identities[identityIdx].ID
+		member := removePotentialIdentityMember(&identities[identityIdx], memberIdx)
+		identities = removeEmptyPotentialIdentities(identities)
+
+		newLink := classifyPotentialIdentityLink(member.Item, identities)
+		if newLink.Status != potentialIdentityStatusStrong && newLink.Status != potentialIdentityStatusPossible {
+			identities = restorePotentialIdentityMember(identities, originalIdentityID, member)
+			continue
+		}
+
+		if newLink.BestPotentialIdentityID == originalIdentityID || newLink.BestPotentialIdentityScore+potentialIdentityAmbiguityMargin >= member.Link.BestPotentialIdentityScore {
+			identities = restorePotentialIdentityMember(identities, originalIdentityID, member)
+			continue
+		}
+
+		if targetIdx := findPotentialIdentityIndexByID(identities, newLink.BestPotentialIdentityID); targetIdx >= 0 {
+			addPotentialIdentityMember(&identities[targetIdx], member.Item, newLink)
+			continue
+		}
+
+		identities = restorePotentialIdentityMember(identities, originalIdentityID, member)
+	}
+
+	identities = removeEmptyPotentialIdentities(identities)
+	sortPotentialIdentityMembers(identities)
+	return identities
+}
+
+func resolveAmbiguousPotentialIdentityMembers(identities []PotentialIdentity, unresolved []PotentialIdentityMember) ([]PotentialIdentity, []PotentialIdentityMember) {
+	var remaining []PotentialIdentityMember
+	sortPotentialIdentityUnresolved(unresolved)
+
+	for _, member := range unresolved {
+		link := classifyPotentialIdentityLink(member.Item, identities)
+		if link.Status == potentialIdentityStatusStrong || link.Status == potentialIdentityStatusPossible {
+			if idx := findPotentialIdentityIndexByID(identities, link.BestPotentialIdentityID); idx >= 0 {
+				addPotentialIdentityMember(&identities[idx], member.Item, link)
+				continue
+			}
+		}
+		member.Link = link
+		remaining = append(remaining, member)
+	}
+
+	sortPotentialIdentityMembers(identities)
+	sortPotentialIdentityUnresolved(remaining)
+	return identities, remaining
+}
+
+func buildPotentialIdentities(items []reviewSummaryItem) ([]PotentialIdentity, []PotentialIdentityMember) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	sortedItems := append([]reviewSummaryItem(nil), items...)
+	sort.Slice(sortedItems, func(i, j int) bool {
+		if sortedItems[i].StartTime != sortedItems[j].StartTime {
+			return sortedItems[i].StartTime < sortedItems[j].StartTime
+		}
+		return sortedItems[i].ID < sortedItems[j].ID
+	})
+
+	var identities []PotentialIdentity
+	var unresolved []PotentialIdentityMember
+	nextPotentialIdentityID := 1
+
+	for _, item := range sortedItems {
+		link := classifyPotentialIdentityLink(item, identities)
+		if link.Status == potentialIdentityStatusStrong || link.Status == potentialIdentityStatusPossible {
+			if identityIndex := findPotentialIdentityIndexByID(identities, link.BestPotentialIdentityID); identityIndex >= 0 {
+				addPotentialIdentityMember(&identities[identityIndex], item, link)
+				continue
+			}
+		}
+
+		if link.Status == potentialIdentityStatusAmbiguous {
+			unresolved = append(unresolved, PotentialIdentityMember{
+				Item: item,
+				Link: link,
+			})
+			continue
+		}
+
+		identities = append(identities, newPotentialIdentity(nextPotentialIdentityID, item, link))
+		nextPotentialIdentityID++
+	}
+
+	sortPotentialIdentityMembers(identities)
+	identities = refinePossiblePotentialIdentityMembers(identities)
+	identities, unresolved = resolveAmbiguousPotentialIdentityMembers(identities, unresolved)
+	recomputeAllPotentialIdentityStatsFromMembers(identities)
+
+	return identities, unresolved
+}
+
+func potentialIdentityTrackList(members []PotentialIdentityMember) string {
+	ids := make([]string, 0, len(members))
+	for _, member := range members {
+		ids = append(ids, strconv.Itoa(member.Item.ID))
+	}
+	return strings.Join(ids, ", ")
+}
+
+func potentialIdentityLinkLines(member PotentialIdentityMember) []string {
+	switch member.Link.Status {
+	case potentialIdentityStatusStrong, potentialIdentityStatusPossible:
+		return []string{
+			fmt.Sprintf("Track %d %s match to Potential Identity %d (best link: Track %d, distance: %.2f)", member.Item.ID, member.Link.Status, member.Link.BestPotentialIdentityID, member.Link.BestMemberTrackID, member.Link.BestMemberDistance),
+		}
+	case potentialIdentityStatusAmbiguous:
+		return []string{
+			fmt.Sprintf("Track %d AMBIGUOUS between:", member.Item.ID),
+			fmt.Sprintf("Potential Identity %d (distance: %.2f - BEST)", member.Link.BestPotentialIdentityID, member.Link.BestPotentialIdentityScore),
+			fmt.Sprintf("Potential Identity %d (distance: %.2f)", member.Link.SecondBestPotentialIdentityID, member.Link.SecondBestPotentialIdentityScore),
+		}
+	case potentialIdentityStatusNew:
+		if member.Link.OverlapBlockedPotentialIdentityID > 0 {
+			return []string{
+				fmt.Sprintf("Track %d NEW potential identity (closest match to Potential Identity %d blocked by time overlap with Track %d, distance: %.2f)", member.Item.ID, member.Link.OverlapBlockedPotentialIdentityID, member.Link.OverlapBlockedTrackID, member.Link.OverlapBlockedDistance),
+			}
+		}
+	}
+	return nil
+}
+
+func printPotentialIdentityLinkLines(lines []string) {
+	if len(lines) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "     - %s\n", lines[0])
+	for _, line := range lines[1:] {
+		fmt.Fprintf(os.Stderr, "       %s\n", line)
+	}
+}
+
 func printReviewSummary(videoID string, items []reviewSummaryItem, totalDetections int) {
-	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	identities, unresolved := buildPotentialIdentities(items)
 
 	fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
 	fmt.Fprintf(os.Stderr, "📋 REVIEW SUMMARY [%s]\n", shortDisplayID(videoID))
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 
-	for _, item := range items {
-		status := "pending track"
-		trackingHint := ""
-		if item.KnownVariant {
-			if item.Action == "merge" {
-				status = "Possible known variant"
-			} else {
-				trackingHint = "possible known variant"
-			}
+	for _, identity := range identities {
+		fmt.Fprintf(os.Stderr, "\n👤 Potential Identity %d\n", identity.ID)
+		fmt.Fprintf(os.Stderr, "   tracks: %s\n", potentialIdentityTrackList(identity.Members))
+		fmt.Fprintf(os.Stderr, "   spans:\n")
+		for _, member := range identity.Members {
+			fmt.Fprintf(os.Stderr, "     - Track %d: %s -> %s [action: %s]\n", member.Item.ID, utils.FmtTime(member.Item.StartTime), utils.FmtTime(member.Item.EndTime), reviewActionLabel(member.Item.Action))
 		}
 
-		candidates := item.NearestCandidates
-		targetVariant := item.Variant
-		if item.Action == "new_variant" && targetVariant == "" && item.Identity != "" {
-			targetVariant = "[set during review]"
-		}
-		target := identityVariantLabel(item.Identity, targetVariant)
-
-		fmt.Fprintf(os.Stderr, "\n🎞️ Track %d [%s]\n", item.ID, status)
-		fmt.Fprintf(os.Stderr, "   time: %s -> %s\n", utils.FmtTime(item.StartTime), utils.FmtTime(item.EndTime))
-		fmt.Fprintf(os.Stderr, "   action: %s\n", reviewActionLabel(item.Action))
-		if trackingHint != "" {
-			fmt.Fprintf(os.Stderr, "   tracking hint: %s\n", trackingHint)
-		}
-		if len(candidates) == 0 {
-			fmt.Fprintf(os.Stderr, "   nearest: none\n")
-		} else {
-			fmt.Fprintf(os.Stderr, "   nearest:\n")
-			for i, candidate := range candidates {
-				fmt.Fprintf(os.Stderr, "     %d. %s (distance: %.3f)\n", i+1, candidateLabel(candidate), candidate.Distance)
+		var linkageMembers []PotentialIdentityMember
+		for _, member := range identity.Members {
+			if len(potentialIdentityLinkLines(member)) > 0 {
+				linkageMembers = append(linkageMembers, member)
 			}
 		}
-		fmt.Fprintf(os.Stderr, "   target: %s\n", target)
-		fmt.Fprintf(os.Stderr, "   confidence: %.2f\n", item.Confidence)
-		if item.Reason != "" {
-			fmt.Fprintf(os.Stderr, "   reason: %s\n", item.Reason)
+		if len(linkageMembers) > 0 {
+			fmt.Fprintf(os.Stderr, "   linkage:\n")
+			for _, member := range linkageMembers {
+				printPotentialIdentityLinkLines(potentialIdentityLinkLines(member))
+			}
 		}
-		fmt.Fprintf(os.Stderr, "   artifacts: %s/\n", item.ArtifactDir)
+	}
+
+	for _, member := range unresolved {
+		fmt.Fprintf(os.Stderr, "\n👤 Unresolved Track %d\n", member.Item.ID)
+		fmt.Fprintf(os.Stderr, "   time: %s -> %s\n", utils.FmtTime(member.Item.StartTime), utils.FmtTime(member.Item.EndTime))
+		fmt.Fprintf(os.Stderr, "   action: %s\n", reviewActionLabel(member.Item.Action))
+		fmt.Fprintf(os.Stderr, "   linkage:\n")
+		printPotentialIdentityLinkLines(potentialIdentityLinkLines(member))
 	}
 
 	fmt.Fprintf(os.Stderr, "\n---------------------------------------------------------\n")
@@ -960,9 +1442,9 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 		maxGapFrames = 1 // Ensure at least 1 frame gap to prevent instant closing
 	}
 
-		// If /data exists (Docker volume), use it. Otherwise use relative "data" (Local)
-		outputBase := currentOutputBase()
-		artifactCommentRoot = reviewArtifactCommentRoot(outputBase, videoID, reviewID)
+	// If /data exists (Docker volume), use it. Otherwise use relative "data" (Local)
+	outputBase := currentOutputBase()
+	artifactCommentRoot = reviewArtifactCommentRoot(outputBase, videoID, reviewID)
 	// Optimization: Ensure output directory exists ONCE, not per-track
 	resultsDir = filepath.Join(outputBase, "results", videoID)
 	if err := os.MkdirAll(resultsDir, 0755); err != nil {
@@ -1132,6 +1614,8 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 				Action:            item.Action,
 				KnownVariant:      t.IsKnown,
 				ArtifactDir:       reviewArtifactRelativeDir(videoID, reviewID, trackReviewID),
+				Vector:            cloneVector(t.MeanVec),
+				Count:             t.Count,
 			})
 			return // Skip DB persistence in review mode
 		}

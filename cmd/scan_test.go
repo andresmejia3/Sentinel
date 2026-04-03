@@ -3,9 +3,11 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -338,6 +340,331 @@ func TestHeadlineArtifactFilename(t *testing.T) {
 	want := "3_Highest_Confidence_[frame_00018]_[13.89].jpg"
 	if got != want {
 		t.Fatalf("headlineArtifactFilename() = %q, want %q", got, want)
+	}
+}
+
+func summaryItemForPotentialIdentityTest(id int, start, end float64, vec []float64) reviewSummaryItem {
+	return reviewSummaryItem{
+		ID:        id,
+		StartTime: start,
+		EndTime:   end,
+		Action:    "new_identity",
+		Vector:    vec,
+		Count:     1,
+	}
+}
+
+func captureStderrOutput(t *testing.T, fn func()) string {
+	t.Helper()
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create stderr pipe: %v", err)
+	}
+	os.Stderr = w
+
+	done := make(chan string, 1)
+	go func() {
+		data, _ := io.ReadAll(r)
+		done <- string(data)
+	}()
+
+	fn()
+
+	w.Close()
+	os.Stderr = oldStderr
+	out := <-done
+	r.Close()
+	return out
+}
+
+func TestClassifyPotentialIdentityLinkStrong(t *testing.T) {
+	t.Parallel()
+
+	identities := []PotentialIdentity{
+		newPotentialIdentity(1, summaryItemForPotentialIdentityTest(1, 0, 2, []float64{1, 0}), PotentialIdentityLink{Status: potentialIdentityStatusNew}),
+	}
+
+	link := classifyPotentialIdentityLink(summaryItemForPotentialIdentityTest(2, 3, 5, []float64{0.98, 0.2}), identities)
+	if link.Status != potentialIdentityStatusStrong {
+		t.Fatalf("classifyPotentialIdentityLink() status = %s, want %s", link.Status, potentialIdentityStatusStrong)
+	}
+	if link.BestPotentialIdentityID != 1 {
+		t.Fatalf("classifyPotentialIdentityLink() best potential identity = %d, want 1", link.BestPotentialIdentityID)
+	}
+	if link.BestMemberTrackID != 1 {
+		t.Fatalf("classifyPotentialIdentityLink() best linked track = %d, want 1", link.BestMemberTrackID)
+	}
+}
+
+func TestClassifyPotentialIdentityLinkPossible(t *testing.T) {
+	t.Parallel()
+
+	identities := []PotentialIdentity{
+		newPotentialIdentity(1, summaryItemForPotentialIdentityTest(1, 0, 2, []float64{1, 0}), PotentialIdentityLink{Status: potentialIdentityStatusNew}),
+	}
+
+	link := classifyPotentialIdentityLink(summaryItemForPotentialIdentityTest(2, 3, 5, []float64{0.74, 0.67}), identities)
+	if link.Status != potentialIdentityStatusPossible {
+		t.Fatalf("classifyPotentialIdentityLink() status = %s, want %s", link.Status, potentialIdentityStatusPossible)
+	}
+	if link.BestPotentialIdentityID != 1 {
+		t.Fatalf("classifyPotentialIdentityLink() best potential identity = %d, want 1", link.BestPotentialIdentityID)
+	}
+}
+
+func TestClassifyPotentialIdentityLinkAmbiguous(t *testing.T) {
+	t.Parallel()
+
+	identities := []PotentialIdentity{
+		newPotentialIdentity(1, summaryItemForPotentialIdentityTest(1, 0, 1, []float64{0.819, 0.574}), PotentialIdentityLink{Status: potentialIdentityStatusNew}),
+		newPotentialIdentity(2, summaryItemForPotentialIdentityTest(2, 2, 3, []float64{0.819, -0.574}), PotentialIdentityLink{Status: potentialIdentityStatusNew}),
+	}
+
+	link := classifyPotentialIdentityLink(summaryItemForPotentialIdentityTest(3, 4, 5, []float64{1, 0}), identities)
+	if link.Status != potentialIdentityStatusAmbiguous {
+		t.Fatalf("classifyPotentialIdentityLink() status = %s, want %s", link.Status, potentialIdentityStatusAmbiguous)
+	}
+	if link.BestPotentialIdentityID != 1 || link.SecondBestPotentialIdentityID != 2 {
+		t.Fatalf("classifyPotentialIdentityLink() best/second = %d/%d, want 1/2", link.BestPotentialIdentityID, link.SecondBestPotentialIdentityID)
+	}
+}
+
+func TestClassifyPotentialIdentityLinkOverlapBlocked(t *testing.T) {
+	t.Parallel()
+
+	identities := []PotentialIdentity{
+		newPotentialIdentity(1, summaryItemForPotentialIdentityTest(1, 0, 2, []float64{1, 0}), PotentialIdentityLink{Status: potentialIdentityStatusNew}),
+	}
+
+	link := classifyPotentialIdentityLink(summaryItemForPotentialIdentityTest(2, 1, 3, []float64{0.98, 0.2}), identities)
+	if link.Status != potentialIdentityStatusNew {
+		t.Fatalf("classifyPotentialIdentityLink() status = %s, want %s", link.Status, potentialIdentityStatusNew)
+	}
+	if link.OverlapBlockedPotentialIdentityID != 1 {
+		t.Fatalf("classifyPotentialIdentityLink() overlap-blocked potential identity = %d, want 1", link.OverlapBlockedPotentialIdentityID)
+	}
+	if link.OverlapBlockedTrackID != 1 {
+		t.Fatalf("classifyPotentialIdentityLink() overlap-blocked track = %d, want 1", link.OverlapBlockedTrackID)
+	}
+}
+
+func TestBuildPotentialIdentities(t *testing.T) {
+	t.Parallel()
+
+	items := []reviewSummaryItem{
+		summaryItemForPotentialIdentityTest(1, 0, 2, []float64{1, 0}),
+		summaryItemForPotentialIdentityTest(2, 3, 5, []float64{0.98, 0.2}),
+		summaryItemForPotentialIdentityTest(3, 6, 8, []float64{0, 1}),
+	}
+
+	identities, unresolved := buildPotentialIdentities(items)
+	if len(identities) != 2 {
+		t.Fatalf("buildPotentialIdentities() count = %d, want 2", len(identities))
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("buildPotentialIdentities() unresolved count = %d, want 0", len(unresolved))
+	}
+	if got := len(identities[0].Members); got != 2 {
+		t.Fatalf("first potential identity member count = %d, want 2", got)
+	}
+	if identities[0].Members[0].Item.ID != 1 || identities[0].Members[1].Item.ID != 2 {
+		t.Fatalf("first potential identity members = %d,%d, want 1,2", identities[0].Members[0].Item.ID, identities[0].Members[1].Item.ID)
+	}
+	if got := len(identities[1].Members); got != 1 {
+		t.Fatalf("second potential identity member count = %d, want 1", got)
+	}
+	if identities[1].Members[0].Item.ID != 3 {
+		t.Fatalf("second potential identity member = %d, want 3", identities[1].Members[0].Item.ID)
+	}
+}
+
+func TestBuildPotentialIdentitiesLeavesAmbiguousTracksUnresolved(t *testing.T) {
+	t.Parallel()
+
+	items := []reviewSummaryItem{
+		summaryItemForPotentialIdentityTest(1, 0, 1, []float64{0.819, 0.574}),
+		summaryItemForPotentialIdentityTest(2, 2, 3, []float64{0.819, -0.574}),
+		summaryItemForPotentialIdentityTest(3, 4, 5, []float64{1, 0}),
+		summaryItemForPotentialIdentityTest(4, 6, 7, []float64{1, 0}),
+	}
+
+	identities, unresolved := buildPotentialIdentities(items)
+	if len(identities) != 2 {
+		t.Fatalf("buildPotentialIdentities() count = %d, want 2", len(identities))
+	}
+	if len(unresolved) != 2 {
+		t.Fatalf("buildPotentialIdentities() unresolved count = %d, want 2", len(unresolved))
+	}
+	if unresolved[0].Item.ID != 3 || unresolved[1].Item.ID != 4 {
+		t.Fatalf("buildPotentialIdentities() unresolved track IDs = %d,%d, want 3,4", unresolved[0].Item.ID, unresolved[1].Item.ID)
+	}
+}
+
+func TestRefinePossiblePotentialIdentityMembersMovesToBetterIdentity(t *testing.T) {
+	t.Parallel()
+
+	item1 := summaryItemForPotentialIdentityTest(1, 0, 1, []float64{1, 0})
+	item2 := summaryItemForPotentialIdentityTest(2, 2, 3, []float64{0.66, 0.75})
+	item3 := summaryItemForPotentialIdentityTest(3, 4, 5, []float64{0, 1})
+
+	identity1 := newPotentialIdentity(1, item1, PotentialIdentityLink{Status: potentialIdentityStatusNew})
+	addPotentialIdentityMember(&identity1, item2, PotentialIdentityLink{
+		Status:                     potentialIdentityStatusPossible,
+		BestPotentialIdentityID:    1,
+		BestPotentialIdentityScore: 0.34,
+		BestMemberTrackID:          1,
+		BestMemberDistance:         0.34,
+	})
+	identity2 := newPotentialIdentity(2, item3, PotentialIdentityLink{Status: potentialIdentityStatusNew})
+
+	identities := refinePossiblePotentialIdentityMembers([]PotentialIdentity{identity1, identity2})
+
+	firstIdx, _ := findPotentialIdentityMember(identities, 1)
+	secondIdx, _ := findPotentialIdentityMember(identities, 2)
+	thirdIdx, _ := findPotentialIdentityMember(identities, 3)
+	if firstIdx < 0 || secondIdx < 0 || thirdIdx < 0 {
+		t.Fatalf("refinePossiblePotentialIdentityMembers() lost a track assignment")
+	}
+	if identities[secondIdx].ID != 2 {
+		t.Fatalf("track 2 ended up in potential identity %d, want 2", identities[secondIdx].ID)
+	}
+	if identities[firstIdx].ID == identities[secondIdx].ID {
+		t.Fatalf("track 2 should not remain grouped with track 1 after refinement")
+	}
+	if identities[thirdIdx].ID != 2 {
+		t.Fatalf("track 3 ended up in potential identity %d, want 2", identities[thirdIdx].ID)
+	}
+}
+
+func TestResolveAmbiguousPotentialIdentityMembersAttachesClearWinner(t *testing.T) {
+	t.Parallel()
+
+	item1 := summaryItemForPotentialIdentityTest(1, 0, 1, []float64{1, 0})
+	item2 := summaryItemForPotentialIdentityTest(2, 2, 3, []float64{0.95, 0.1})
+	item3 := summaryItemForPotentialIdentityTest(3, 4, 5, []float64{0.98, 0.05})
+	item4 := summaryItemForPotentialIdentityTest(4, 6, 7, []float64{0.819, -0.574})
+
+	identity1 := newPotentialIdentity(1, item1, PotentialIdentityLink{Status: potentialIdentityStatusNew})
+	addPotentialIdentityMember(&identity1, item2, PotentialIdentityLink{
+		Status:                     potentialIdentityStatusStrong,
+		BestPotentialIdentityID:    1,
+		BestPotentialIdentityScore: 0.06,
+		BestMemberTrackID:          1,
+		BestMemberDistance:         0.06,
+	})
+	identity2 := newPotentialIdentity(2, item4, PotentialIdentityLink{Status: potentialIdentityStatusNew})
+
+	unresolved := []PotentialIdentityMember{{
+		Item: item3,
+		Link: PotentialIdentityLink{
+			Status:                           potentialIdentityStatusAmbiguous,
+			BestPotentialIdentityID:          1,
+			BestPotentialIdentityScore:       0.18,
+			SecondBestPotentialIdentityID:    2,
+			SecondBestPotentialIdentityScore: 0.20,
+		},
+	}}
+
+	identities, remaining := resolveAmbiguousPotentialIdentityMembers([]PotentialIdentity{identity1, identity2}, unresolved)
+	if len(remaining) != 0 {
+		t.Fatalf("resolveAmbiguousPotentialIdentityMembers() remaining unresolved = %d, want 0", len(remaining))
+	}
+
+	resolvedIdx, _ := findPotentialIdentityMember(identities, 3)
+	if resolvedIdx < 0 {
+		t.Fatalf("resolveAmbiguousPotentialIdentityMembers() did not attach track 3")
+	}
+	if identities[resolvedIdx].ID != 1 {
+		t.Fatalf("track 3 ended up in potential identity %d, want 1", identities[resolvedIdx].ID)
+	}
+}
+
+func TestRecomputeAllPotentialIdentityStatsFromMembers(t *testing.T) {
+	t.Parallel()
+
+	item1 := summaryItemForPotentialIdentityTest(1, 0, 1, []float64{1, 0})
+	item1.Count = 2
+	item2 := summaryItemForPotentialIdentityTest(2, 2, 3, []float64{0, 1})
+	item2.Count = 1
+
+	identity := PotentialIdentity{
+		ID: 1,
+		Members: []PotentialIdentityMember{
+			{Item: item1},
+			{Item: item2},
+		},
+		SumVec:     []float64{999, 999},
+		Centroid:   []float64{9, 9},
+		TotalCount: 999,
+	}
+
+	identities := []PotentialIdentity{identity}
+	recomputeAllPotentialIdentityStatsFromMembers(identities)
+
+	got := identities[0]
+	if got.TotalCount != 3 {
+		t.Fatalf("TotalCount = %d, want 3", got.TotalCount)
+	}
+	if len(got.SumVec) != 2 || math.Abs(got.SumVec[0]-2.0) > 1e-9 || math.Abs(got.SumVec[1]-1.0) > 1e-9 {
+		t.Fatalf("SumVec = %v, want [2 1]", got.SumVec)
+	}
+	if len(got.Centroid) != 2 || math.Abs(got.Centroid[0]-(2.0/3.0)) > 1e-9 || math.Abs(got.Centroid[1]-(1.0/3.0)) > 1e-9 {
+		t.Fatalf("Centroid = %v, want [%v %v]", got.Centroid, 2.0/3.0, 1.0/3.0)
+	}
+}
+
+func TestPrintReviewSummaryPotentialIdentityFormatting(t *testing.T) {
+	items := []reviewSummaryItem{
+		summaryItemForPotentialIdentityTest(1, 0, 2, []float64{1, 0}),
+		summaryItemForPotentialIdentityTest(2, 3, 5, []float64{0.74, 0.67}),
+	}
+
+	output := captureStderrOutput(t, func() {
+		printReviewSummary("c46b22a303430d0d4f2477196dd10ece118b9488c25a3ffa05b1513948e16939", items, 2)
+	})
+
+	if !strings.Contains(output, "👤 Potential Identity 1") {
+		t.Fatalf("printReviewSummary() missing potential identity heading:\n%s", output)
+	}
+	if !strings.Contains(output, "tracks: 1, 2") {
+		t.Fatalf("printReviewSummary() missing grouped track list:\n%s", output)
+	}
+	if !strings.Contains(output, "Track 2 POSSIBLE match to Potential Identity 1") {
+		t.Fatalf("printReviewSummary() missing POSSIBLE linkage line:\n%s", output)
+	}
+}
+
+func TestPrintReviewSummaryAmbiguousFormatting(t *testing.T) {
+	items := []reviewSummaryItem{
+		summaryItemForPotentialIdentityTest(1, 0, 1, []float64{0.819, 0.574}),
+		summaryItemForPotentialIdentityTest(2, 2, 3, []float64{0.819, -0.574}),
+		{
+			ID:        3,
+			StartTime: 4,
+			EndTime:   5,
+			Action:    "",
+			Vector:    []float64{1, 0},
+			Count:     1,
+		},
+	}
+
+	output := captureStderrOutput(t, func() {
+		printReviewSummary("video123", items, 3)
+	})
+
+	if !strings.Contains(output, "👤 Unresolved Track 3") {
+		t.Fatalf("printReviewSummary() missing unresolved track heading:\n%s", output)
+	}
+	if !strings.Contains(output, "Track 3 AMBIGUOUS between:") {
+		t.Fatalf("printReviewSummary() missing ambiguous linkage heading:\n%s", output)
+	}
+	if !strings.Contains(output, "Potential Identity 1 (distance: 0.18 - BEST)") {
+		t.Fatalf("printReviewSummary() missing best ambiguous candidate:\n%s", output)
+	}
+	if !strings.Contains(output, "Potential Identity 2 (distance: 0.18)") {
+		t.Fatalf("printReviewSummary() missing second ambiguous candidate:\n%s", output)
 	}
 }
 
