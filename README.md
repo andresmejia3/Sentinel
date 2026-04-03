@@ -178,10 +178,10 @@ Review rules:
 
 Per-track review artifacts:
 
-- `1_First_Detection_[score].jpg`
-- `2_Last_Detection_[score].jpg`
-- `3_Highest_Confidence_[score].jpg`
-- `4_Lowest_Confidence_[score].jpg`
+- `1_First_Detection_[frame_00010]_[score].jpg`
+- `2_Last_Detection_[frame_00025]_[score].jpg`
+- `3_Highest_Confidence_[frame_00018]_[score].jpg`
+- `4_Lowest_Confidence_[frame_00007]_[score].jpg`
 - `frames/` contains sampled appearance snapshots when the face score changes materially during the track
 
 Review artifacts live under:
@@ -340,22 +340,22 @@ Inside the launched shell:
 
 ```bash
 # Safe default: create a review file
-sentinel scan -i /data/video.mp4
+sentinel scan -i video.mp4
 
 # Apply the reviewed scan to Postgres
-sentinel commit /data/reviews/video.review.yaml
+sentinel commit reviews/video.review.yaml
 
 # Fast but unsafe direct-write mode
-sentinel scan -i /data/video.mp4 --no-staging
+sentinel scan -i video.mp4 --no-staging
 
 # List identities
 sentinel list
 
 # Search for someone with an image
-sentinel find /data/suspect.jpg
+sentinel find suspect.jpg
 
 # Targeted redaction
-sentinel redact -i /data/video.mp4 -m targeted --target 3 -o /data/output/redacted.mp4
+sentinel redact -i video.mp4 -m targeted --target 3 -o output/redacted.mp4
 ```
 
 ### Native Local Installation

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -288,6 +289,55 @@ func TestValidateScanFlags(t *testing.T) {
 			os.Stderr = oldStderr
 			r.Close()
 		})
+	}
+}
+
+func TestUserFacingOutputPath(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{
+			name: "docker review path",
+			path: "/data/reviews/scan.review.yaml",
+			want: filepath.Join("reviews", "scan.review.yaml"),
+		},
+		{
+			name: "docker results path",
+			path: "/data/results/video123",
+			want: filepath.Join("results", "video123"),
+		},
+		{
+			name: "local path unchanged",
+			path: filepath.Join("data", "reviews", "scan.review.yaml"),
+			want: filepath.Join("data", "reviews", "scan.review.yaml"),
+		},
+		{
+			name: "non data absolute path unchanged",
+			path: "/tmp/scan.review.yaml",
+			want: "/tmp/scan.review.yaml",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := userFacingOutputPath(tt.path); got != tt.want {
+				t.Fatalf("userFacingOutputPath(%q) = %q, want %q", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHeadlineArtifactFilename(t *testing.T) {
+	t.Parallel()
+
+	got := headlineArtifactFilename(3, "Highest_Confidence", 18, 13.89)
+	want := "3_Highest_Confidence_[frame_00018]_[13.89].jpg"
+	if got != want {
+		t.Fatalf("headlineArtifactFilename() = %q, want %q", got, want)
 	}
 }
 

@@ -53,7 +53,7 @@ func init() {
 	scanCmd.Flags().StringVarP(&scanOpts.GracePeriod, "grace-period", "g", "2s", "The longest period where a face can be missing before Sentinel declares they are out of frame and logs it to the database")
 	scanCmd.Flags().Float64VarP(&scanOpts.MatchThreshold, "threshold", "t", 0.6, "Face matching threshold (lower is stricter)")
 	scanCmd.Flags().StringVarP(&scanOpts.BlipDuration, "blip-duration", "b", "100ms", "Minimum duration of a track to be considered valid (filters blips)")
-	scanCmd.Flags().BoolVarP(&scanOpts.DebugScreenshots, "debug-screenshots", "d", false, "Save debug images with bounding boxes to /data/debug_frames/")
+	scanCmd.Flags().BoolVarP(&scanOpts.DebugScreenshots, "debug-screenshots", "d", false, "Save debug images with bounding boxes to debug_frames/ (or data/debug_frames/ outside Docker)")
 	scanCmd.Flags().Float64VarP(&scanOpts.DetectionThreshold, "detection-threshold", "D", 0.5, "Face detection confidence threshold (0.0 - 1.0)")
 
 	scanCmd.Flags().StringVar(&scanOpts.WorkerTimeout, "worker-timeout", "30s", "Timeout for a worker to process a single frame")
@@ -243,11 +243,11 @@ func runScan(ctx context.Context, opts Options) error {
 		}
 	}
 
-	bar := progressbar.NewOptions(totalVideoFrames,
-		progressbar.OptionSetDescription("🔍 Sentinel Scanning"),
-		progressbar.OptionSetWriter(os.Stderr), // Write bar to Stderr
-		progressbar.OptionShowCount(),
-	)
+		bar := progressbar.NewOptions(totalVideoFrames,
+			progressbar.OptionSetDescription("🔍 Scanning"),
+			progressbar.OptionSetWriter(os.Stderr), // Write bar to Stderr
+			progressbar.OptionShowCount(),
+		)
 	barUpdateStop := make(chan struct{})
 	barUpdateDone := make(chan struct{})
 
@@ -265,10 +265,10 @@ func runScan(ctx context.Context, opts Options) error {
 			mem := atomic.LoadUint64(&currentMemory)
 			bufLen := len(inflightSem)
 			bufCap := cap(inflightSem)
-			if mem > 0 {
-				bar.Describe(fmt.Sprintf("🔍 Sentinel Scanning (RAM: %.2f GB | Buffer: %d/%d)", float64(mem)/(1024*1024*1024), bufLen, bufCap))
+				if mem > 0 {
+					bar.Describe(fmt.Sprintf("🔍 Scanning (RAM: %.2f GB | Buffer: %d/%d)", float64(mem)/(1024*1024*1024), bufLen, bufCap))
+				}
 			}
-		}
 		updateDesc()
 
 		ticker := time.NewTicker(250 * time.Millisecond)
@@ -418,8 +418,10 @@ func runScan(ctx context.Context, opts Options) error {
 			return err
 		default:
 			// Success
-			fmt.Fprintf(os.Stderr, "\n📝 Review file generated for video %s at: %s\n", shortDisplayID(videoID), opts.ReviewFile)
-			fmt.Fprintf(os.Stderr, "🧠 Review data file generated at: %s\n", reviewDataFilePath(opts.ReviewFile))
+			fmt.Fprintf(os.Stderr, "\n🆔 Session ID: %s\n", reviewID)
+			fmt.Fprintf(os.Stderr, "🖼️  Results folder: %s\n", reviewArtifactCommentRoot(currentOutputBase(), videoID, reviewID))
+			fmt.Fprintf(os.Stderr, "📝 Review file generated for video %s at: %s\n", shortDisplayID(videoID), userFacingOutputPath(opts.ReviewFile))
+			fmt.Fprintf(os.Stderr, "🧠 Review data file generated at: %s\n", userFacingOutputPath(reviewDataFilePath(opts.ReviewFile)))
 			return nil
 		}
 	}
@@ -591,8 +593,10 @@ type activeTrack struct {
 	LastScore      float64
 	BestThumb      []byte  // Raw JPEG bytes of the best face
 	BestQuality    float64 // Best quality score seen so far (Highest)
+	BestFrame      int
 	LowestThumb    []byte
 	LowestScore    float64
+	LowestFrame    int
 	LastSavedScore float64
 	PendingFrames  []frameData
 	TopFrames      []frameCandidate
@@ -614,6 +618,7 @@ type frameData struct {
 }
 
 type frameCandidate struct {
+	Index int
 	Score float64
 	Vec   []float64
 	Thumb []byte
@@ -678,6 +683,30 @@ func reviewArtifactCommentRoot(outputBase, videoID, reviewID string) string {
 		return filepath.Join("results", videoID, "reviews", reviewID, "tracks")
 	}
 	return filepath.Join(outputBase, "results", videoID, "reviews", reviewID, "tracks")
+}
+
+func currentOutputBase() string {
+	outputBase := "data"
+	if _, err := os.Stat("/data"); err == nil {
+		outputBase = "/data"
+	}
+	return outputBase
+}
+
+func headlineArtifactFilename(order int, label string, frameIndex int, score float64) string {
+	return fmt.Sprintf("%d_%s_[frame_%05d]_[%.2f].jpg", order, label, frameIndex, score)
+}
+
+func userFacingOutputPath(path string) string {
+	clean := filepath.Clean(path)
+	if clean == "/data" {
+		return "."
+	}
+	prefix := "/data" + string(os.PathSeparator)
+	if strings.HasPrefix(clean, prefix) {
+		return strings.TrimPrefix(clean, prefix)
+	}
+	return clean
 }
 
 func prepareReviewArtifactsRoot(reviewArtifactsDir string) error {
@@ -931,12 +960,9 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 		maxGapFrames = 1 // Ensure at least 1 frame gap to prevent instant closing
 	}
 
-	// If /data exists (Docker volume), use it. Otherwise use relative "data" (Local)
-	outputBase := "data"
-	if _, err := os.Stat("/data"); err == nil {
-		outputBase = "/data"
-	}
-	artifactCommentRoot = reviewArtifactCommentRoot(outputBase, videoID, reviewID)
+		// If /data exists (Docker volume), use it. Otherwise use relative "data" (Local)
+		outputBase := currentOutputBase()
+		artifactCommentRoot = reviewArtifactCommentRoot(outputBase, videoID, reviewID)
 	// Optimization: Ensure output directory exists ONCE, not per-track
 	resultsDir = filepath.Join(outputBase, "results", videoID)
 	if err := os.MkdirAll(resultsDir, 0755); err != nil {
@@ -949,7 +975,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 			return
 		}
 	}
-	fmt.Fprintf(os.Stderr, "📂 Output Directory [%s]: %s\n", shortDisplayID(videoID), resultsDir)
+	fmt.Fprintf(os.Stderr, "📂 Output Directory [%s]: %s\n", shortDisplayID(videoID), userFacingOutputPath(resultsDir))
 
 	fmt.Fprintf(os.Stderr, "⚙️  Tracker initialized with Cosine Distance (Threshold: %.2f)\n", opts.MatchThreshold)
 
@@ -992,7 +1018,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 
 			if !sendThumbOp(thumbOp{
 				dir:        trackDir,
-				filename:   fmt.Sprintf("1_First_Detection_[%.2f].jpg", t.FirstScore),
+				filename:   headlineArtifactFilename(1, "First_Detection", t.StartFrame, t.FirstScore),
 				data:       t.FirstThumb,
 				removeGlob: "1_First_Detection_*.jpg",
 			}) {
@@ -1000,7 +1026,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 			}
 			if !sendThumbOp(thumbOp{
 				dir:        trackDir,
-				filename:   fmt.Sprintf("2_Last_Detection_[%.2f].jpg", t.LastScore),
+				filename:   headlineArtifactFilename(2, "Last_Detection", t.LastFrame, t.LastScore),
 				data:       t.LastThumb,
 				removeGlob: "2_Last_Detection_*.jpg",
 			}) {
@@ -1008,7 +1034,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 			}
 			if !sendThumbOp(thumbOp{
 				dir:        trackDir,
-				filename:   fmt.Sprintf("3_Highest_Confidence_[%.2f].jpg", t.BestQuality),
+				filename:   headlineArtifactFilename(3, "Highest_Confidence", t.BestFrame, t.BestQuality),
 				data:       t.BestThumb,
 				removeGlob: "3_Highest_Confidence_*.jpg",
 			}) {
@@ -1016,7 +1042,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 			}
 			if !sendThumbOp(thumbOp{
 				dir:        trackDir,
-				filename:   fmt.Sprintf("4_Lowest_Confidence_[%.2f].jpg", t.LowestScore),
+				filename:   headlineArtifactFilename(4, "Lowest_Confidence", t.LowestFrame, t.LowestScore),
 				data:       t.LowestThumb,
 				removeGlob: "4_Lowest_Confidence_*.jpg",
 			}) {
@@ -1127,6 +1153,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 			if bestIdx != -1 {
 				t.BestThumb = t.TopFrames[bestIdx].Thumb
 				t.BestQuality = t.TopFrames[bestIdx].Score
+				t.BestFrame = t.TopFrames[bestIdx].Index
 			}
 		}
 
@@ -1169,7 +1196,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 		if !firstDetectionWritten[finalIdentityID] { // Use IdentityID for map key
 			if !sendThumbOp(thumbOp{
 				dir:        identityDir,
-				filename:   fmt.Sprintf("1_First_Detection_[%.2f].jpg", t.FirstScore),
+				filename:   headlineArtifactFilename(1, "First_Detection", t.StartFrame, t.FirstScore),
 				data:       t.FirstThumb,
 				removeGlob: "1_First_Detection_*.jpg",
 			}) {
@@ -1181,7 +1208,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 		// 2. Last Detection (Always overwrite)
 		if !sendThumbOp(thumbOp{
 			dir:        identityDir,
-			filename:   fmt.Sprintf("2_Last_Detection_[%.2f].jpg", t.LastScore),
+			filename:   headlineArtifactFilename(2, "Last_Detection", t.LastFrame, t.LastScore),
 			data:       t.LastThumb,
 			removeGlob: "2_Last_Detection_*.jpg",
 		}) {
@@ -1193,7 +1220,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 			globalBestScore[finalIdentityID] = t.BestQuality // Use IdentityID for map key
 			if !sendThumbOp(thumbOp{
 				dir:        identityDir,
-				filename:   fmt.Sprintf("3_Highest_Confidence_[%.2f].jpg", t.BestQuality),
+				filename:   headlineArtifactFilename(3, "Highest_Confidence", t.BestFrame, t.BestQuality),
 				data:       t.BestThumb,
 				removeGlob: "3_Highest_Confidence_*.jpg",
 			}) {
@@ -1207,7 +1234,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 			globalLowestScore[finalIdentityID] = t.LowestScore // Use IdentityID for map key
 			if !sendThumbOp(thumbOp{
 				dir:        identityDir,
-				filename:   fmt.Sprintf("4_Lowest_Confidence_[%.2f].jpg", t.LowestScore),
+				filename:   headlineArtifactFilename(4, "Lowest_Confidence", t.LowestFrame, t.LowestScore),
 				data:       t.LowestThumb,
 				removeGlob: "4_Lowest_Confidence_*.jpg",
 			}) {
@@ -1393,9 +1420,10 @@ func aggregateFrameResults(ctx context.Context, frame scanResult, tracks *[]*act
 		if face.Quality > t.BestQuality {
 			t.BestQuality = face.Quality
 			t.BestThumb = face.Thumb
+			t.BestFrame = frame.Index
 		}
 
-		candidate := frameCandidate{Score: face.Quality, Vec: face.Vec, Thumb: face.Thumb}
+		candidate := frameCandidate{Index: frame.Index, Score: face.Quality, Vec: face.Vec, Thumb: face.Thumb}
 		if len(t.TopFrames) < 10 {
 			t.TopFrames = append(t.TopFrames, candidate)
 		} else {
@@ -1410,7 +1438,7 @@ func aggregateFrameResults(ctx context.Context, frame scanResult, tracks *[]*act
 			}
 		}
 		if face.Quality < t.LowestScore {
-			t.LowestScore, t.LowestThumb = face.Quality, face.Thumb
+			t.LowestScore, t.LowestThumb, t.LowestFrame = face.Quality, face.Thumb, frame.Index
 		}
 
 		// Logic Safety: Use a single robust check for sample frame capture
@@ -1548,11 +1576,11 @@ func splitReviewDocument(doc ReviewDocument) (ReviewDocument, ReviewSidecarDocum
 		Tracks:    make(map[string]ReviewTrackData, len(doc.Tracks)),
 	}
 
-		for _, item := range doc.Tracks {
-			sanitized := item
-			sanitized.InternalVector = nil
-			sanitized.InternalCount = 0
-			reviewDoc.Tracks = append(reviewDoc.Tracks, sanitized)
+	for _, item := range doc.Tracks {
+		sanitized := item
+		sanitized.InternalVector = nil
+		sanitized.InternalCount = 0
+		reviewDoc.Tracks = append(reviewDoc.Tracks, sanitized)
 
 		if len(item.InternalVector) == 0 && item.InternalCount == 0 {
 			continue
@@ -1672,15 +1700,17 @@ func newActiveTrack(id, identityID, frameIndex int, vec []float64, thumb []byte,
 		Count:          1,
 		BestThumb:      thumb,
 		BestQuality:    quality,
+		BestFrame:      frameIndex,
 		FirstThumb:     thumb,
 		FirstScore:     quality,
 		LastThumb:      thumb,
 		LastScore:      quality,
 		LowestThumb:    thumb,
 		LowestScore:    quality,
+		LowestFrame:    frameIndex,
 		LastSavedScore: quality,
 		PendingFrames:  []frameData{{Index: frameIndex, Score: quality, Data: thumb}},
-		TopFrames:      []frameCandidate{{Score: quality, Vec: vec, Thumb: thumb}},
+		TopFrames:      []frameCandidate{{Index: frameIndex, Score: quality, Vec: vec, Thumb: thumb}},
 		IdentityName:   name,
 		VariantName:    variantName,
 		IsKnown:        isKnown,
@@ -1736,10 +1766,7 @@ func validateScanFlags(opts *Options) error {
 }
 
 func defaultReviewFilePath(inputPath, videoID, reviewID string) string {
-	outputBase := "data"
-	if _, err := os.Stat("/data"); err == nil {
-		outputBase = "/data"
-	}
+	outputBase := currentOutputBase()
 
 	base := filepath.Base(inputPath)
 	ext := filepath.Ext(base)

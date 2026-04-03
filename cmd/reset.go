@@ -30,9 +30,11 @@ var resetCmd = &cobra.Command{
 		}
 
 		reader := bufio.NewReader(os.Stdin)
+		confirmedReset := false
 
 		if resetDB {
 			if confirm(reader, "⚠️  Are you sure you want to DROP all database tables?") {
+				confirmedReset = true
 				fmt.Println("🗑️  Clearing Database...")
 				if err := DB.Reset(cmd.Context()); err != nil {
 					return fmt.Errorf("failed to reset database: %w", err)
@@ -47,21 +49,24 @@ var resetCmd = &cobra.Command{
 		}
 
 		if resetFiles {
-			if confirm(reader, "⚠️  Are you sure you want to delete all thumbnails and output videos?") {
-				fmt.Println("🗑️  Clearing Output Files (Thumbnails, Videos)...")
-				removeDir(filepath.Join(outputBase, "results"))
-				removeDir(filepath.Join(outputBase, "output"))
+			if confirm(reader, "⚠️  Are you sure you want to delete all output files (review files, thumbnails, and output videos)?") {
+				confirmedReset = true
+				fmt.Println("🗑️  Clearing Output Files (Review Files, Thumbnails, Videos)...")
+				for _, path := range resetManagedFilePaths(outputBase) {
+					removeDir(path)
+				}
 			}
 		}
 
 		if resetDebug {
 			if confirm(reader, "⚠️  Are you sure you want to delete all debug frames?") {
+				confirmedReset = true
 				fmt.Println("🗑️  Clearing Debug Frames...")
 				removeDir(filepath.Join(outputBase, "debug_frames"))
 			}
 		}
 
-		fmt.Println("✨ System Reset Complete.")
+		fmt.Println(resetCompletionMessage(confirmedReset))
 		return nil
 	},
 }
@@ -84,4 +89,19 @@ func removeDir(path string) {
 	if err := os.RemoveAll(path); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠️  Failed to remove %s: %v\n", path, err)
 	}
+}
+
+func resetManagedFilePaths(outputBase string) []string {
+	return []string{
+		filepath.Join(outputBase, "reviews"),
+		filepath.Join(outputBase, "results"),
+		filepath.Join(outputBase, "output"),
+	}
+}
+
+func resetCompletionMessage(confirmedReset bool) string {
+	if confirmedReset {
+		return "✨ System Reset Complete."
+	}
+	return "ℹ️  No reset actions were confirmed."
 }
