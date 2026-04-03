@@ -246,6 +246,23 @@ func runScan(ctx context.Context, opts Options) error {
 		}
 	}
 
+	// Start Aggregator (Consumer) concurrently to prevent deadlock on resultsChan
+	aggDone := make(chan struct{})
+	finalIntervalsChan := make(chan []store.IntervalData, 1)
+	startupReady := make(chan struct{})
+	go func() {
+		processResults(ctx, resultsChan, dbOps, videoID, reviewID, fps, opts, errChan, finalIntervalsChan, inflightSem, startupReady)
+		close(aggDone)
+	}()
+
+	select {
+	case <-startupReady:
+	case err := <-errChan:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
 	bar := progressbar.NewOptions(totalVideoFrames,
 		progressbar.OptionSetDescription("🔍 Scanning"),
 		progressbar.OptionSetWriter(os.Stderr), // Write bar to Stderr
@@ -253,14 +270,6 @@ func runScan(ctx context.Context, opts Options) error {
 	)
 	barUpdateStop := make(chan struct{})
 	barUpdateDone := make(chan struct{})
-
-	// Start Aggregator (Consumer) concurrently to prevent deadlock on resultsChan
-	aggDone := make(chan struct{})
-	finalIntervalsChan := make(chan []store.IntervalData, 1)
-	go func() {
-		processResults(ctx, resultsChan, dbOps, videoID, reviewID, fps, opts, errChan, finalIntervalsChan, inflightSem)
-		close(aggDone)
-	}()
 
 	go func() {
 		defer close(barUpdateDone)
@@ -1336,7 +1345,7 @@ func printReviewSummary(videoID string, items []reviewSummaryItem, totalDetectio
 	fmt.Fprintf(os.Stderr, "---------------------------------------------------------\n")
 }
 
-func processResults(ctx context.Context, results <-chan scanResult, db scanDB, videoID, reviewID string, fps float64, opts Options, errChan chan<- error, finalIntervalsChan chan<- []store.IntervalData, inflightSem chan struct{}) {
+func processResults(ctx context.Context, results <-chan scanResult, db scanDB, videoID, reviewID string, fps float64, opts Options, errChan chan<- error, finalIntervalsChan chan<- []store.IntervalData, inflightSem chan struct{}, startupReady chan<- struct{}) {
 	var reviewFileReadyToWrite bool
 	var finalIntervals []store.IntervalData
 	var reviewItems []StagingItem
@@ -1460,6 +1469,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 	fmt.Fprintf(os.Stderr, "📂 Output Directory [%s]: %s\n", shortDisplayID(videoID), userFacingOutputPath(resultsDir))
 
 	fmt.Fprintf(os.Stderr, "⚙️  Tracker initialized with Cosine Distance (Threshold: %.2f)\n", opts.MatchThreshold)
+	close(startupReady)
 
 	// Helper closure to persist a track (DRY: Used in loop and at flush)
 	sendThumbOp := func(op thumbOp) bool {
