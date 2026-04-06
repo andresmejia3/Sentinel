@@ -11,12 +11,13 @@ import (
 
 // CommitAction is a single reviewed staging action to be applied atomically.
 type CommitAction struct {
-	TrackID      string
-	Action       string
-	IdentityName string
-	VariantName  string
-	Vector       []float64
-	Count        int
+	TrackID       string
+	Action        string
+	IdentityName  string
+	VariantName   string
+	Vector        []float64
+	Count         int
+	TargetTrackID string
 }
 
 type CommitInterval struct {
@@ -60,7 +61,7 @@ func (s *Store) ApplyCommitBatch(ctx context.Context, commitID string, actions [
 
 	variantByTrack := make(map[string]int, len(actions))
 	for _, action := range orderCommitActions(actions) {
-		variantID, err := applyCommitActionTx(ctx, tx, commitID, action)
+		variantID, err := applyCommitActionTx(ctx, tx, commitID, action, variantByTrack)
 		if err != nil {
 			return err
 		}
@@ -131,7 +132,7 @@ func orderCommitActions(actions []CommitAction) []CommitAction {
 	return ordered
 }
 
-func applyCommitActionTx(ctx context.Context, tx pgx.Tx, commitID string, action CommitAction) (int, error) {
+func applyCommitActionTx(ctx context.Context, tx pgx.Tx, commitID string, action CommitAction, variantByTrack map[string]int) (int, error) {
 	addedSum := make([]float64, len(action.Vector))
 	for i, v := range action.Vector {
 		addedSum[i] = v * float64(action.Count)
@@ -146,6 +147,16 @@ func applyCommitActionTx(ctx context.Context, tx pgx.Tx, commitID string, action
 
 	switch action.Action {
 	case "merge":
+		if action.TargetTrackID != "" {
+			variantID, ok := variantByTrack[action.TargetTrackID]
+			if !ok {
+				return 0, fmt.Errorf("target track %s has not created a merge target yet for track %s", action.TargetTrackID, action.TrackID)
+			}
+			if err := commitMergeTx(ctx, tx, variantID, addedSum, action.Count, ledgerEntry); err != nil {
+				return 0, fmt.Errorf("failed to commit grouped merge for %s: %w", action.TrackID, err)
+			}
+			return variantID, nil
+		}
 		identityID, err := resolveIdentityIDTx(ctx, tx, action.IdentityName)
 		if err != nil {
 			return 0, fmt.Errorf("error resolving identity '%s' for track %s: %w", action.IdentityName, action.TrackID, err)

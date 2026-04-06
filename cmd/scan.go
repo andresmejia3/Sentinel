@@ -35,6 +35,8 @@ const shortDisplayIDLength = 12
 const potentialIdentityThreshold = 0.35
 const potentialIdentityStrongMatchThreshold = 0.25
 const potentialIdentityAmbiguityMargin = 0.05
+const potentialIdentityMoveMargin = 0.03
+const potentialIdentityRefinementMaxRounds = 3
 
 var scanOpts Options
 var scanBufferSize int
@@ -538,10 +540,10 @@ type StagingItem struct {
 	EndTime           float64            `yaml:"end_time"`
 	NearestCandidates []NearestCandidate `yaml:"nearest_candidates,omitempty"`
 	Confidence        float64            `yaml:"confidence"`
-	Reason            string             `yaml:"reason,omitempty"`
 	Identity          string             `yaml:"identity"`
 	Variant           string             `yaml:"variant"`
 	Action            string             `yaml:"action"`
+	GroupID           int                `yaml:"-"`
 	// Internal data for the commit process
 	InternalVector []float64 `yaml:"-"`
 	InternalCount  int       `yaml:"-"`
@@ -554,11 +556,41 @@ type NearestCandidate struct {
 }
 
 type ReviewDocument struct {
-	ReviewID     string        `yaml:"review_id,omitempty"`
-	VideoID      string        `yaml:"video_id,omitempty"`
-	InputPath    string        `yaml:"input_path,omitempty"`
-	Tracks       []StagingItem `yaml:"tracks"`
-	ArtifactRoot string        `yaml:"-"`
+	ReviewID     string              `yaml:"review_id,omitempty"`
+	VideoID      string              `yaml:"video_id,omitempty"`
+	InputPath    string              `yaml:"input_path,omitempty"`
+	Tracks       []StagingItem       `yaml:"tracks"`
+	ArtifactRoot string              `yaml:"-"`
+	SummaryItems []reviewSummaryItem `yaml:"-"`
+}
+
+type ReviewFileDocument struct {
+	ReviewID            string                        `yaml:"review_id,omitempty"`
+	VideoID             string                        `yaml:"video_id,omitempty"`
+	InputPath           string                        `yaml:"input_path,omitempty"`
+	RawTracks           map[string]ReviewRawTrackItem `yaml:"raw_tracks"`
+	UnresolvedTracks    []string                      `yaml:"unresolved_tracks,omitempty"`
+	PotentialIdentities []ReviewPotentialIdentityItem `yaml:"potential_identities"`
+	ArtifactRoot        string                        `yaml:"-"`
+}
+
+type ReviewRawTrackItem struct {
+	StartTime         float64            `yaml:"start_time"`
+	EndTime           float64            `yaml:"end_time"`
+	NearestCandidates []NearestCandidate `yaml:"nearest_candidates,omitempty"`
+	Confidence        float64            `yaml:"confidence"`
+	SuggestedIdentity string             `yaml:"suggested_identity"`
+	SuggestedVariant  string             `yaml:"suggested_variant"`
+	SuggestedAction   string             `yaml:"suggested_action"`
+	ArtifactDir       string             `yaml:"artifact_dir,omitempty"`
+}
+
+type ReviewPotentialIdentityItem struct {
+	ID       int      `yaml:"id"`
+	Tracks   []string `yaml:"tracks"`
+	Identity string   `yaml:"identity"`
+	Variant  string   `yaml:"variant"`
+	Action   string   `yaml:"action"`
 }
 
 type ReviewTrackData struct {
@@ -582,9 +614,7 @@ type reviewSummaryItem struct {
 	Identity          string
 	Variant           string
 	Confidence        float64
-	Reason            string
 	Action            string
-	KnownVariant      bool
 	ArtifactDir       string
 	Vector            []float64
 	Count             int
@@ -633,6 +663,23 @@ type potentialIdentityCandidate struct {
 	BestMemberDistance    float64
 	BestMemberTrackID     int
 	OverlapBlockedTrackID int
+}
+
+type potentialIdentityDecisionKind string
+
+const (
+	potentialIdentityDecisionStay       potentialIdentityDecisionKind = "stay"
+	potentialIdentityDecisionMove       potentialIdentityDecisionKind = "move"
+	potentialIdentityDecisionUnresolved potentialIdentityDecisionKind = "unresolved"
+	potentialIdentityDecisionAttach     potentialIdentityDecisionKind = "attach"
+)
+
+type potentialIdentityDecision struct {
+	TrackID            int
+	Kind               potentialIdentityDecisionKind
+	OriginalIdentityID int
+	TargetIdentityID   int
+	Link               PotentialIdentityLink
 }
 
 // --- Aggregation & Tracking Logic ---
@@ -708,6 +755,170 @@ func reviewDocumentID(doc ReviewDocument) string {
 
 func sidecarDocumentID(doc ReviewSidecarDocument) string {
 	return doc.ReviewID
+}
+
+func reviewSummaryItemsFromTracks(tracks []StagingItem) []reviewSummaryItem {
+	items := make([]reviewSummaryItem, 0, len(tracks))
+	for _, track := range tracks {
+		items = append(items, reviewSummaryItem{
+			ID:                track.ID,
+			StartTime:         track.StartTime,
+			EndTime:           track.EndTime,
+			NearestCandidates: append([]NearestCandidate(nil), track.NearestCandidates...),
+			Identity:          track.Identity,
+			Variant:           track.Variant,
+			Confidence:        track.Confidence,
+			Action:            track.Action,
+			Vector:            cloneVector(track.InternalVector),
+			Count:             track.InternalCount,
+		})
+	}
+	return items
+}
+
+func buildReviewRawTrackItems(summaryItems []reviewSummaryItem) map[string]ReviewRawTrackItem {
+	rawTracks := make(map[string]ReviewRawTrackItem, len(summaryItems))
+	for _, item := range summaryItems {
+		if item.ID <= 0 {
+			continue
+		}
+		rawTracks[strconv.Itoa(item.ID)] = ReviewRawTrackItem{
+			StartTime:         item.StartTime,
+			EndTime:           item.EndTime,
+			NearestCandidates: append([]NearestCandidate(nil), item.NearestCandidates...),
+			Confidence:        item.Confidence,
+			SuggestedIdentity: item.Identity,
+			SuggestedVariant:  item.Variant,
+			SuggestedAction:   item.Action,
+			ArtifactDir:       item.ArtifactDir,
+		}
+	}
+	return rawTracks
+}
+
+func allMembersAgreeOnIdentity(members []PotentialIdentityMember) (string, bool) {
+	if len(members) == 0 {
+		return "", false
+	}
+	identity := strings.TrimSpace(members[0].Item.Identity)
+	if identity == "" {
+		return "", false
+	}
+	for _, member := range members[1:] {
+		if strings.TrimSpace(member.Item.Identity) != identity {
+			return "", false
+		}
+	}
+	return identity, true
+}
+
+func allMembersAgreeOnAction(members []PotentialIdentityMember) (string, bool) {
+	if len(members) == 0 {
+		return "", false
+	}
+	action := strings.TrimSpace(members[0].Item.Action)
+	if action == "" {
+		return "", false
+	}
+	for _, member := range members[1:] {
+		if strings.TrimSpace(member.Item.Action) != action {
+			return "", false
+		}
+	}
+	return action, true
+}
+
+func allMembersAgreeOnVariant(members []PotentialIdentityMember) (string, bool) {
+	if len(members) == 0 {
+		return "", false
+	}
+	variant := strings.TrimSpace(members[0].Item.Variant)
+	if variant == "" {
+		return "", false
+	}
+	for _, member := range members[1:] {
+		if strings.TrimSpace(member.Item.Variant) != variant {
+			return "", false
+		}
+	}
+	return variant, true
+}
+
+func suggestPotentialIdentityReviewFields(members []PotentialIdentityMember) (string, string, string) {
+	action, actionOK := allMembersAgreeOnAction(members)
+	identity, identityOK := allMembersAgreeOnIdentity(members)
+	variant, variantOK := allMembersAgreeOnVariant(members)
+
+	if actionOK {
+		switch action {
+		case "new_identity":
+			return "", "", "new_identity"
+		case "discard":
+			return "", "", "discard"
+		case "new_variant":
+			if identityOK {
+				return identity, "", "new_variant"
+			}
+		case "merge":
+			if identityOK && variantOK {
+				return identity, variant, "merge"
+			}
+		}
+	}
+
+	if identityOK {
+		return identity, "", ""
+	}
+
+	return "", "", ""
+}
+
+func reviewPotentialIdentityItem(id int, members []PotentialIdentityMember) ReviewPotentialIdentityItem {
+	item := ReviewPotentialIdentityItem{
+		ID:     id,
+		Tracks: make([]string, 0, len(members)),
+	}
+	for _, member := range members {
+		item.Tracks = append(item.Tracks, strconv.Itoa(member.Item.ID))
+	}
+	item.Identity, item.Variant, item.Action = suggestPotentialIdentityReviewFields(members)
+	return item
+}
+
+func buildReviewUnresolvedTrackRefs(unresolved []PotentialIdentityMember) []string {
+	refs := make([]string, 0, len(unresolved))
+	for _, member := range unresolved {
+		if member.Item.ID <= 0 {
+			continue
+		}
+		refs = append(refs, strconv.Itoa(member.Item.ID))
+	}
+	return refs
+}
+
+func buildReviewFileDocument(doc ReviewDocument) ReviewFileDocument {
+	summaryItems := append([]reviewSummaryItem(nil), doc.SummaryItems...)
+	if len(summaryItems) == 0 {
+		summaryItems = reviewSummaryItemsFromTracks(doc.Tracks)
+	}
+
+	identities, unresolved := buildPotentialIdentities(summaryItems)
+	fileDoc := ReviewFileDocument{
+		ReviewID:            reviewDocumentID(doc),
+		VideoID:             doc.VideoID,
+		InputPath:           doc.InputPath,
+		RawTracks:           buildReviewRawTrackItems(summaryItems),
+		UnresolvedTracks:    buildReviewUnresolvedTrackRefs(unresolved),
+		PotentialIdentities: make([]ReviewPotentialIdentityItem, 0, len(identities)),
+		ArtifactRoot:        doc.ArtifactRoot,
+	}
+
+	nextID := 1
+	for _, identity := range identities {
+		fileDoc.PotentialIdentities = append(fileDoc.PotentialIdentities, reviewPotentialIdentityItem(nextID, identity.Members))
+		nextID++
+	}
+	return fileDoc
 }
 
 func newReviewID() (string, error) {
@@ -786,14 +997,12 @@ func reviewTrackFingerprint(item StagingItem) (string, error) {
 		EndTime           float64            `json:"end_time"`
 		NearestCandidates []NearestCandidate `json:"nearest_candidates,omitempty"`
 		Confidence        float64            `json:"confidence"`
-		Reason            string             `json:"reason,omitempty"`
 	}{
 		Key:               stagingItemKey(item),
 		StartTime:         item.StartTime,
 		EndTime:           item.EndTime,
 		NearestCandidates: item.NearestCandidates,
 		Confidence:        item.Confidence,
-		Reason:            item.Reason,
 	}
 
 	data, err := json.Marshal(payload)
@@ -825,31 +1034,6 @@ func roundTo(v float64, places int) float64 {
 
 func candidateLabel(candidate NearestCandidate) string {
 	return identityVariantLabel(candidate.Identity, candidate.Variant)
-}
-
-func reviewReason(matches []store.IdentityMatch, matchThreshold float64, action string) string {
-	if len(matches) == 0 {
-		return "no stored variants found -> suggested new_identity"
-	}
-
-	topDistance := roundTo(matches[0].Distance, 3)
-	switch action {
-	case "new_identity":
-		return fmt.Sprintf("nearest_distance=%.3f > threshold=%.3f -> suggested new_identity", topDistance, roundTo(matchThreshold, 3))
-	case "":
-		if len(matches) > 1 {
-			secondDistance := roundTo(matches[1].Distance, 3)
-			gap := roundTo(math.Abs(matches[1].Distance-matches[0].Distance), 3)
-			return fmt.Sprintf("nearest_distance=%.3f, second_distance=%.3f, gap=%.3f < 0.050 -> needs review", topDistance, secondDistance, gap)
-		}
-		return fmt.Sprintf("nearest_distance=%.3f -> needs review", topDistance)
-	case "new_variant":
-		return fmt.Sprintf("nearest_distance=%.3f is within threshold=%.3f but above merge_cutoff=0.350 -> suggested new_variant", topDistance, roundTo(matchThreshold, 3))
-	case "merge":
-		return fmt.Sprintf("nearest_distance=%.3f <= merge_cutoff=0.350 -> suggested merge", topDistance)
-	default:
-		return fmt.Sprintf("nearest_distance=%.3f -> suggested %s", topDistance, action)
-	}
 }
 
 func reviewActionLabel(action string) string {
@@ -1030,10 +1214,9 @@ func sortPotentialIdentityCandidates(candidates []potentialIdentityCandidate) {
 	})
 }
 
-func classifyPotentialIdentityLink(item reviewSummaryItem, identities []PotentialIdentity) PotentialIdentityLink {
-	link := PotentialIdentityLink{Status: potentialIdentityStatusNew}
+func collectPotentialIdentityCandidates(item reviewSummaryItem, identities []PotentialIdentity) ([]potentialIdentityCandidate, []potentialIdentityCandidate) {
 	if len(item.Vector) == 0 || len(identities) == 0 {
-		return link
+		return nil, nil
 	}
 
 	var eligible []potentialIdentityCandidate
@@ -1052,7 +1235,11 @@ func classifyPotentialIdentityLink(item reviewSummaryItem, identities []Potentia
 
 	sortPotentialIdentityCandidates(eligible)
 	sortPotentialIdentityCandidates(overlapBlocked)
+	return eligible, overlapBlocked
+}
 
+func buildPotentialIdentityLinkFromCandidates(eligible, overlapBlocked []potentialIdentityCandidate) PotentialIdentityLink {
+	link := PotentialIdentityLink{Status: potentialIdentityStatusNew}
 	if len(eligible) == 0 {
 		if len(overlapBlocked) > 0 && overlapBlocked[0].Score <= potentialIdentityThreshold {
 			blocked := overlapBlocked[0]
@@ -1085,6 +1272,11 @@ func classifyPotentialIdentityLink(item reviewSummaryItem, identities []Potentia
 		link.Status = potentialIdentityStatusPossible
 	}
 	return link
+}
+
+func classifyPotentialIdentityLink(item reviewSummaryItem, identities []PotentialIdentity) PotentialIdentityLink {
+	eligible, overlapBlocked := collectPotentialIdentityCandidates(item, identities)
+	return buildPotentialIdentityLinkFromCandidates(eligible, overlapBlocked)
 }
 
 func findPotentialIdentityIndexByID(identities []PotentialIdentity, id int) int {
@@ -1138,6 +1330,20 @@ func sortPotentialIdentityUnresolved(unresolved []PotentialIdentityMember) {
 	})
 }
 
+func clonePotentialIdentities(identities []PotentialIdentity) []PotentialIdentity {
+	cloned := make([]PotentialIdentity, len(identities))
+	for i, identity := range identities {
+		cloned[i] = PotentialIdentity{
+			ID:         identity.ID,
+			Members:    append([]PotentialIdentityMember(nil), identity.Members...),
+			SumVec:     cloneVector(identity.SumVec),
+			Centroid:   cloneVector(identity.Centroid),
+			TotalCount: identity.TotalCount,
+		}
+	}
+	return cloned
+}
+
 func restorePotentialIdentityMember(identities []PotentialIdentity, identityID int, member PotentialIdentityMember) []PotentialIdentity {
 	if idx := findPotentialIdentityIndexByID(identities, identityID); idx >= 0 {
 		addPotentialIdentityMember(&identities[idx], member.Item, member.Link)
@@ -1145,6 +1351,186 @@ func restorePotentialIdentityMember(identities []PotentialIdentity, identityID i
 	}
 	identities = append(identities, newPotentialIdentityWithID(identityID, member.Item, member.Link))
 	return identities
+}
+
+func findPotentialIdentityCandidateByID(candidates []potentialIdentityCandidate, identityID int) (potentialIdentityCandidate, bool) {
+	for _, candidate := range candidates {
+		if candidate.IdentityID == identityID {
+			return candidate, true
+		}
+	}
+	return potentialIdentityCandidate{}, false
+}
+
+func stagePossiblePotentialIdentityDecisions(identities []PotentialIdentity) []potentialIdentityDecision {
+	possibleTrackIDs := collectPotentialIdentityMemberTrackIDsByStatus(identities, potentialIdentityStatusPossible)
+	decisions := make([]potentialIdentityDecision, 0, len(possibleTrackIDs))
+
+	for _, trackID := range possibleTrackIDs {
+		snapshot := clonePotentialIdentities(identities)
+		identityIdx, memberIdx := findPotentialIdentityMember(snapshot, trackID)
+		if identityIdx < 0 || memberIdx < 0 {
+			continue
+		}
+
+		originalIdentityID := snapshot[identityIdx].ID
+		member := removePotentialIdentityMember(&snapshot[identityIdx], memberIdx)
+		snapshot = removeEmptyPotentialIdentities(snapshot)
+
+		eligible, overlapBlocked := collectPotentialIdentityCandidates(member.Item, snapshot)
+		link := buildPotentialIdentityLinkFromCandidates(eligible, overlapBlocked)
+		decision := potentialIdentityDecision{
+			TrackID:            trackID,
+			Kind:               potentialIdentityDecisionStay,
+			OriginalIdentityID: originalIdentityID,
+			Link:               member.Link,
+		}
+
+		if link.Status != potentialIdentityStatusStrong && link.Status != potentialIdentityStatusPossible {
+			decision.Kind = potentialIdentityDecisionUnresolved
+			decision.Link = link
+			decisions = append(decisions, decision)
+			continue
+		}
+
+		bestCandidate := eligible[0]
+		if link.BestPotentialIdentityID == originalIdentityID {
+			decision.Link = link
+			decisions = append(decisions, decision)
+			continue
+		}
+
+		currentCandidate, currentEligible := findPotentialIdentityCandidateByID(eligible, originalIdentityID)
+		if currentEligible && bestCandidate.Score+potentialIdentityMoveMargin >= currentCandidate.Score {
+			decision.Link = link
+			decisions = append(decisions, decision)
+			continue
+		}
+
+		decision.Kind = potentialIdentityDecisionMove
+		decision.TargetIdentityID = link.BestPotentialIdentityID
+		decision.Link = link
+		decisions = append(decisions, decision)
+	}
+
+	sort.Slice(decisions, func(i, j int) bool {
+		return decisions[i].TrackID < decisions[j].TrackID
+	})
+	return decisions
+}
+
+func stageUnresolvedPotentialIdentityDecisions(identities []PotentialIdentity, unresolved []PotentialIdentityMember) []potentialIdentityDecision {
+	snapshot := clonePotentialIdentities(identities)
+	sortedUnresolved := append([]PotentialIdentityMember(nil), unresolved...)
+	sortPotentialIdentityUnresolved(sortedUnresolved)
+
+	decisions := make([]potentialIdentityDecision, 0, len(sortedUnresolved))
+	for _, member := range sortedUnresolved {
+		link := classifyPotentialIdentityLink(member.Item, snapshot)
+		decision := potentialIdentityDecision{
+			TrackID: member.Item.ID,
+			Kind:    potentialIdentityDecisionUnresolved,
+			Link:    link,
+		}
+		if link.Status == potentialIdentityStatusStrong || link.Status == potentialIdentityStatusPossible {
+			decision.Kind = potentialIdentityDecisionAttach
+			decision.TargetIdentityID = link.BestPotentialIdentityID
+		}
+		decisions = append(decisions, decision)
+	}
+	return decisions
+}
+
+func applyPossiblePotentialIdentityDecisions(identities []PotentialIdentity, unresolved []PotentialIdentityMember, decisions []potentialIdentityDecision) ([]PotentialIdentity, []PotentialIdentityMember, bool) {
+	changed := false
+
+	for _, decision := range decisions {
+		identityIdx, memberIdx := findPotentialIdentityMember(identities, decision.TrackID)
+		if identityIdx < 0 || memberIdx < 0 {
+			continue
+		}
+
+		switch decision.Kind {
+		case potentialIdentityDecisionStay:
+			identities[identityIdx].Members[memberIdx].Link = decision.Link
+		case potentialIdentityDecisionMove:
+			member := removePotentialIdentityMember(&identities[identityIdx], memberIdx)
+			member.Link = decision.Link
+			identities = restorePotentialIdentityMember(identities, decision.TargetIdentityID, member)
+			changed = true
+		case potentialIdentityDecisionUnresolved:
+			member := removePotentialIdentityMember(&identities[identityIdx], memberIdx)
+			member.Link = decision.Link
+			unresolved = append(unresolved, member)
+			changed = true
+		}
+	}
+
+	identities = removeEmptyPotentialIdentities(identities)
+	sortPotentialIdentityMembers(identities)
+	sortPotentialIdentityUnresolved(unresolved)
+	return identities, unresolved, changed
+}
+
+func applyUnresolvedPotentialIdentityDecisions(identities []PotentialIdentity, unresolved []PotentialIdentityMember, decisions []potentialIdentityDecision) ([]PotentialIdentity, []PotentialIdentityMember, bool) {
+	if len(decisions) == 0 {
+		sortPotentialIdentityMembers(identities)
+		sortPotentialIdentityUnresolved(unresolved)
+		return identities, unresolved, false
+	}
+
+	unresolvedByTrack := make(map[int]PotentialIdentityMember, len(unresolved))
+	for _, member := range unresolved {
+		unresolvedByTrack[member.Item.ID] = member
+	}
+
+	var remaining []PotentialIdentityMember
+	changed := false
+
+	for _, decision := range decisions {
+		member, ok := unresolvedByTrack[decision.TrackID]
+		if !ok {
+			continue
+		}
+
+		switch decision.Kind {
+		case potentialIdentityDecisionAttach:
+			member.Link = decision.Link
+			identities = restorePotentialIdentityMember(identities, decision.TargetIdentityID, member)
+			changed = true
+		default:
+			member.Link = decision.Link
+			remaining = append(remaining, member)
+		}
+	}
+
+	identities = removeEmptyPotentialIdentities(identities)
+	sortPotentialIdentityMembers(identities)
+	sortPotentialIdentityUnresolved(remaining)
+	return identities, remaining, changed
+}
+
+func potentialIdentityAssignmentSignature(identities []PotentialIdentity, unresolved []PotentialIdentityMember) string {
+	var b strings.Builder
+	for _, identity := range identities {
+		b.WriteString(strconv.Itoa(identity.ID))
+		b.WriteByte(':')
+		for i, member := range identity.Members {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(strconv.Itoa(member.Item.ID))
+		}
+		b.WriteByte(';')
+	}
+	b.WriteString("|u:")
+	for i, member := range unresolved {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.Itoa(member.Item.ID))
+	}
+	return b.String()
 }
 
 func collectPotentialIdentityMemberTrackIDsByStatus(identities []PotentialIdentity, status PotentialIdentityStatus) []int {
@@ -1160,61 +1546,42 @@ func collectPotentialIdentityMemberTrackIDsByStatus(identities []PotentialIdenti
 	return trackIDs
 }
 
-func refinePossiblePotentialIdentityMembers(identities []PotentialIdentity) []PotentialIdentity {
-	possibleTrackIDs := collectPotentialIdentityMemberTrackIDsByStatus(identities, potentialIdentityStatusPossible)
-	for _, trackID := range possibleTrackIDs {
-		identityIdx, memberIdx := findPotentialIdentityMember(identities, trackID)
-		if identityIdx < 0 || memberIdx < 0 {
-			continue
-		}
-
-		originalIdentityID := identities[identityIdx].ID
-		member := removePotentialIdentityMember(&identities[identityIdx], memberIdx)
-		identities = removeEmptyPotentialIdentities(identities)
-
-		newLink := classifyPotentialIdentityLink(member.Item, identities)
-		if newLink.Status != potentialIdentityStatusStrong && newLink.Status != potentialIdentityStatusPossible {
-			identities = restorePotentialIdentityMember(identities, originalIdentityID, member)
-			continue
-		}
-
-		if newLink.BestPotentialIdentityID == originalIdentityID || newLink.BestPotentialIdentityScore+potentialIdentityAmbiguityMargin >= member.Link.BestPotentialIdentityScore {
-			identities = restorePotentialIdentityMember(identities, originalIdentityID, member)
-			continue
-		}
-
-		if targetIdx := findPotentialIdentityIndexByID(identities, newLink.BestPotentialIdentityID); targetIdx >= 0 {
-			addPotentialIdentityMember(&identities[targetIdx], member.Item, newLink)
-			continue
-		}
-
-		identities = restorePotentialIdentityMember(identities, originalIdentityID, member)
-	}
-
-	identities = removeEmptyPotentialIdentities(identities)
+func refinePotentialIdentityAssignmentsUntilStable(identities []PotentialIdentity, unresolved []PotentialIdentityMember) ([]PotentialIdentity, []PotentialIdentityMember) {
+	recomputeAllPotentialIdentityStatsFromMembers(identities)
 	sortPotentialIdentityMembers(identities)
-	return identities
-}
-
-func resolveAmbiguousPotentialIdentityMembers(identities []PotentialIdentity, unresolved []PotentialIdentityMember) ([]PotentialIdentity, []PotentialIdentityMember) {
-	var remaining []PotentialIdentityMember
 	sortPotentialIdentityUnresolved(unresolved)
 
-	for _, member := range unresolved {
-		link := classifyPotentialIdentityLink(member.Item, identities)
-		if link.Status == potentialIdentityStatusStrong || link.Status == potentialIdentityStatusPossible {
-			if idx := findPotentialIdentityIndexByID(identities, link.BestPotentialIdentityID); idx >= 0 {
-				addPotentialIdentityMember(&identities[idx], member.Item, link)
-				continue
-			}
+	seenSignatures := make(map[string]struct{}, potentialIdentityRefinementMaxRounds+1)
+	for round := 0; round < potentialIdentityRefinementMaxRounds; round++ {
+		signature := potentialIdentityAssignmentSignature(identities, unresolved)
+		if _, seen := seenSignatures[signature]; seen {
+			break
 		}
-		member.Link = link
-		remaining = append(remaining, member)
+		seenSignatures[signature] = struct{}{}
+
+		possibleDecisions := stagePossiblePotentialIdentityDecisions(identities)
+		var possibleChanged bool
+		identities, unresolved, possibleChanged = applyPossiblePotentialIdentityDecisions(identities, unresolved, possibleDecisions)
+		recomputeAllPotentialIdentityStatsFromMembers(identities)
+		sortPotentialIdentityMembers(identities)
+		sortPotentialIdentityUnresolved(unresolved)
+
+		unresolvedDecisions := stageUnresolvedPotentialIdentityDecisions(identities, unresolved)
+		var unresolvedChanged bool
+		identities, unresolved, unresolvedChanged = applyUnresolvedPotentialIdentityDecisions(identities, unresolved, unresolvedDecisions)
+		recomputeAllPotentialIdentityStatsFromMembers(identities)
+		sortPotentialIdentityMembers(identities)
+		sortPotentialIdentityUnresolved(unresolved)
+
+		if !possibleChanged && !unresolvedChanged {
+			break
+		}
 	}
 
+	recomputeAllPotentialIdentityStatsFromMembers(identities)
 	sortPotentialIdentityMembers(identities)
-	sortPotentialIdentityUnresolved(remaining)
-	return identities, remaining
+	sortPotentialIdentityUnresolved(unresolved)
+	return identities, unresolved
 }
 
 func buildPotentialIdentities(items []reviewSummaryItem) ([]PotentialIdentity, []PotentialIdentityMember) {
@@ -1256,9 +1623,7 @@ func buildPotentialIdentities(items []reviewSummaryItem) ([]PotentialIdentity, [
 	}
 
 	sortPotentialIdentityMembers(identities)
-	identities = refinePossiblePotentialIdentityMembers(identities)
-	identities, unresolved = resolveAmbiguousPotentialIdentityMembers(identities, unresolved)
-	recomputeAllPotentialIdentityStatsFromMembers(identities)
+	identities, unresolved = refinePotentialIdentityAssignmentsUntilStable(identities, unresolved)
 
 	return identities, unresolved
 }
@@ -1280,13 +1645,13 @@ func potentialIdentityLinkLines(member PotentialIdentityMember) []string {
 	case potentialIdentityStatusAmbiguous:
 		return []string{
 			fmt.Sprintf("Track %d AMBIGUOUS between:", member.Item.ID),
-			fmt.Sprintf("Potential Identity %d (distance: %.2f - BEST)", member.Link.BestPotentialIdentityID, member.Link.BestPotentialIdentityScore),
-			fmt.Sprintf("Potential Identity %d (distance: %.2f)", member.Link.SecondBestPotentialIdentityID, member.Link.SecondBestPotentialIdentityScore),
+			fmt.Sprintf("Potential Identity %d (score: %.2f - BEST)", member.Link.BestPotentialIdentityID, member.Link.BestPotentialIdentityScore),
+			fmt.Sprintf("Potential Identity %d (score: %.2f)", member.Link.SecondBestPotentialIdentityID, member.Link.SecondBestPotentialIdentityScore),
 		}
 	case potentialIdentityStatusNew:
 		if member.Link.OverlapBlockedPotentialIdentityID > 0 {
 			return []string{
-				fmt.Sprintf("Track %d NEW potential identity (closest match to Potential Identity %d blocked by time overlap with Track %d, distance: %.2f)", member.Item.ID, member.Link.OverlapBlockedPotentialIdentityID, member.Link.OverlapBlockedTrackID, member.Link.OverlapBlockedDistance),
+				fmt.Sprintf("Track %d NEW potential identity (closest match to Potential Identity %d blocked by time overlap with Track %d, score: %.2f)", member.Item.ID, member.Link.OverlapBlockedPotentialIdentityID, member.Link.OverlapBlockedTrackID, member.Link.OverlapBlockedDistance),
 			}
 		}
 	}
@@ -1379,6 +1744,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 				InputPath:    opts.InputPath,
 				Tracks:       reviewItems,
 				ArtifactRoot: artifactCommentRoot,
+				SummaryItems: reviewSummaryItems,
 			}
 			if err := writeReviewArtifacts(opts.ReviewFile, doc); err != nil {
 				// Try to send the error back to the main routine.
@@ -1609,8 +1975,6 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 			} else {
 				item.Action = "new_identity"
 			}
-			item.Reason = reviewReason(matches, opts.MatchThreshold, item.Action)
-
 			reviewItems = append(reviewItems, item)
 			reviewSummaryItems = append(reviewSummaryItems, reviewSummaryItem{
 				ID:                trackReviewID,
@@ -1620,9 +1984,7 @@ func processResults(ctx context.Context, results <-chan scanResult, db scanDB, v
 				Identity:          item.Identity,
 				Variant:           item.Variant,
 				Confidence:        item.Confidence,
-				Reason:            item.Reason,
 				Action:            item.Action,
-				KnownVariant:      t.IsKnown,
 				ArtifactDir:       reviewArtifactRelativeDir(videoID, reviewID, trackReviewID),
 				Vector:            cloneVector(t.MeanVec),
 				Count:             t.Count,
@@ -2055,14 +2417,8 @@ func writeReviewArtifacts(path string, doc ReviewDocument) error {
 	return nil
 }
 
-func splitReviewDocument(doc ReviewDocument) (ReviewDocument, ReviewSidecarDocument, error) {
-	reviewDoc := ReviewDocument{
-		ReviewID:     reviewDocumentID(doc),
-		VideoID:      doc.VideoID,
-		InputPath:    doc.InputPath,
-		Tracks:       make([]StagingItem, 0, len(doc.Tracks)),
-		ArtifactRoot: doc.ArtifactRoot,
-	}
+func splitReviewDocument(doc ReviewDocument) (ReviewFileDocument, ReviewSidecarDocument, error) {
+	reviewDoc := buildReviewFileDocument(doc)
 	reviewData := ReviewSidecarDocument{
 		ReviewID:  reviewDocumentID(doc),
 		VideoID:   doc.VideoID,
@@ -2071,21 +2427,16 @@ func splitReviewDocument(doc ReviewDocument) (ReviewDocument, ReviewSidecarDocum
 	}
 
 	for _, item := range doc.Tracks {
-		sanitized := item
-		sanitized.InternalVector = nil
-		sanitized.InternalCount = 0
-		reviewDoc.Tracks = append(reviewDoc.Tracks, sanitized)
-
 		if len(item.InternalVector) == 0 && item.InternalCount == 0 {
 			continue
 		}
 		key := stagingItemKey(item)
 		if key == "" {
-			return ReviewDocument{}, ReviewSidecarDocument{}, fmt.Errorf("cannot write review data for track with blank id")
+			return ReviewFileDocument{}, ReviewSidecarDocument{}, fmt.Errorf("cannot write review data for track with blank id")
 		}
 		fingerprint, err := reviewTrackFingerprint(item)
 		if err != nil {
-			return ReviewDocument{}, ReviewSidecarDocument{}, err
+			return ReviewFileDocument{}, ReviewSidecarDocument{}, err
 		}
 		reviewData.Tracks[key] = ReviewTrackData{
 			Fingerprint:    fingerprint,
@@ -2097,7 +2448,7 @@ func splitReviewDocument(doc ReviewDocument) (ReviewDocument, ReviewSidecarDocum
 	return reviewDoc, reviewData, nil
 }
 
-func writeReviewFile(path string, doc ReviewDocument) error {
+func writeReviewFile(path string, doc ReviewFileDocument) error {
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -2119,19 +2470,25 @@ func writeReviewFile(path string, doc ReviewDocument) error {
 		return fmt.Errorf("failed to finalize review YAML: %w", err)
 	}
 	formatted := strings.TrimPrefix(buf.String(), "---\n")
-	header := "# Edit only `identity`, `variant`, and `action`.\n" +
+	header := "# Leave top-level `raw_tracks`, `unresolved_tracks`, `review_id`, `video_id`, and `input_path` unchanged.\n" +
+		"# Edit only `potential_identities[].tracks`, `potential_identities[].identity`, `potential_identities[].variant`, and `potential_identities[].action`.\n" +
 		"# `review_id` is the unique identifier for this scan run and review file.\n" +
-		"# Leave `review_id`, `video_id`, and `input_path` unchanged.\n" +
-		"# Leave `id`, `start_time`, `end_time`, `nearest_candidates`, `confidence`, and `reason` unchanged.\n" +
+		"# Each `potential_identities[].tracks` entry must use either a <track_id> or an inclusive <start>-<end> range of track IDs listed under `raw_tracks`.\n" +
+		"# `unresolved_tracks` is read-only. To resolve one, add its <track_id> to a `potential_identities[].tracks` entry or create a new potential identity entry.\n" +
+		"# Leave `raw_tracks.*.start_time`, `raw_tracks.*.end_time`, `raw_tracks.*.nearest_candidates`, `raw_tracks.*.confidence`, `raw_tracks.*.suggested_identity`, `raw_tracks.*.suggested_variant`, `raw_tracks.*.suggested_action`, and `raw_tracks.*.artifact_dir` unchanged.\n" +
+		"# Leave each `potential_identities[].id` unchanged.\n" +
 		"# Valid actions: merge | new_identity | new_variant | discard.\n" +
 		"# The prefilled `action` is Sentinel's best guess from scan heuristics, not final truth.\n"
 	if doc.ArtifactRoot != "" {
-		header += "# Corresponding thumbnails and frame artifacts live under:\n"
-		header += fmt.Sprintf("#   %s/<id>/\n", doc.ArtifactRoot)
+		header += "# Each `raw_tracks.<track_id>.artifact_dir` points to corresponding thumbnails and frame artifacts under:\n"
+		header += fmt.Sprintf("#   %s/<track_id>/\n", doc.ArtifactRoot)
 	}
 	formatted = header + formatted
-	formatted = strings.ReplaceAll(formatted, "\n    - id:", "\n\n    # Read-only fields below are generated by scan.\n    - id:")
-	formatted = strings.ReplaceAll(formatted, "\n      identity:", "\n      # Editable fields below are the values that will be committed.\n      # For `new_identity`, if `identity` is left blank, then Sentinel will auto-name it. If `variant` is left blank, then Sentinel will create the `Default` variant.\n      # For `new_variant`, set `identity` to the existing person and `variant` to the new variant name.\n      identity:")
+	formatted = strings.ReplaceAll(formatted, "\nraw_tracks:\n", "\nraw_tracks:\n\n    # Read-only track evidence below is generated by scan.\n")
+	formatted = strings.ReplaceAll(formatted, "\nunresolved_tracks:\n", "\nunresolved_tracks:\n\n    # Read-only unresolved track IDs below were not confidently grouped during scan.\n")
+	formatted = strings.ReplaceAll(formatted, "\npotential_identities:\n", "\npotential_identities:\n\n    # Editable potential identities below control track membership and the values that will be committed.\n")
+	formatted = strings.ReplaceAll(formatted, "\n    - id:", "\n\n    # Leave `id` unchanged.\n    - id:")
+	formatted = strings.ReplaceAll(formatted, "\n      tracks:", "\n      # Edit `tracks` to move <track_id> entries or <start>-<end> ranges between potential identities.\n      # For `new_identity`, if `identity` is left blank, then Sentinel will auto-name it. If `variant` is left blank, then Sentinel will create the `Default` variant.\n      # For `new_variant`, set `identity` to the existing person and `variant` to the new variant name.\n      tracks:")
 	if _, err := f.WriteString(formatted); err != nil {
 		return fmt.Errorf("failed to write review YAML: %w", err)
 	}

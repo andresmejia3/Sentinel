@@ -162,6 +162,165 @@ func TestStoreIntegration(t *testing.T) {
 		t.Fatalf("expected duplicate variant error, got: %v", err)
 	}
 
+	groupedIdentityVecA := make([]float64, 512)
+	groupedIdentityVecA[10] = 1.0
+	groupedIdentityVecB := make([]float64, 512)
+	groupedIdentityVecB[11] = 1.0
+	groupedIdentityCommitID := "commit_grouped_new_identity"
+	groupedIdentityVideoID := "vid_grouped_new_identity"
+	if err := s.ApplyCommitBatch(ctx, groupedIdentityCommitID, []CommitAction{
+		{
+			TrackID:      "GroupTrack_1",
+			Action:       "new_identity",
+			IdentityName: "Grouped Person",
+			Vector:       groupedIdentityVecA,
+			Count:        2,
+		},
+		{
+			TrackID:       "GroupTrack_2",
+			Action:        "merge",
+			Vector:        groupedIdentityVecB,
+			Count:         3,
+			TargetTrackID: "GroupTrack_1",
+		},
+	}, groupedIdentityVideoID, "/tmp/grouped_identity.mp4", []CommitInterval{
+		{TrackID: "GroupTrack_1", Start: 0.0, End: 1.0, FaceCount: 2},
+		{TrackID: "GroupTrack_2", Start: 2.0, End: 3.0, FaceCount: 3},
+	}); err != nil {
+		t.Fatalf("ApplyCommitBatch(grouped new_identity) failed: %v", err)
+	}
+
+	groupedIdentityID, err := s.GetIdentityIDByName(ctx, "Grouped Person")
+	if err != nil {
+		t.Fatalf("GetIdentityIDByName(Grouped Person) failed: %v", err)
+	}
+	if groupedIdentityID == 0 {
+		t.Fatal("expected grouped new_identity to create one named identity")
+	}
+
+	var groupedIdentityVariantID, groupedIdentityFaceCount int
+	if err := s.pool.QueryRow(ctx, "SELECT id, face_count FROM variants WHERE identity_id = $1 AND name = 'Default'", groupedIdentityID).Scan(&groupedIdentityVariantID, &groupedIdentityFaceCount); err != nil {
+		t.Fatalf("failed to load grouped identity default variant: %v", err)
+	}
+	if groupedIdentityFaceCount != 5 {
+		t.Fatalf("expected grouped new_identity default variant face_count 5, got %d", groupedIdentityFaceCount)
+	}
+
+	var groupedIdentityIntervalCount int
+	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM face_intervals WHERE video_id = $1 AND variant_id = $2", groupedIdentityVideoID, groupedIdentityVariantID).Scan(&groupedIdentityIntervalCount); err != nil {
+		t.Fatalf("failed to count grouped new_identity intervals: %v", err)
+	}
+	if groupedIdentityIntervalCount != 2 {
+		t.Fatalf("expected 2 intervals to point at grouped new_identity variant, got %d", groupedIdentityIntervalCount)
+	}
+
+	groupedVariantVecA := make([]float64, 512)
+	groupedVariantVecA[12] = 1.0
+	groupedVariantVecB := make([]float64, 512)
+	groupedVariantVecB[13] = 1.0
+	groupedVariantCommitID := "commit_grouped_new_variant"
+	groupedVariantVideoID := "vid_grouped_new_variant"
+	if err := s.ApplyCommitBatch(ctx, groupedVariantCommitID, []CommitAction{
+		{
+			TrackID:      "VariantTrack_1",
+			Action:       "new_variant",
+			IdentityName: "Identity 42 - Lobby",
+			VariantName:  "Hat",
+			Vector:       groupedVariantVecA,
+			Count:        2,
+		},
+		{
+			TrackID:       "VariantTrack_2",
+			Action:        "merge",
+			Vector:        groupedVariantVecB,
+			Count:         1,
+			TargetTrackID: "VariantTrack_1",
+		},
+	}, groupedVariantVideoID, "/tmp/grouped_variant.mp4", []CommitInterval{
+		{TrackID: "VariantTrack_1", Start: 0.0, End: 1.0, FaceCount: 2},
+		{TrackID: "VariantTrack_2", Start: 2.0, End: 3.0, FaceCount: 1},
+	}); err != nil {
+		t.Fatalf("ApplyCommitBatch(grouped new_variant) failed: %v", err)
+	}
+
+	groupedVariantID, err := s.GetVariantID(ctx, caseInsensitiveIdentityID, "hat")
+	if err != nil {
+		t.Fatalf("GetVariantID(Hat) failed: %v", err)
+	}
+	if groupedVariantID == 0 {
+		t.Fatal("expected grouped new_variant to create one variant")
+	}
+
+	var groupedVariantFaceCount int
+	if err := s.pool.QueryRow(ctx, "SELECT face_count FROM variants WHERE id = $1", groupedVariantID).Scan(&groupedVariantFaceCount); err != nil {
+		t.Fatalf("failed to load grouped variant face_count: %v", err)
+	}
+	if groupedVariantFaceCount != 3 {
+		t.Fatalf("expected grouped new_variant face_count 3, got %d", groupedVariantFaceCount)
+	}
+
+	var groupedVariantIntervalCount int
+	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM face_intervals WHERE video_id = $1 AND variant_id = $2", groupedVariantVideoID, groupedVariantID).Scan(&groupedVariantIntervalCount); err != nil {
+		t.Fatalf("failed to count grouped new_variant intervals: %v", err)
+	}
+	if groupedVariantIntervalCount != 2 {
+		t.Fatalf("expected 2 intervals to point at grouped new_variant, got %d", groupedVariantIntervalCount)
+	}
+
+	if err := s.RevertCommit(ctx, groupedVariantCommitID); err != nil {
+		t.Fatalf("RevertCommit(grouped new_variant) failed: %v", err)
+	}
+
+	groupedVariantIDAfterRollback, err := s.GetVariantID(ctx, caseInsensitiveIdentityID, "hat")
+	if err != nil {
+		t.Fatalf("GetVariantID(Hat) after rollback failed: %v", err)
+	}
+	if groupedVariantIDAfterRollback != 0 {
+		t.Fatalf("expected grouped new_variant rollback to remove variant, got %d", groupedVariantIDAfterRollback)
+	}
+
+	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM face_intervals WHERE video_id = $1", groupedVariantVideoID).Scan(&groupedVariantIntervalCount); err != nil {
+		t.Fatalf("failed to count grouped new_variant intervals after rollback: %v", err)
+	}
+	if groupedVariantIntervalCount != 0 {
+		t.Fatalf("expected grouped new_variant rollback to remove all intervals, got %d", groupedVariantIntervalCount)
+	}
+
+	var groupedVariantVideoMetadataCount int
+	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM video_metadata WHERE id = $1", groupedVariantVideoID).Scan(&groupedVariantVideoMetadataCount); err != nil {
+		t.Fatalf("failed to count grouped new_variant video metadata after rollback: %v", err)
+	}
+	if groupedVariantVideoMetadataCount != 0 {
+		t.Fatalf("expected grouped new_variant rollback to remove video metadata, got %d rows", groupedVariantVideoMetadataCount)
+	}
+
+	if err := s.RevertCommit(ctx, groupedIdentityCommitID); err != nil {
+		t.Fatalf("RevertCommit(grouped new_identity) failed: %v", err)
+	}
+
+	groupedIdentityIDAfterRollback, err := s.GetIdentityIDByName(ctx, "Grouped Person")
+	if err != nil {
+		t.Fatalf("GetIdentityIDByName(Grouped Person) after rollback failed: %v", err)
+	}
+	if groupedIdentityIDAfterRollback != 0 {
+		t.Fatalf("expected grouped new_identity rollback to remove identity, got %d", groupedIdentityIDAfterRollback)
+	}
+
+	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM face_intervals WHERE video_id = $1", groupedIdentityVideoID).Scan(&groupedIdentityIntervalCount); err != nil {
+		t.Fatalf("failed to count grouped new_identity intervals after rollback: %v", err)
+	}
+	if groupedIdentityIntervalCount != 0 {
+		t.Fatalf("expected grouped new_identity rollback to remove all intervals, got %d", groupedIdentityIntervalCount)
+	}
+
+	var groupedIdentityVideoMetadataCount int
+	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM video_metadata WHERE id = $1", groupedIdentityVideoID).Scan(&groupedIdentityVideoMetadataCount); err != nil {
+		t.Fatalf("failed to count grouped new_identity video metadata after rollback: %v", err)
+	}
+	if groupedIdentityVideoMetadataCount != 0 {
+		t.Fatalf("expected grouped new_identity rollback to remove video metadata, got %d rows", groupedIdentityVideoMetadataCount)
+	}
+
 	// Update Identity (Weighted Average)
 	// We update ID A with a new vector that is slightly different.
 	// Old: [1.0, 0.0...] (Count 1)
@@ -200,11 +359,23 @@ func TestStoreIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListIdentities failed: %v", err)
 	}
-	if len(identities) != 1 {
-		t.Errorf("Expected 1 identity, got %d", len(identities))
+	if len(identities) == 0 {
+		t.Fatal("expected at least one identity in ListIdentities output")
 	}
-	if identities[0].Count != 2 {
-		t.Errorf("Expected count 2 (1 initial + 1 update), got %d", identities[0].Count)
+
+	foundUpdatedIdentity := false
+	for _, identity := range identities {
+		if identity.ID != 1 {
+			continue
+		}
+		foundUpdatedIdentity = true
+		if identity.Count != 2 {
+			t.Errorf("Expected identity 1 count 2 (1 initial + 1 update), got %d", identity.Count)
+		}
+		break
+	}
+	if !foundUpdatedIdentity {
+		t.Fatal("expected ListIdentities to include the original updated identity")
 	}
 }
 

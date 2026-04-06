@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestWriteReviewArtifactsSplitsVectorsIntoSidecar(t *testing.T) {
@@ -22,18 +24,34 @@ func TestWriteReviewArtifactsSplitsVectorsIntoSidecar(t *testing.T) {
 		ReviewID:     "a1b2c3d4e5f6",
 		VideoID:      "vid_test",
 		InputPath:    "samples/test.mp4",
-			ArtifactRoot: "results/vid_test/reviews/a1b2c3d4e5f6/tracks",
-			Tracks: []StagingItem{
-				{
-					ID: 1,
-					NearestCandidates: []NearestCandidate{
-						{Identity: "Jenny", Variant: "Default", Distance: 0.284},
-						{Identity: "Jenna", Variant: "Default", Distance: 0.317},
+		ArtifactRoot: "results/vid_test/reviews/a1b2c3d4e5f6/tracks",
+		Tracks: []StagingItem{
+			{
+				ID: 1,
+				NearestCandidates: []NearestCandidate{
+					{Identity: "Jenny", Variant: "Default", Distance: 0.284},
+					{Identity: "Jenna", Variant: "Default", Distance: 0.317},
 				},
-				Reason:         "nearest_distance=0.284, second_distance=0.317, gap=0.033 < 0.050 -> needs review",
+				Confidence:     0.86,
 				Action:         "new_identity",
 				InternalVector: vec,
 				InternalCount:  3,
+			},
+		},
+		SummaryItems: []reviewSummaryItem{
+			{
+				ID:        1,
+				StartTime: 0,
+				EndTime:   0,
+				NearestCandidates: []NearestCandidate{
+					{Identity: "Jenny", Variant: "Default", Distance: 0.284},
+					{Identity: "Jenna", Variant: "Default", Distance: 0.317},
+				},
+				Confidence:  0.86,
+				Action:      "new_identity",
+				ArtifactDir: "results/vid_test/reviews/a1b2c3d4e5f6/tracks/1",
+				Vector:      vec,
+				Count:       3,
 			},
 		},
 	}
@@ -53,17 +71,26 @@ func TestWriteReviewArtifactsSplitsVectorsIntoSidecar(t *testing.T) {
 	if strings.Contains(reviewText, "thumbnail:") {
 		t.Fatalf("expected review YAML to omit thumbnail paths, got:\n%s", reviewText)
 	}
-	if !strings.Contains(reviewText, "# Edit only `identity`, `variant`, and `action`.") {
+	if !strings.Contains(reviewText, "# Leave top-level `raw_tracks`, `unresolved_tracks`, `review_id`, `video_id`, and `input_path` unchanged.") {
+		t.Fatalf("expected top-level immutable guidance comment, got:\n%s", reviewText)
+	}
+	if !strings.Contains(reviewText, "# Edit only `potential_identities[].tracks`, `potential_identities[].identity`, `potential_identities[].variant`, and `potential_identities[].action`.") {
 		t.Fatalf("expected top-level edit guidance comment, got:\n%s", reviewText)
 	}
 	if !strings.Contains(reviewText, "# `review_id` is the unique identifier for this scan run and review file.") {
 		t.Fatalf("expected review_id description comment, got:\n%s", reviewText)
 	}
-	if !strings.Contains(reviewText, "# Leave `review_id`, `video_id`, and `input_path` unchanged.") {
-		t.Fatalf("expected top-level immutable metadata guidance comment, got:\n%s", reviewText)
+	if !strings.Contains(reviewText, "# Each `potential_identities[].tracks` entry must use either a <track_id> or an inclusive <start>-<end> range of track IDs listed under `raw_tracks`.") {
+		t.Fatalf("expected track membership guidance comment, got:\n%s", reviewText)
 	}
-	if !strings.Contains(reviewText, "# Leave `id`, `start_time`, `end_time`, `nearest_candidates`, `confidence`, and `reason` unchanged.") {
+	if !strings.Contains(reviewText, "# `unresolved_tracks` is read-only. To resolve one, add its <track_id> to a `potential_identities[].tracks` entry or create a new potential identity entry.") {
+		t.Fatalf("expected unresolved_tracks guidance comment, got:\n%s", reviewText)
+	}
+	if !strings.Contains(reviewText, "# Leave `raw_tracks.*.start_time`, `raw_tracks.*.end_time`, `raw_tracks.*.nearest_candidates`, `raw_tracks.*.confidence`, `raw_tracks.*.suggested_identity`, `raw_tracks.*.suggested_variant`, `raw_tracks.*.suggested_action`, and `raw_tracks.*.artifact_dir` unchanged.") {
 		t.Fatalf("expected read-only guidance comment, got:\n%s", reviewText)
+	}
+	if !strings.Contains(reviewText, "# Leave each `potential_identities[].id` unchanged.") {
+		t.Fatalf("expected potential identity id guidance comment, got:\n%s", reviewText)
 	}
 	if !strings.Contains(reviewText, "# Valid actions: merge | new_identity | new_variant | discard.") {
 		t.Fatalf("expected valid actions guidance comment, got:\n%s", reviewText)
@@ -71,55 +98,73 @@ func TestWriteReviewArtifactsSplitsVectorsIntoSidecar(t *testing.T) {
 	if !strings.Contains(reviewText, "# The prefilled `action` is Sentinel's best guess from scan heuristics, not final truth.") {
 		t.Fatalf("expected action heuristic guidance comment, got:\n%s", reviewText)
 	}
-	if !strings.Contains(reviewText, "# Corresponding thumbnails and frame artifacts live under:\n#   results/vid_test/reviews/a1b2c3d4e5f6/tracks/<id>/") {
+	if !strings.Contains(reviewText, "# Each `raw_tracks.<track_id>.artifact_dir` points to corresponding thumbnails and frame artifacts under:\n#   results/vid_test/reviews/a1b2c3d4e5f6/tracks/<track_id>/") {
 		t.Fatalf("expected artifact root guidance comment, got:\n%s", reviewText)
 	}
-	if !strings.Contains(reviewText, "# Editable fields below are the values that will be committed.") {
-		t.Fatalf("expected per-track editable guidance comment, got:\n%s", reviewText)
+	if !strings.Contains(reviewText, "raw_tracks:\n\n    # Read-only track evidence below is generated by scan.") {
+		t.Fatalf("expected raw_tracks read-only section comment, got:\n%s", reviewText)
+	}
+	if !strings.Contains(reviewText, "potential_identities:\n\n    # Editable potential identities below control track membership and the values that will be committed.") {
+		t.Fatalf("expected potential_identities editable section comment, got:\n%s", reviewText)
+	}
+	if !strings.Contains(reviewText, "# Edit `tracks` to move <track_id> entries or <start>-<end> ranges between potential identities.") {
+		t.Fatalf("expected track editing guidance comment, got:\n%s", reviewText)
 	}
 	if !strings.Contains(reviewText, "# For `new_identity`, if `identity` is left blank, then Sentinel will auto-name it. If `variant` is left blank, then Sentinel will create the `Default` variant.") {
-		t.Fatalf("expected new_identity variant guidance comment, got:\n%s", reviewText)
+		t.Fatalf("expected new_identity guidance comment, got:\n%s", reviewText)
 	}
 	if !strings.Contains(reviewText, "# For `new_variant`, set `identity` to the existing person and `variant` to the new variant name.") {
 		t.Fatalf("expected new_variant guidance comment, got:\n%s", reviewText)
 	}
-	if !strings.Contains(reviewText, "tracks:\n\n    # Read-only fields below are generated by scan.\n    - id: 1") {
-		t.Fatalf("expected blank line and read-only comment before first review track, got:\n%s", reviewText)
+	if !strings.Contains(reviewText, "\n\n    # Leave `id` unchanged.\n    - id: 1") {
+		t.Fatalf("expected blank line and read-only comment before first potential identity, got:\n%s", reviewText)
 	}
 	if !strings.Contains(reviewText, "nearest_candidates:") || !strings.Contains(reviewText, "distance: 0.284") || !strings.Contains(reviewText, "distance: 0.317") {
 		t.Fatalf("expected nearest_candidates with rounded distances, got:\n%s", reviewText)
 	}
-	if !strings.Contains(reviewText, "reason: nearest_distance=0.284, second_distance=0.317, gap=0.033 < 0.050 -> needs review") {
-		t.Fatalf("expected concrete reason field, got:\n%s", reviewText)
+	if strings.Contains(reviewText, "\n    reason:") || strings.Contains(reviewText, "\n      reason:") {
+		t.Fatalf("expected grouped review YAML to omit verbose reason fields, got:\n%s", reviewText)
 	}
-	if strings.Index(reviewText, "confidence:") > strings.Index(reviewText, "# Editable fields below are the values that will be committed.") {
-		t.Fatalf("expected confidence to remain in the read-only section above the editable-fields comment, got:\n%s", reviewText)
+	if strings.Index(reviewText, "confidence:") > strings.Index(reviewText, "potential_identities:\n\n    # Editable potential identities below control track membership and the values that will be committed.") {
+		t.Fatalf("expected confidence to remain in the raw_tracks evidence section above potential identities, got:\n%s", reviewText)
 	}
-	if !strings.Contains(reviewText, "identity: \"\"") || !strings.Contains(reviewText, "variant: \"\"") {
-		t.Fatalf("expected blank editable identity/variant fields to remain visible, got:\n%s", reviewText)
+	if !strings.Contains(reviewText, "suggested_action: new_identity") {
+		t.Fatalf("expected per-track suggested_action in raw track evidence, got:\n%s", reviewText)
 	}
 
-	review, err := readReviewDocument(reviewBytes)
-	if err != nil {
-		t.Fatalf("readReviewDocument returned error: %v", err)
+	var reviewFile ReviewFileDocument
+	if err := yaml.Unmarshal(reviewBytes, &reviewFile); err != nil {
+		t.Fatalf("failed to unmarshal grouped review YAML: %v", err)
 	}
-	if got := len(review.Tracks); got != 1 {
-		t.Fatalf("expected one review track, got %d", got)
-	}
-	if got := review.ReviewID; got != "a1b2c3d4e5f6" {
+	if got := reviewFile.ReviewID; got != "a1b2c3d4e5f6" {
 		t.Fatalf("expected review_id to round-trip, got %q", got)
 	}
-	if got := review.Tracks[0].ID; got != 1 {
-		t.Fatalf("expected review id 1, got %d", got)
+	if got := len(reviewFile.PotentialIdentities); got != 1 {
+		t.Fatalf("expected one potential identity, got %d", got)
 	}
-	if got := len(review.Tracks[0].InternalVector); got != 0 {
-		t.Fatalf("expected no embedded vector in YAML, got len=%d", got)
+	if got := len(reviewFile.UnresolvedTracks); got != 0 {
+		t.Fatalf("expected no unresolved tracks, got %d", got)
 	}
-		if got := review.Tracks[0].InternalCount; got != 0 {
-			t.Fatalf("expected no embedded internal_count in YAML, got %d", got)
-		}
+	if got := len(reviewFile.RawTracks); got != 1 {
+		t.Fatalf("expected one raw track entry, got %d", got)
+	}
+	if got := reviewFile.PotentialIdentities[0].ID; got != 1 {
+		t.Fatalf("expected potential identity id 1, got %d", got)
+	}
+	if got := reviewFile.PotentialIdentities[0].Tracks; len(got) != 1 || got[0] != "1" {
+		t.Fatalf("expected grouped track selector [\"1\"], got %v", got)
+	}
+	if got := reviewFile.RawTracks["1"].ArtifactDir; got != "results/vid_test/reviews/a1b2c3d4e5f6/tracks/1" {
+		t.Fatalf("expected raw track artifact_dir to round-trip, got %q", got)
+	}
+	if got := reviewFile.RawTracks["1"].SuggestedAction; got != "new_identity" {
+		t.Fatalf("expected raw track suggested_action to round-trip, got %q", got)
+	}
+	if got := reviewFile.PotentialIdentities[0].Action; got != "new_identity" {
+		t.Fatalf("expected conservative group action prefill to remain new_identity for singleton, got %q", got)
+	}
 
-		sidecarBytes, err := os.ReadFile(reviewDataFilePath(reviewPath))
+	sidecarBytes, err := os.ReadFile(reviewDataFilePath(reviewPath))
 	if err != nil {
 		t.Fatalf("failed to read review sidecar: %v", err)
 	}
@@ -157,6 +202,103 @@ func TestWriteReviewArtifactsSplitsVectorsIntoSidecar(t *testing.T) {
 	}
 	if got := data.Fingerprint; got != wantFingerprint {
 		t.Fatalf("expected sidecar fingerprint %q, got %q", wantFingerprint, got)
+	}
+}
+
+func TestWriteReviewArtifactsSeparatesUnresolvedTracksFromPotentialIdentities(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	reviewPath := filepath.Join(tmpDir, "scan.review.yaml")
+
+	vec1 := make([]float64, embeddingDim)
+	vec1[0] = 0.819
+	vec1[1] = 0.574
+	vec2 := make([]float64, embeddingDim)
+	vec2[0] = 0.819
+	vec2[1] = -0.574
+	vec3 := make([]float64, embeddingDim)
+	vec3[0] = 1.0
+
+	doc := ReviewDocument{
+		ReviewID:     "a1b2c3d4e5f6",
+		VideoID:      "vid_test",
+		InputPath:    "samples/test.mp4",
+		ArtifactRoot: "results/vid_test/reviews/a1b2c3d4e5f6/tracks",
+		Tracks: []StagingItem{
+			{ID: 1, StartTime: 0, EndTime: 2},
+			{ID: 2, StartTime: 3, EndTime: 5},
+			{ID: 3, StartTime: 6, EndTime: 8},
+		},
+		SummaryItems: []reviewSummaryItem{
+			{ID: 1, StartTime: 0, EndTime: 2, Vector: vec1, Count: 3, Action: "new_identity"},
+			{ID: 2, StartTime: 3, EndTime: 5, Vector: vec2, Count: 3, Action: "new_identity"},
+			{ID: 3, StartTime: 6, EndTime: 8, Vector: vec3, Count: 3, Action: "new_identity"},
+		},
+	}
+
+	if err := writeReviewArtifacts(reviewPath, doc); err != nil {
+		t.Fatalf("writeReviewArtifacts returned error: %v", err)
+	}
+
+	reviewBytes, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatalf("failed to read review YAML: %v", err)
+	}
+
+	var reviewFile ReviewFileDocument
+	if err := yaml.Unmarshal(reviewBytes, &reviewFile); err != nil {
+		t.Fatalf("failed to unmarshal grouped review YAML: %v", err)
+	}
+
+	if got := len(reviewFile.PotentialIdentities); got != 2 {
+		t.Fatalf("expected two potential identities, got %d", got)
+	}
+	if got := len(reviewFile.RawTracks); got != 3 {
+		t.Fatalf("expected three raw track entries, got %d", got)
+	}
+	if got := reviewFile.UnresolvedTracks; len(got) != 1 || got[0] != "3" {
+		t.Fatalf("expected unresolved_tracks [\"3\"], got %v", got)
+	}
+	if !strings.Contains(string(reviewBytes), "unresolved_tracks:\n\n    # Read-only unresolved track IDs below were not confidently grouped during scan.\n") {
+		t.Fatalf("expected unresolved_tracks read-only section comment, got:\n%s", string(reviewBytes))
+	}
+	if got := reviewFile.PotentialIdentities[0].Tracks; len(got) != 1 || got[0] != "1" {
+		t.Fatalf("expected first potential identity to contain raw track 1, got %v", got)
+	}
+	if got := reviewFile.PotentialIdentities[1].Tracks; len(got) != 1 || got[0] != "2" {
+		t.Fatalf("expected second potential identity to contain raw track 2, got %v", got)
+	}
+}
+
+func TestReviewPotentialIdentityItemOnlyPrefillsWhenAllMembersBroadlyAgree(t *testing.T) {
+	t.Parallel()
+
+	agreeing := []PotentialIdentityMember{
+		{Item: reviewSummaryItem{ID: 1, Identity: "Monica", Variant: "Default", Action: "merge"}},
+		{Item: reviewSummaryItem{ID: 4, Identity: "Monica", Variant: "Default", Action: "merge"}},
+	}
+	item := reviewPotentialIdentityItem(1, agreeing)
+	if item.Identity != "Monica" || item.Variant != "Default" || item.Action != "merge" {
+		t.Fatalf("expected full prefill for unanimous merge suggestion, got %+v", item)
+	}
+
+	mixedAction := []PotentialIdentityMember{
+		{Item: reviewSummaryItem{ID: 1, Identity: "Monica", Variant: "Default", Action: "merge"}},
+		{Item: reviewSummaryItem{ID: 4, Identity: "Monica", Variant: "", Action: "new_variant"}},
+	}
+	item = reviewPotentialIdentityItem(1, mixedAction)
+	if item.Identity != "Monica" || item.Variant != "" || item.Action != "" {
+		t.Fatalf("expected identity-only prefill when members agree on person but not action/variant, got %+v", item)
+	}
+
+	conflicting := []PotentialIdentityMember{
+		{Item: reviewSummaryItem{ID: 1, Identity: "Monica", Variant: "Default", Action: "merge"}},
+		{Item: reviewSummaryItem{ID: 4, Identity: "Phoebe", Variant: "Default", Action: "merge"}},
+	}
+	item = reviewPotentialIdentityItem(1, conflicting)
+	if item.Identity != "" || item.Variant != "" || item.Action != "" {
+		t.Fatalf("expected blank prefill for conflicting members, got %+v", item)
 	}
 }
 
@@ -541,7 +683,6 @@ func TestHydrateReviewDocumentRejectsMismatchedTrackFingerprint(t *testing.T) {
 				StartTime:  0,
 				EndTime:    1,
 				Confidence: 0.84,
-				Reason:     "nearest_distance=0.284 <= merge_cutoff=0.350 -> suggested merge",
 				Action:     "merge",
 				Identity:   "Jenny",
 				Variant:    "Default",

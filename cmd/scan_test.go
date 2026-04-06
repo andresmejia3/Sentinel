@@ -431,6 +431,23 @@ func TestClassifyPotentialIdentityLinkAmbiguous(t *testing.T) {
 	}
 }
 
+func TestClassifyPotentialIdentityLinkExactTieUsesLowerPotentialIdentityID(t *testing.T) {
+	t.Parallel()
+
+	identities := []PotentialIdentity{
+		newPotentialIdentity(1, summaryItemForPotentialIdentityTest(1, 0, 1, []float64{0.819, 0.574}), PotentialIdentityLink{Status: potentialIdentityStatusNew}),
+		newPotentialIdentity(2, summaryItemForPotentialIdentityTest(2, 2, 3, []float64{0.819, -0.574}), PotentialIdentityLink{Status: potentialIdentityStatusNew}),
+	}
+
+	link := classifyPotentialIdentityLink(summaryItemForPotentialIdentityTest(3, 4, 5, []float64{1, 0}), identities)
+	if link.BestPotentialIdentityID != 1 {
+		t.Fatalf("classifyPotentialIdentityLink() best potential identity = %d, want deterministic lower ID 1", link.BestPotentialIdentityID)
+	}
+	if link.SecondBestPotentialIdentityID != 2 {
+		t.Fatalf("classifyPotentialIdentityLink() second-best potential identity = %d, want 2", link.SecondBestPotentialIdentityID)
+	}
+}
+
 func TestClassifyPotentialIdentityLinkOverlapBlocked(t *testing.T) {
 	t.Parallel()
 
@@ -502,7 +519,7 @@ func TestBuildPotentialIdentitiesLeavesAmbiguousTracksUnresolved(t *testing.T) {
 	}
 }
 
-func TestRefinePossiblePotentialIdentityMembersMovesToBetterIdentity(t *testing.T) {
+func TestRefinePotentialIdentityAssignmentsUntilStableMovesPossibleTrackToBetterIdentity(t *testing.T) {
 	t.Parallel()
 
 	item1 := summaryItemForPotentialIdentityTest(1, 0, 1, []float64{1, 0})
@@ -519,13 +536,16 @@ func TestRefinePossiblePotentialIdentityMembersMovesToBetterIdentity(t *testing.
 	})
 	identity2 := newPotentialIdentity(2, item3, PotentialIdentityLink{Status: potentialIdentityStatusNew})
 
-	identities := refinePossiblePotentialIdentityMembers([]PotentialIdentity{identity1, identity2})
+	identities, unresolved := refinePotentialIdentityAssignmentsUntilStable([]PotentialIdentity{identity1, identity2}, nil)
+	if len(unresolved) != 0 {
+		t.Fatalf("refinePotentialIdentityAssignmentsUntilStable() unresolved count = %d, want 0", len(unresolved))
+	}
 
 	firstIdx, _ := findPotentialIdentityMember(identities, 1)
 	secondIdx, _ := findPotentialIdentityMember(identities, 2)
 	thirdIdx, _ := findPotentialIdentityMember(identities, 3)
 	if firstIdx < 0 || secondIdx < 0 || thirdIdx < 0 {
-		t.Fatalf("refinePossiblePotentialIdentityMembers() lost a track assignment")
+		t.Fatalf("refinePotentialIdentityAssignmentsUntilStable() lost a track assignment")
 	}
 	if identities[secondIdx].ID != 2 {
 		t.Fatalf("track 2 ended up in potential identity %d, want 2", identities[secondIdx].ID)
@@ -538,7 +558,37 @@ func TestRefinePossiblePotentialIdentityMembersMovesToBetterIdentity(t *testing.
 	}
 }
 
-func TestResolveAmbiguousPotentialIdentityMembersAttachesClearWinner(t *testing.T) {
+func TestRefinePotentialIdentityAssignmentsUntilStableLeavesNoLongerMatchingPossibleTrackUnresolved(t *testing.T) {
+	t.Parallel()
+
+	item1 := summaryItemForPotentialIdentityTest(1, 0, 1, []float64{1, 0})
+	item2 := summaryItemForPotentialIdentityTest(2, 2, 3, []float64{0.60, 0.80})
+
+	identity1 := newPotentialIdentity(1, item1, PotentialIdentityLink{Status: potentialIdentityStatusNew})
+	addPotentialIdentityMember(&identity1, item2, PotentialIdentityLink{
+		Status:                     potentialIdentityStatusPossible,
+		BestPotentialIdentityID:    1,
+		BestPotentialIdentityScore: 0.34,
+		BestMemberTrackID:          1,
+		BestMemberDistance:         0.34,
+	})
+
+	identities, unresolved := refinePotentialIdentityAssignmentsUntilStable([]PotentialIdentity{identity1}, nil)
+	if len(identities) != 1 {
+		t.Fatalf("refinePotentialIdentityAssignmentsUntilStable() identity count = %d, want 1", len(identities))
+	}
+	if len(identities[0].Members) != 1 || identities[0].Members[0].Item.ID != 1 {
+		t.Fatalf("refinePotentialIdentityAssignmentsUntilStable() remaining members = %+v, want only track 1", identities[0].Members)
+	}
+	if len(unresolved) != 1 || unresolved[0].Item.ID != 2 {
+		t.Fatalf("refinePotentialIdentityAssignmentsUntilStable() unresolved = %+v, want track 2 unresolved", unresolved)
+	}
+	if unresolved[0].Link.Status != potentialIdentityStatusNew {
+		t.Fatalf("refinePotentialIdentityAssignmentsUntilStable() unresolved status = %s, want %s", unresolved[0].Link.Status, potentialIdentityStatusNew)
+	}
+}
+
+func TestRefinePotentialIdentityAssignmentsUntilStableAttachesAmbiguousTrackToClearWinner(t *testing.T) {
 	t.Parallel()
 
 	item1 := summaryItemForPotentialIdentityTest(1, 0, 1, []float64{1, 0})
@@ -567,14 +617,14 @@ func TestResolveAmbiguousPotentialIdentityMembersAttachesClearWinner(t *testing.
 		},
 	}}
 
-	identities, remaining := resolveAmbiguousPotentialIdentityMembers([]PotentialIdentity{identity1, identity2}, unresolved)
+	identities, remaining := refinePotentialIdentityAssignmentsUntilStable([]PotentialIdentity{identity1, identity2}, unresolved)
 	if len(remaining) != 0 {
-		t.Fatalf("resolveAmbiguousPotentialIdentityMembers() remaining unresolved = %d, want 0", len(remaining))
+		t.Fatalf("refinePotentialIdentityAssignmentsUntilStable() remaining unresolved = %d, want 0", len(remaining))
 	}
 
 	resolvedIdx, _ := findPotentialIdentityMember(identities, 3)
 	if resolvedIdx < 0 {
-		t.Fatalf("resolveAmbiguousPotentialIdentityMembers() did not attach track 3")
+		t.Fatalf("refinePotentialIdentityAssignmentsUntilStable() did not attach track 3")
 	}
 	if identities[resolvedIdx].ID != 1 {
 		t.Fatalf("track 3 ended up in potential identity %d, want 1", identities[resolvedIdx].ID)
@@ -660,10 +710,10 @@ func TestPrintReviewSummaryAmbiguousFormatting(t *testing.T) {
 	if !strings.Contains(output, "Track 3 AMBIGUOUS between:") {
 		t.Fatalf("printReviewSummary() missing ambiguous linkage heading:\n%s", output)
 	}
-	if !strings.Contains(output, "Potential Identity 1 (distance: 0.18 - BEST)") {
+	if !strings.Contains(output, "Potential Identity 1 (score: 0.18 - BEST)") {
 		t.Fatalf("printReviewSummary() missing best ambiguous candidate:\n%s", output)
 	}
-	if !strings.Contains(output, "Potential Identity 2 (distance: 0.18)") {
+	if !strings.Contains(output, "Potential Identity 2 (score: 0.18)") {
 		t.Fatalf("printReviewSummary() missing second ambiguous candidate:\n%s", output)
 	}
 }

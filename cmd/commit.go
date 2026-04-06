@@ -102,6 +102,19 @@ func prepareCommitBatch(review ReviewDocument) ([]store.CommitAction, []store.Co
 	var intervals []store.CommitInterval
 	skipCount := 0
 	var unresolvedTracks []string
+	groupedCreateItems := make(map[int][]StagingItem)
+	groupedCreateHandled := make(map[int]struct{})
+	groupIndexes := make(map[string]int, len(review.Tracks))
+
+	for i, item := range review.Tracks {
+		action := strings.TrimSpace(item.Action)
+		if item.GroupID > 0 && (action == "new_identity" || action == "new_variant") {
+			groupedCreateItems[item.GroupID] = append(groupedCreateItems[item.GroupID], item)
+		}
+		if key := stagingItemKey(item); key != "" {
+			groupIndexes[key] = i
+		}
+	}
 
 	for i, item := range review.Tracks {
 		action := strings.TrimSpace(item.Action)
@@ -117,66 +130,28 @@ func prepareCommitBatch(review ReviewDocument) ([]store.CommitAction, []store.Co
 			skipCount++
 			continue
 		}
-		trackKey := stagingItemKey(item)
-		trackLabel := stagingItemLabel(item)
-		if trackLabel == "" {
-			trackLabel = fmt.Sprintf("item_%d", i)
-		}
-		if len(item.InternalVector) != 512 {
-			return nil, nil, 0, fmt.Errorf("validation failed on item %d (%s): vector has %d dimensions, expected 512", i, trackLabel, len(item.InternalVector))
-		}
-		if action != "merge" && action != "new_identity" && action != "new_variant" {
-			return nil, nil, 0, fmt.Errorf("validation failed on item %d (%s): invalid action '%s'", i, trackLabel, strings.TrimSpace(item.Action))
+		if item.GroupID > 0 && (action == "new_identity" || action == "new_variant") {
+			if _, ok := groupedCreateHandled[item.GroupID]; ok {
+				continue
+			}
+			groupedCreateHandled[item.GroupID] = struct{}{}
+			identity := strings.TrimSpace(item.Identity)
+			variant := strings.TrimSpace(item.Variant)
+			var err error
+			actions, intervals, err = appendGroupedCreateActions(actions, intervals, groupedCreateItems[item.GroupID], groupIndexes, action, identity, variant)
+			if err != nil {
+				return nil, nil, 0, err
+			}
+			continue
 		}
 		identity := strings.TrimSpace(item.Identity)
 		variant := strings.TrimSpace(item.Variant)
-		switch action {
-		case "merge":
-			if identity == "" {
-				return nil, nil, 0, fmt.Errorf("validation failed on item %d (%s): action 'merge' requires `identity` to be set", i, trackLabel)
-			}
-			if variant == "" {
-				return nil, nil, 0, fmt.Errorf("validation failed on item %d (%s): action 'merge' requires `variant` to be set", i, trackLabel)
-			}
-		case "new_variant":
-			if identity == "" {
-				return nil, nil, 0, fmt.Errorf("validation failed on item %d (%s): action 'new_variant' requires `identity` to be set", i, trackLabel)
-			}
-			if variant == "" {
-				return nil, nil, 0, fmt.Errorf("validation failed on item %d (%s): action 'new_variant' requires `variant` to be set to the new variant name", i, trackLabel)
-			}
-		case "new_identity":
-			if variant != "" {
-				return nil, nil, 0, fmt.Errorf("validation failed on item %d (%s): action 'new_identity' requires `variant` to be blank; Sentinel will create the `Default` variant", i, trackLabel)
-			}
-		}
-		if item.InternalCount <= 0 {
-			return nil, nil, 0, fmt.Errorf("validation failed on item %d (%s): internal_count must be positive, got %d", i, trackLabel, item.InternalCount)
-		}
-		if item.StartTime < 0 || item.EndTime < 0 {
-			return nil, nil, 0, fmt.Errorf("validation failed on item %d (%s): interval times must be non-negative", i, trackLabel)
-		}
-		if item.EndTime < item.StartTime {
-			return nil, nil, 0, fmt.Errorf("validation failed on item %d (%s): end_time must be >= start_time", i, trackLabel)
-		}
-		if trackKey == "" {
-			return nil, nil, 0, fmt.Errorf("validation failed on item %d: missing review track id", i)
+		if err := validatePreparedCommitItem(item, i, action, identity, variant, ""); err != nil {
+			return nil, nil, 0, err
 		}
 
-		actions = append(actions, store.CommitAction{
-			TrackID:      trackKey,
-			Action:       action,
-			IdentityName: identity,
-			VariantName:  variant,
-			Vector:       item.InternalVector,
-			Count:        item.InternalCount,
-		})
-		intervals = append(intervals, store.CommitInterval{
-			TrackID:   trackKey,
-			Start:     item.StartTime,
-			End:       item.EndTime,
-			FaceCount: item.InternalCount,
-		})
+		actions = append(actions, buildPreparedCommitAction(item, action, identity, variant, ""))
+		intervals = append(intervals, buildPreparedCommitInterval(item))
 	}
 
 	if len(unresolvedTracks) > 0 {
@@ -246,17 +221,312 @@ func validateReviewTrackKeys(review ReviewDocument) error {
 	return nil
 }
 
+func parseGroupedTrackRef(ref string) (string, int, error) {
+	trimmed := strings.TrimSpace(ref)
+	if trimmed == "" {
+		return "", 0, fmt.Errorf("blank track reference")
+	}
+	id, err := strconv.Atoi(trimmed)
+	if err != nil || id <= 0 {
+		return "", 0, fmt.Errorf("invalid track reference %q", ref)
+	}
+	canonical := strconv.Itoa(id)
+	if canonical != trimmed {
+		return "", 0, fmt.Errorf("track reference %q must use canonical integer form", ref)
+	}
+	return canonical, id, nil
+}
+
+func expandGroupedTrackRefs(ref string, availableTrackIDs []int) ([]string, error) {
+	trimmed := strings.TrimSpace(ref)
+	if trimmed == "" {
+		return nil, fmt.Errorf("blank track reference")
+	}
+	if !strings.Contains(trimmed, "-") {
+		key, _, err := parseGroupedTrackRef(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		return []string{key}, nil
+	}
+
+	parts := strings.Split(trimmed, "-")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid track range %q", ref)
+	}
+
+	startKey, startID, err := parseGroupedTrackRef(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid track range %q: %w", ref, err)
+	}
+	endKey, endID, err := parseGroupedTrackRef(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid track range %q: %w", ref, err)
+	}
+	if canonical := startKey + "-" + endKey; canonical != trimmed {
+		return nil, fmt.Errorf("track range %q must use canonical integer form like %q", ref, canonical)
+	}
+	if startID > endID {
+		return nil, fmt.Errorf("track range %q is descending; use ascending inclusive ranges", ref)
+	}
+
+	startIdx := sort.SearchInts(availableTrackIDs, startID)
+	endIdx := sort.Search(len(availableTrackIDs), func(i int) bool {
+		return availableTrackIDs[i] > endID
+	})
+
+	expected := startID
+	capHint := endIdx - startIdx
+	if capHint < 0 {
+		capHint = 0
+	}
+	keys := make([]string, 0, capHint)
+	for _, id := range availableTrackIDs[startIdx:endIdx] {
+		if id != expected {
+			return nil, fmt.Errorf("track %q is not defined under raw_tracks", strconv.Itoa(expected))
+		}
+		keys = append(keys, strconv.Itoa(id))
+		expected++
+	}
+	if expected != endID+1 {
+		return nil, fmt.Errorf("track %q is not defined under raw_tracks", strconv.Itoa(expected))
+	}
+	return keys, nil
+}
+
+func expandGroupedReviewDocument(fileDoc ReviewFileDocument) (ReviewDocument, error) {
+	review := ReviewDocument{
+		ReviewID:  fileDoc.ReviewID,
+		VideoID:   fileDoc.VideoID,
+		InputPath: fileDoc.InputPath,
+		Tracks:    make([]StagingItem, 0, len(fileDoc.RawTracks)),
+	}
+
+	rawTracks := make(map[string]ReviewRawTrackItem, len(fileDoc.RawTracks))
+	availableTrackIDs := make([]int, 0, len(fileDoc.RawTracks))
+	for key, item := range fileDoc.RawTracks {
+		canonical, id, err := parseGroupedTrackRef(key)
+		if err != nil {
+			return ReviewDocument{}, fmt.Errorf("validation failed on raw_tracks key %q: %w", key, err)
+		}
+		rawTracks[canonical] = item
+		availableTrackIDs = append(availableTrackIDs, id)
+	}
+	sort.Ints(availableTrackIDs)
+
+	unresolvedTrackRefs := make(map[string]struct{}, len(fileDoc.UnresolvedTracks))
+	for i, ref := range fileDoc.UnresolvedTracks {
+		key, _, err := parseGroupedTrackRef(ref)
+		if err != nil {
+			return ReviewDocument{}, fmt.Errorf("validation failed on unresolved_tracks[%d]: %w", i, err)
+		}
+		if _, ok := rawTracks[key]; !ok {
+			return ReviewDocument{}, fmt.Errorf("validation failed on unresolved_tracks[%d]: track %q is not defined under raw_tracks", i, key)
+		}
+		if _, exists := unresolvedTrackRefs[key]; exists {
+			return ReviewDocument{}, fmt.Errorf("validation failed on unresolved_tracks[%d]: track %q is listed more than once", i, key)
+		}
+		unresolvedTrackRefs[key] = struct{}{}
+	}
+
+	seenPotentialIdentityIDs := make(map[int]int, len(fileDoc.PotentialIdentities))
+	assignedTracks := make(map[string]int, len(rawTracks))
+
+	for i, identity := range fileDoc.PotentialIdentities {
+		if identity.ID <= 0 {
+			return ReviewDocument{}, fmt.Errorf("validation failed on potential identity %d: missing positive `id`", i+1)
+		}
+		if prev, ok := seenPotentialIdentityIDs[identity.ID]; ok {
+			return ReviewDocument{}, fmt.Errorf("review file has duplicate potential identity id '%d' on items %d and %d", identity.ID, prev, i+1)
+		}
+		seenPotentialIdentityIDs[identity.ID] = i + 1
+		if len(identity.Tracks) == 0 {
+			return ReviewDocument{}, fmt.Errorf("validation failed on potential identity %d: `tracks` must contain at least one <track_id> or <start>-<end> range", identity.ID)
+		}
+
+		seenTracksInIdentity := make(map[string]struct{}, len(identity.Tracks))
+		for _, ref := range identity.Tracks {
+			keys, err := expandGroupedTrackRefs(ref, availableTrackIDs)
+			if err != nil {
+				return ReviewDocument{}, fmt.Errorf("validation failed on potential identity %d: %w", identity.ID, err)
+			}
+			for _, key := range keys {
+				if _, ok := seenTracksInIdentity[key]; ok {
+					return ReviewDocument{}, fmt.Errorf("validation failed on potential identity %d: track %q is listed more than once", identity.ID, key)
+				}
+				seenTracksInIdentity[key] = struct{}{}
+
+				id, err := strconv.Atoi(key)
+				if err != nil {
+					return ReviewDocument{}, fmt.Errorf("validation failed on potential identity %d: invalid expanded track id %q", identity.ID, key)
+				}
+				rawTrack, ok := rawTracks[key]
+				if !ok {
+					return ReviewDocument{}, fmt.Errorf("validation failed on potential identity %d: track %q is not defined under raw_tracks", identity.ID, key)
+				}
+				if prevIdentityID, ok := assignedTracks[key]; ok {
+					return ReviewDocument{}, fmt.Errorf("review file assigns track %q to multiple potential identities (%d and %d)", key, prevIdentityID, identity.ID)
+				}
+				assignedTracks[key] = identity.ID
+
+				review.Tracks = append(review.Tracks, StagingItem{
+					ID:                id,
+					StartTime:         rawTrack.StartTime,
+					EndTime:           rawTrack.EndTime,
+					NearestCandidates: append([]NearestCandidate(nil), rawTrack.NearestCandidates...),
+					Confidence:        rawTrack.Confidence,
+					Identity:          identity.Identity,
+					Variant:           identity.Variant,
+					Action:            identity.Action,
+					GroupID:           identity.ID,
+				})
+			}
+		}
+	}
+
+	var unassigned []string
+	for key := range rawTracks {
+		if _, ok := assignedTracks[key]; !ok {
+			unassigned = append(unassigned, key)
+		}
+	}
+	if len(unassigned) > 0 {
+		sort.Strings(unassigned)
+		allUnassignedMarkedUnresolved := true
+		for _, key := range unassigned {
+			if _, ok := unresolvedTrackRefs[key]; !ok {
+				allUnassignedMarkedUnresolved = false
+				break
+			}
+		}
+		if allUnassignedMarkedUnresolved {
+			return ReviewDocument{}, fmt.Errorf("review file has unresolved_tracks that must be moved into potential_identities before commit: %s", strings.Join(unassigned, ", "))
+		}
+		return ReviewDocument{}, fmt.Errorf("review file has raw_tracks that are not assigned to any potential identity: %s", strings.Join(unassigned, ", "))
+	}
+
+	return review, nil
+}
+
+func validatePreparedCommitItem(item StagingItem, index int, action, identity, variant, targetTrackID string) error {
+	trackLabel := stagingItemLabel(item)
+	if trackLabel == "" {
+		trackLabel = fmt.Sprintf("item_%d", index)
+	}
+	if len(item.InternalVector) != 512 {
+		return fmt.Errorf("validation failed on item %d (%s): vector has %d dimensions, expected 512", index, trackLabel, len(item.InternalVector))
+	}
+	switch action {
+	case "merge":
+		if targetTrackID == "" {
+			if identity == "" {
+				return fmt.Errorf("validation failed on item %d (%s): action 'merge' requires `identity` to be set", index, trackLabel)
+			}
+			if variant == "" {
+				return fmt.Errorf("validation failed on item %d (%s): action 'merge' requires `variant` to be set", index, trackLabel)
+			}
+		}
+	case "new_variant":
+		if identity == "" {
+			return fmt.Errorf("validation failed on item %d (%s): action 'new_variant' requires `identity` to be set", index, trackLabel)
+		}
+		if variant == "" {
+			return fmt.Errorf("validation failed on item %d (%s): action 'new_variant' requires `variant` to be set to the new variant name", index, trackLabel)
+		}
+	case "new_identity":
+		if variant != "" {
+			return fmt.Errorf("validation failed on item %d (%s): action 'new_identity' requires `variant` to be blank; Sentinel will create the `Default` variant", index, trackLabel)
+		}
+	default:
+		return fmt.Errorf("validation failed on item %d (%s): invalid action '%s'", index, trackLabel, action)
+	}
+	if item.InternalCount <= 0 {
+		return fmt.Errorf("validation failed on item %d (%s): internal_count must be positive, got %d", index, trackLabel, item.InternalCount)
+	}
+	if item.StartTime < 0 || item.EndTime < 0 {
+		return fmt.Errorf("validation failed on item %d (%s): interval times must be non-negative", index, trackLabel)
+	}
+	if item.EndTime < item.StartTime {
+		return fmt.Errorf("validation failed on item %d (%s): end_time must be >= start_time", index, trackLabel)
+	}
+	if stagingItemKey(item) == "" {
+		return fmt.Errorf("validation failed on item %d: missing review track id", index)
+	}
+	return nil
+}
+
+func buildPreparedCommitAction(item StagingItem, action, identity, variant, targetTrackID string) store.CommitAction {
+	return store.CommitAction{
+		TrackID:       stagingItemKey(item),
+		Action:        action,
+		IdentityName:  identity,
+		VariantName:   variant,
+		Vector:        item.InternalVector,
+		Count:         item.InternalCount,
+		TargetTrackID: targetTrackID,
+	}
+}
+
+func buildPreparedCommitInterval(item StagingItem) store.CommitInterval {
+	return store.CommitInterval{
+		TrackID:   stagingItemKey(item),
+		Start:     item.StartTime,
+		End:       item.EndTime,
+		FaceCount: item.InternalCount,
+	}
+}
+
+func appendGroupedCreateActions(
+	actions []store.CommitAction,
+	intervals []store.CommitInterval,
+	groupItems []StagingItem,
+	groupIndexes map[string]int,
+	action string,
+	identity string,
+	variant string,
+) ([]store.CommitAction, []store.CommitInterval, error) {
+	if len(groupItems) == 0 {
+		return actions, intervals, nil
+	}
+
+	for _, item := range groupItems {
+		idx := groupIndexes[stagingItemKey(item)]
+		if strings.TrimSpace(item.Action) != action || strings.TrimSpace(item.Identity) != identity || strings.TrimSpace(item.Variant) != variant {
+			return nil, nil, fmt.Errorf("validation failed on potential identity %d: all member tracks must share the same action/identity/variant", item.GroupID)
+		}
+		if err := validatePreparedCommitItem(item, idx, action, identity, variant, ""); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	seed := groupItems[0]
+	actions = append(actions, buildPreparedCommitAction(seed, action, identity, variant, ""))
+	intervals = append(intervals, buildPreparedCommitInterval(seed))
+
+	seedTrackID := stagingItemKey(seed)
+	for _, item := range groupItems[1:] {
+		idx := groupIndexes[stagingItemKey(item)]
+		if err := validatePreparedCommitItem(item, idx, "merge", "", "", seedTrackID); err != nil {
+			return nil, nil, err
+		}
+		actions = append(actions, buildPreparedCommitAction(item, "merge", "", "", seedTrackID))
+		intervals = append(intervals, buildPreparedCommitInterval(item))
+	}
+
+	return actions, intervals, nil
+}
+
 func readReviewDocument(data []byte) (ReviewDocument, error) {
-	var review ReviewDocument
+	var fileDoc ReviewFileDocument
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
-	if err := dec.Decode(&review); err != nil {
-		return ReviewDocument{}, fmt.Errorf("failed to parse review YAML: expected current review document format with top-level tracks: %w", err)
+	if err := dec.Decode(&fileDoc); err != nil {
+		return ReviewDocument{}, fmt.Errorf("failed to parse review YAML: expected current grouped review document format with top-level raw_tracks, optional unresolved_tracks, and potential_identities: %w", err)
 	}
-	if review.Tracks == nil && review.VideoID == "" && reviewDocumentID(review) == "" && review.InputPath == "" {
-		return ReviewDocument{}, fmt.Errorf("failed to parse review YAML: expected current review document format with top-level tracks")
+	if fileDoc.RawTracks == nil && fileDoc.PotentialIdentities == nil && fileDoc.VideoID == "" && fileDoc.ReviewID == "" && fileDoc.InputPath == "" {
+		return ReviewDocument{}, fmt.Errorf("failed to parse review YAML: expected current grouped review document format with top-level raw_tracks, optional unresolved_tracks, and potential_identities")
 	}
-	return review, nil
+	return expandGroupedReviewDocument(fileDoc)
 }
 
 func hydrateReviewDocument(stagingPath string, review ReviewDocument) (ReviewDocument, error) {
