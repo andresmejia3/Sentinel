@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/andresmejia3/sentinel/internal/store"
@@ -34,9 +35,11 @@ var (
 	redactBufferSize     int
 )
 
+const defaultRedactionBoxScale = 1.2
+
 var redactCmd = &cobra.Command{
 	Use:   "redact",
-	Short: "Redact faces in a video based on detection or identity",
+	Short: "Redact all faces or specific identity IDs from a video",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
 		return runRedact(cmd.Context(), cmd, redactOpts)
@@ -47,7 +50,7 @@ func init() {
 	redactCmd.Flags().StringVarP(&redactOpts.InputPath, "input", "i", "", "Path to input video")
 	redactCmd.Flags().StringVarP(&redactOutput, "output", "o", "output/redacted.mp4", "Path to output video")
 	redactCmd.Flags().StringVarP(&redactMode, "mode", "m", "blur-all", "Redaction mode: blur-all, targeted")
-	redactCmd.Flags().StringVar(&redactTargets, "target", "", "Comma-separated list of Identity IDs to redact (for targeted mode)")
+	redactCmd.Flags().StringVar(&redactTargets, "target", "", "Comma-separated list of Identity IDs to redact (implies targeted mode)")
 	redactCmd.Flags().StringVar(&redactStyle, "style", "black", "Redaction style: pixel, black, gauss, secure")
 	redactCmd.Flags().StringVar(&redactLinger, "linger", "1s", "How long to keep blurring after a targeted face is lost")
 	redactCmd.Flags().BoolVar(&redactParanoid, "paranoid", false, "Enable paranoid mode: blur ALL faces if a targeted face is lost")
@@ -57,6 +60,7 @@ func init() {
 	redactCmd.Flags().Float64VarP(&redactOpts.MatchThreshold, "threshold", "t", 0.6, "Face matching threshold")
 	redactCmd.Flags().Float64VarP(&redactOpts.DetectionThreshold, "detection-threshold", "D", 0.5, "Face detection confidence threshold")
 	redactCmd.Flags().IntVarP(&redactOpts.BlurStrength, "strength", "s", 15, "Pixelation block size (higher = more blocky)")
+	redactCmd.Flags().Float64Var(&redactOpts.BoxScale, "box-scale", defaultRedactionBoxScale, "Scale factor for redaction boxes (1.0 = detected box size)")
 	redactCmd.Flags().StringVar(&redactOpts.WorkerTimeout, "worker-timeout", "30s", "Timeout for a worker to process a single frame")
 	redactCmd.Flags().IntVarP(&redactBufferSize, "buffer-size", "B", 35, "Max number of frames to buffer in memory (prevents OOM)")
 
@@ -95,7 +99,9 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if err := validateRedactFlags(&opts); err != nil {
+	mode := effectiveRedactMode(cmd)
+
+	if err := validateRedactFlags(cmd, &opts); err != nil {
 		return err
 	}
 
@@ -120,7 +126,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 
 	targetIDs := []int{}
 	var validationErrors []string
-	if redactMode == "targeted" {
+	if mode == "targeted" {
 		for _, s := range strings.Split(redactTargets, ",") {
 			id, err := strconv.Atoi(strings.TrimSpace(s))
 			if err != nil {
@@ -159,7 +165,15 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 
 	var wg sync.WaitGroup
 	var writerWg sync.WaitGroup
-	readyChan := make(chan bool, opts.NumEngines)
+	var bufferedFrames int64
+	readyChan := make(chan struct{}, opts.NumEngines)
+	releaseBufferedFrame := func() {
+		atomic.AddInt64(&bufferedFrames, -1)
+	}
+	putBufferedFrame := func(buf []byte) {
+		frameBufferPool.Put(buf)
+		releaseBufferedFrame()
+	}
 
 	// Safety Net: Cleanup Deferred Block to prevent Memory Leaks (Dangling Rows) & Deadlocks
 	defer func() {
@@ -175,7 +189,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 				if !ok {
 					break DrainTask
 				}
-				frameBufferPool.Put(t.Data)
+				putBufferedFrame(t.Data)
 			default:
 				break DrainTask
 			}
@@ -187,7 +201,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 				if !ok {
 					break DrainResults
 				}
-				frameBufferPool.Put(r.Data)
+				putBufferedFrame(r.Data)
 			default:
 				break DrainResults
 			}
@@ -199,22 +213,22 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 				if !ok {
 					break DrainWrite
 				}
-				frameBufferPool.Put(d)
+				putBufferedFrame(d)
 			default:
 				break DrainWrite
 			}
 		}
 	}()
 
-	// Optimization: Load all target variant embeddings into memory
-	targetVariants, err := DB.GetVariantsForIdentities(ctx, targetIDs)
+	// Optimization: Load target variant embeddings only when targeted matching is needed.
+	targetVariants, err := loadRedactTargetVariants(ctx, mode, targetIDs)
 	if err != nil {
 		return fmt.Errorf("failed to load target embeddings: %w", err)
 	}
 
 	// Critical Safety Check: Ensure ALL requested targets actually exist in the DB.
 	// If a target is missing, we must abort to prevent accidental leakage (unredacted faces).
-	if redactMode == "targeted" {
+	if mode == "targeted" {
 		foundIdentityIDs := make(map[int]bool)
 		for _, v := range targetVariants {
 			foundIdentityIDs[v.IdentityID] = true
@@ -273,6 +287,41 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 		bufferSize = 1
 	}
 	inflightSem := make(chan struct{}, bufferSize)
+	var currentMemory uint64
+	pidChan := make(chan int, opts.NumEngines)
+
+	go func() {
+		var pids []int
+		for i := 0; i < opts.NumEngines; i++ {
+			select {
+			case pid := <-pidChan:
+				pids = append(pids, pid)
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		updateMem := func() {
+			var total uint64
+			total += utils.GetProcessRSS(os.Getpid())
+			for _, pid := range pids {
+				total += utils.GetProcessRSS(pid)
+			}
+			atomic.StoreUint64(&currentMemory, total)
+		}
+
+		updateMem()
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				updateMem()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	for i := 0; i < opts.NumEngines; i++ {
 		wg.Add(1)
@@ -280,7 +329,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 			defer wg.Done()
 
 			inferenceMode := "full"
-			if redactMode == "blur-all" {
+			if mode == "blur-all" {
 				inferenceMode = "detection-only"
 			}
 
@@ -301,7 +350,16 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 				}
 			}
 			defer pyWorker.Close()
-			readyChan <- true
+			select {
+			case pidChan <- pyWorker.Cmd.Process.Pid:
+			case <-ctx.Done():
+				return
+			}
+			select {
+			case readyChan <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 
 			for {
 				select {
@@ -312,9 +370,9 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 						return
 					}
 					faces, err := pyWorker.ProcessRedactFrame(task.Data)
-					if err != nil {
-						frameBufferPool.Put(task.Data) // Return buffer on error
-						pyWorker.Close()               // Reap process before diagnostics
+			if err != nil {
+				putBufferedFrame(task.Data) // Return buffer on error
+				pyWorker.Close()               // Reap process before diagnostics
 						utils.ShowError("Python crashed", err, pyWorker.Cmd)
 						select {
 						case <-ctx.Done():
@@ -326,7 +384,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 					select {
 					case resultsChan <- redactResult{Index: task.Index, Data: task.Data, Faces: faces}:
 					case <-ctx.Done():
-						frameBufferPool.Put(task.Data) // Return buffer on cancellation
+						putBufferedFrame(task.Data) // Return buffer on cancellation
 						return
 					}
 				}
@@ -404,12 +462,13 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 				frameBufferPool.Put(buf)
 				break
 			}
+			atomic.AddInt64(&bufferedFrames, 1)
 
 			// Acquire semaphore (Block if too many frames are in flight)
 			select {
 			case inflightSem <- struct{}{}:
 			case <-ctx.Done():
-				frameBufferPool.Put(buf)
+				putBufferedFrame(buf)
 				return
 			}
 
@@ -420,7 +479,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 				// We acquired the semaphore, but are exiting before the frame is processed.
 				// Release the semaphore and the buffer to prevent leaks.
 				<-inflightSem
-				frameBufferPool.Put(buf)
+				putBufferedFrame(buf)
 				return
 			}
 		}
@@ -430,7 +489,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 	// Ensure buffered frames are returned to the pool if we exit early on error
 	defer func() {
 		for _, res := range buffer {
-			frameBufferPool.Put(res.Data)
+			putBufferedFrame(res.Data)
 		}
 	}()
 	nextFrame := 0
@@ -443,7 +502,42 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 		progressbar.OptionSetWriter(os.Stderr),
 		progressbar.OptionShowCount(),
 	)
-	defer bar.Finish()
+	barUpdateStop := make(chan struct{})
+	barUpdateDone := make(chan struct{})
+	go func() {
+		defer close(barUpdateDone)
+			updateDesc := func() {
+				mem := atomic.LoadUint64(&currentMemory)
+				inFlight := len(inflightSem)
+				inFlightCap := cap(inflightSem)
+				buffered := atomic.LoadInt64(&bufferedFrames)
+				if mem > 0 {
+					bar.Describe(fmt.Sprintf("Redacting (RAM: %.2f GB | Buffered: %d | In Flight: %d/%d)", float64(mem)/(1024*1024*1024), buffered, inFlight, inFlightCap))
+					return
+				}
+				bar.Describe(fmt.Sprintf("Redacting (Buffered: %d | In Flight: %d/%d)", buffered, inFlight, inFlightCap))
+			}
+		updateDesc()
+
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-barUpdateStop:
+				return
+			case <-ticker.C:
+				updateDesc()
+			}
+		}
+	}()
+	defer func() {
+		close(barUpdateStop)
+		<-barUpdateDone
+		_ = bar.Finish()
+		fmt.Fprintln(os.Stderr)
+	}()
 
 	go func() {
 		wg.Wait()
@@ -472,7 +566,7 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 						}
 					}
 				}
-				frameBufferPool.Put(data)
+				putBufferedFrame(data)
 			case <-ctx.Done():
 				return
 			}
@@ -502,20 +596,20 @@ func runRedact(ctx context.Context, cmd *cobra.Command, opts Options) error {
 				}
 				delete(buffer, nextFrame)
 
-				outData, err := tracker.apply(ctx, frame.Data, width, height, nextFrame, frame.Faces, redactMode, redactStyle, activeParanoid, redactParanoidStrict, lingerFrames)
+				outData, err := tracker.apply(ctx, frame.Data, width, height, nextFrame, frame.Faces, mode, redactStyle, activeParanoid, redactParanoidStrict, lingerFrames)
 				if err != nil {
-					frameBufferPool.Put(frame.Data)
+					putBufferedFrame(frame.Data)
 					return fmt.Errorf("redaction failed: %w", err)
 				}
 
 				select {
 				case writeChan <- outData:
 				case err := <-writeErrChan:
-					frameBufferPool.Put(outData)
+					putBufferedFrame(outData)
 					return err
 				case <-ctx.Done():
 					// The frame was processed but not sent to the encoder. Recycle the buffer before exiting.
-					frameBufferPool.Put(outData)
+					putBufferedFrame(outData)
 					return ctx.Err()
 				}
 
@@ -571,21 +665,15 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 		Rect:   image.Rect(0, 0, width, height),
 	}
 	strength := p.opts.BlurStrength
-
-	// Optimization: Copy master list to a "missing" set.
-	// We remove IDs as we find them. If any remain, paranoid mode triggers.
-	missingTargets := make(map[int]bool)
-	if mode == "targeted" {
-		for _, v := range p.targetVariants {
-			missingTargets[v.IdentityID] = true
-		}
-	}
+	boxScale := p.effectiveBoxScale()
+	bounds := m.Bounds()
 
 	// Map to track which face index corresponds to which target ID (for blurring later)
 	faceIdentities := make([]int, len(faces))
 	for i := range faceIdentities {
 		faceIdentities[i] = -1
 	}
+	matchedRectsByIdentity := make(map[int][]image.Rectangle)
 
 	for i, face := range faces {
 		if mode == "targeted" {
@@ -601,32 +689,24 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 			}
 
 			if bestID != -1 {
+				rect := image.Rect(face.Loc[0], face.Loc[1], face.Loc[2], face.Loc[3])
 				faceIdentities[i] = bestID
-				delete(missingTargets, bestID) // Found it! Remove from missing list.
-
-				p.updateTrack(bestID, frameIndex, image.Rect(face.Loc[0], face.Loc[1], face.Loc[2], face.Loc[3]))
+				matchedRectsByIdentity[bestID] = append(matchedRectsByIdentity[bestID], rect)
 			}
 		}
 	}
+	if mode == "targeted" {
+		p.updateTracks(frameIndex, matchedRectsByIdentity)
+	}
 
 	isParanoidActive := false
-	if paranoid && mode == "targeted" && len(missingTargets) > 0 {
+	if paranoid && mode == "targeted" {
 		if paranoidStrict {
-			// Strict mode: trigger if any target is missing, period.
-			isParanoidActive = true
+			// Strict mode: trigger if any target identity is missing, period.
+			isParanoidActive = p.anyTargetIdentityMissing(matchedRectsByIdentity)
 		} else {
-			// Default behavior: only trigger if a *tracked* target is missing.
-			for id := range missingTargets {
-				for _, track := range p.activeTracks {
-					if track.ID == id {
-						isParanoidActive = true
-						break
-					}
-				}
-				if isParanoidActive {
-					break
-				}
-			}
+			// Default behavior: trigger if any tracked target instance is missing.
+			isParanoidActive = p.hasMissingTrackedInstance(frameIndex, lingerFrames)
 		}
 	}
 
@@ -641,7 +721,7 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 		}
 
 		if shouldBlur {
-			rect := image.Rect(face.Loc[0], face.Loc[1], face.Loc[2], face.Loc[3])
+			rect := scaledRedactionRect(image.Rect(face.Loc[0], face.Loc[1], face.Loc[2], face.Loc[3]), boxScale, bounds)
 			redactFace(m, rect, style, strength)
 		}
 	}
@@ -650,12 +730,9 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 	// If paranoid is active, we are blurring all detected faces.
 	// However, linger covers *undetected* faces (lost tracking), so we still apply it.
 	if mode == "targeted" {
-		// We iterate active tracks. If a track is in 'missingTargets', it means it wasn't found in this frame.
 		for _, track := range p.activeTracks {
-			if missingTargets[track.ID] {
-				if frameIndex-track.LastSeen <= lingerFrames {
-					redactFace(m, track.LastKnown, style, strength)
-				}
+			if track.LastSeen != frameIndex && frameIndex-track.LastSeen <= lingerFrames {
+				redactFace(m, scaledRedactionRect(track.LastKnown, boxScale, bounds), style, strength)
 			}
 		}
 	}
@@ -665,19 +742,145 @@ func (p *paranoidTracker) apply(ctx context.Context, imgData []byte, width, heig
 	return m.Pix, nil
 }
 
-func (p *paranoidTracker) updateTrack(id, frameIndex int, rect image.Rectangle) {
-	for _, t := range p.activeTracks {
-		if t.ID == id {
-			t.LastSeen = frameIndex
-			t.LastKnown = rect
-			return
+func (p *paranoidTracker) effectiveBoxScale() float64 {
+	if p == nil || p.opts == nil || p.opts.BoxScale <= 0 {
+		return defaultRedactionBoxScale
+	}
+	return p.opts.BoxScale
+}
+
+func loadRedactTargetVariants(ctx context.Context, mode string, targetIDs []int) ([]store.VariantData, error) {
+	if mode != "targeted" {
+		return nil, nil
+	}
+	if DB == nil {
+		return nil, fmt.Errorf("targeted mode requires database connection")
+	}
+	return DB.GetVariantsForIdentities(ctx, targetIDs)
+}
+
+func effectiveRedactMode(cmd *cobra.Command) string {
+	mode := redactMode
+	targets := strings.TrimSpace(redactTargets)
+	modeExplicit := false
+
+	if cmd != nil {
+		if flag := cmd.Flags().Lookup("mode"); flag != nil {
+			modeExplicit = cmd.Flags().Changed("mode")
+		}
+		if resolvedMode, err := cmd.Flags().GetString("mode"); err == nil && resolvedMode != "" {
+			mode = resolvedMode
+		}
+		if resolvedTargets, err := cmd.Flags().GetString("target"); err == nil {
+			targets = strings.TrimSpace(resolvedTargets)
 		}
 	}
-	p.activeTracks = append(p.activeTracks, &redactionTrack{
-		ID:        id,
-		LastSeen:  frameIndex,
-		LastKnown: rect,
-	})
+
+	if targets != "" && !modeExplicit && (mode == "" || mode == "blur-all") {
+		return "targeted"
+	}
+	if mode == "" {
+		return "blur-all"
+	}
+	return mode
+}
+
+func (p *paranoidTracker) updateTracks(frameIndex int, matchedRectsByIdentity map[int][]image.Rectangle) {
+	for identityID, rects := range matchedRectsByIdentity {
+		candidates := p.activeTracksForIdentity(identityID)
+		used := make(map[*redactionTrack]bool)
+
+		for _, rect := range rects {
+			track := closestRedactionTrack(candidates, used, rect)
+			if track == nil {
+				track = &redactionTrack{ID: identityID}
+				p.activeTracks = append(p.activeTracks, track)
+			}
+			track.LastSeen = frameIndex
+			track.LastKnown = rect
+			used[track] = true
+		}
+	}
+}
+
+func (p *paranoidTracker) activeTracksForIdentity(identityID int) []*redactionTrack {
+	tracks := make([]*redactionTrack, 0)
+	for _, track := range p.activeTracks {
+		if track.ID == identityID {
+			tracks = append(tracks, track)
+		}
+	}
+	return tracks
+}
+
+func (p *paranoidTracker) anyTargetIdentityMissing(matchedRectsByIdentity map[int][]image.Rectangle) bool {
+	for _, variant := range p.targetVariants {
+		if len(matchedRectsByIdentity[variant.IdentityID]) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *paranoidTracker) hasMissingTrackedInstance(frameIndex, lingerFrames int) bool {
+	for _, track := range p.activeTracks {
+		if track.LastSeen != frameIndex && frameIndex-track.LastSeen <= lingerFrames {
+			return true
+		}
+	}
+	return false
+}
+
+func closestRedactionTrack(candidates []*redactionTrack, used map[*redactionTrack]bool, rect image.Rectangle) *redactionTrack {
+	var best *redactionTrack
+	var bestDistance int64
+
+	for _, candidate := range candidates {
+		if used[candidate] {
+			continue
+		}
+
+		distance := rectCenterDistanceSquared(candidate.LastKnown, rect)
+		if best == nil || distance < bestDistance {
+			best = candidate
+			bestDistance = distance
+		}
+	}
+
+	return best
+}
+
+func rectCenterDistanceSquared(a, b image.Rectangle) int64 {
+	ax := int64(a.Min.X + a.Max.X)
+	ay := int64(a.Min.Y + a.Max.Y)
+	bx := int64(b.Min.X + b.Max.X)
+	by := int64(b.Min.Y + b.Max.Y)
+
+	dx := ax - bx
+	dy := ay - by
+	return dx*dx + dy*dy
+}
+
+func scaledRedactionRect(rect image.Rectangle, scale float64, bounds image.Rectangle) image.Rectangle {
+	if scale <= 0 {
+		scale = defaultRedactionBoxScale
+	}
+	if scale == 1 {
+		return rect.Intersect(bounds)
+	}
+
+	newWidth := math.Max(1, math.Round(float64(rect.Dx())*scale))
+	newHeight := math.Max(1, math.Round(float64(rect.Dy())*scale))
+	centerX := float64(rect.Min.X+rect.Max.X) / 2
+	centerY := float64(rect.Min.Y+rect.Max.Y) / 2
+
+	scaled := image.Rect(
+		int(math.Floor(centerX-newWidth/2)),
+		int(math.Floor(centerY-newHeight/2)),
+		int(math.Ceil(centerX+newWidth/2)),
+		int(math.Ceil(centerY+newHeight/2)),
+	)
+	return scaled.Intersect(bounds)
 }
 
 func (p *paranoidTracker) pruneTracks(frameIndex, lingerFrames int) {
@@ -891,7 +1094,7 @@ func redactFace(img *image.RGBA, rect image.Rectangle, style string, strength in
 	}
 }
 
-func validateRedactFlags(opts *Options) error {
+func validateRedactFlags(cmd *cobra.Command, opts *Options) error {
 	info, err := os.Stat(opts.InputPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -903,8 +1106,9 @@ func validateRedactFlags(opts *Options) error {
 		return fmt.Errorf("input path is a directory, not a video file")
 	}
 
-	if redactMode != "blur-all" && redactMode != "targeted" {
-		return fmt.Errorf("invalid mode '%s'. Must be 'blur-all' or 'targeted'", redactMode)
+	mode := effectiveRedactMode(cmd)
+	if mode != "blur-all" && mode != "targeted" {
+		return fmt.Errorf("invalid mode '%s'. Must be 'blur-all' or 'targeted'", mode)
 	}
 
 	validStyles := map[string]bool{"pixel": true, "black": true, "gauss": true, "secure": true}
@@ -912,8 +1116,18 @@ func validateRedactFlags(opts *Options) error {
 		return fmt.Errorf("invalid style '%s'. Must be one of: pixel, black, gauss, secure", redactStyle)
 	}
 
-	if redactMode == "targeted" && redactTargets == "" {
+	targets := strings.TrimSpace(redactTargets)
+	if cmd != nil {
+		if resolvedTargets, err := cmd.Flags().GetString("target"); err == nil {
+			targets = strings.TrimSpace(resolvedTargets)
+		}
+	}
+
+	if mode == "targeted" && targets == "" {
 		return fmt.Errorf("targeted mode requires --target list of IDs")
+	}
+	if targets != "" && cmd != nil && cmd.Flags().Changed("mode") && mode == "blur-all" {
+		return fmt.Errorf("--target cannot be used with explicit --mode blur-all")
 	}
 
 	if _, err := time.ParseDuration(redactLinger); err != nil {
@@ -934,6 +1148,16 @@ func validateRedactFlags(opts *Options) error {
 
 	if opts.BlurStrength < 0 {
 		return fmt.Errorf("invalid strength: must be non-negative, got %d", opts.BlurStrength)
+	}
+	boxScaleExplicit := false
+	if cmd != nil {
+		boxScaleExplicit = cmd.Flags().Changed("box-scale")
+	}
+	if opts.BoxScale == 0 && !boxScaleExplicit {
+		opts.BoxScale = defaultRedactionBoxScale
+	}
+	if opts.BoxScale <= 0 {
+		return fmt.Errorf("invalid box-scale: must be greater than 0, got %f", opts.BoxScale)
 	}
 
 	if _, err := time.ParseDuration(opts.WorkerTimeout); err != nil {

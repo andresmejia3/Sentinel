@@ -43,7 +43,7 @@ var scanBufferSize int
 
 var scanCmd = &cobra.Command{
 	Use:   "scan",
-	Short: "Scan video in staging mode by default",
+	Short: "Scan a video and stage grouped review artifacts by default",
 	// Use RunE so we can return errors to the root command for proper exit codes
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true // Don't show help text on runtime errors

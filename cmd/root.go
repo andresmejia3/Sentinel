@@ -25,6 +25,7 @@ type Options struct {
 	MatchThreshold     float64
 	DisableSafetyNet   bool
 	BlurStrength       int
+	BoxScale           float64
 	BlipDuration       string
 	DebugScreenshots   bool
 	DetectionThreshold float64
@@ -48,6 +49,10 @@ var rootCmd = &cobra.Command{
 	Short:   "Biometric Video Indexing & Redaction Engine",
 	Version: Version, // This enables the --version flag
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if !commandNeedsDB(cmd) {
+			return nil
+		}
+
 		// If no flag was provided, try to build the connection string from the environment
 		if dbURL == "" {
 			if err := loadLocalEnv(); err != nil {
@@ -112,6 +117,18 @@ func Execute() {
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&dbURL, "db", "", "PostgreSQL connection string (default: postgres://localhost:5432/sentinel)")
+}
+
+func commandNeedsDB(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return true
+	}
+
+	if cmd.Name() != "redact" {
+		return true
+	}
+
+	return effectiveRedactMode(cmd) != "blur-all"
 }
 
 // loadLocalEnv reads a nearby .env file for native runs without overriding

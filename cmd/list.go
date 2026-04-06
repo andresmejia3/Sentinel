@@ -12,7 +12,7 @@ import (
 
 var listCmd = &cobra.Command{
 	Use:   "list",
-	Short: "List all identities in the database",
+	Short: "List identities, variants, or commit history",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
 		return runList(cmd.Context())

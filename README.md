@@ -64,6 +64,12 @@ Sentinel is review-first by default.
 
 This is the safest workflow because it keeps ambiguous matches out of the database until a human confirms them.
 
+The staged review file is now grouped around:
+
+- `raw_tracks`: read-only track evidence from scan
+- `unresolved_tracks`: read-only track IDs that scan could not confidently group
+- `potential_identities`: the only editable section; this controls grouping and commit actions
+
 ### Important: `--no-staging` Is Unsafe
 
 > [!WARNING]
@@ -132,49 +138,63 @@ Scans a video and produces a review YAML plus sidecar data file by default.
 
 Behavior:
 
-- default: writes `data/reviews/<basename>.<short-video-id>.<review_id>.review.yaml`, a sibling `.data.json` sidecar, and track artifacts under `data/results/<video>/reviews/<review_id>/tracks/<id>/`
+- default: writes `data/reviews/<basename>.<short-video-id>.<review_id>.review.yaml`, a sibling `.data.json` sidecar, and track artifacts under `data/results/<video>/reviews/<review_id>/tracks/<track_id>/`
 - `--review-file`: same staged behavior, custom review file path
 - `--no-staging`: skips review and writes directly to the DB
 - machine-only track data (`internal_vector` / `internal_count`) lives only in the sibling `.data.json` sidecar; `sentinel commit` rejects review YAML that tries to embed it
 
-Review YAML shape:
+Grouped review YAML shape:
 
 ```yaml
 review_id: a1b2c3d4e5f6
 video_id: <video hash>
 input_path: samples/example.mp4
-tracks:
 
+raw_tracks:
+    "1":
+        start_time: 0
+        end_time: 2.08
+        nearest_candidates:
+            - identity: Monica
+              variant: Default
+              distance: 0.284
+        confidence: 0.84
+        suggested_identity: Monica
+        suggested_variant: Default
+        suggested_action: merge
+        artifact_dir: results/<video>/reviews/<review_id>/tracks/1
+
+unresolved_tracks:
+    - "3"
+
+potential_identities:
     - id: 1
-      start_time: 0
-      end_time: 2.08
-      nearest_candidates:
-        - identity: Jenny
-          variant: Default
-          distance: 0.284
-        - identity: Jenna
-          variant: Default
-          distance: 0.317
-      confidence: 0.84
-      reason: nearest_distance=0.284 <= merge_cutoff=0.350 -> suggested merge
-      identity: Jenny
+      tracks:
+        - "1-2"
+      identity: Monica
       variant: Default
       action: merge
+    - id: 2
+      tracks:
+        - "3"
+      identity: ""
+      variant: ""
+      action: new_identity
 ```
-
-For `new_identity`, if `identity` is left blank, then Sentinel will auto-name it. If `variant` is left blank, then Sentinel will create the `Default` variant.
 
 Review rules:
 
-- Edit only `identity`, `variant`, and `action`; the other review fields are scan-owned evidence.
-- `nearest_candidates` is the ranked shortlist of closest existing matches and is the single source of truth for nearest-match evidence.
-- The prefilled `action` is only Sentinel's heuristic suggestion, not final truth.
-- Identity and variant names are matched case-insensitively during commit.
-- `merge` requires both `identity` and `variant` to be set.
+- Leave `raw_tracks`, `unresolved_tracks`, `review_id`, `video_id`, and `input_path` unchanged.
+- Edit only `potential_identities[].tracks`, `potential_identities[].identity`, `potential_identities[].variant`, and `potential_identities[].action`.
+- Each `potential_identities[].tracks` entry must be either a single `<track_id>` or an inclusive `<start>-<end>` range of track IDs listed under `raw_tracks`.
+- `unresolved_tracks` is read-only. To resolve one, add its track ID to an existing `potential_identities[].tracks` entry or create a new potential identity entry.
+- `nearest_candidates` is read-only evidence. The prefilled suggested fields are Sentinel heuristics, not final truth.
+- `merge` requires both `identity` and `variant`.
 - `new_variant` requires `identity` to be the existing person and `variant` to be the new variant name.
-- `new_identity` should leave `variant` blank; leaving `identity` blank lets Sentinel auto-name the new identity.
-- `sentinel commit` applies actions in dependency-safe phases (`new_identity` -> `new_variant` -> `merge`), so the YAML row order does not control commit behavior.
-- `sentinel commit` rejects blank actions, duplicate review IDs, edited read-only track evidence, sidecar metadata mismatches, any review/sidecar track-set mismatch, duplicate `new_identity` names within the same review batch, `new_identity` names that already exist, and exact system-label collisions like `Identity 42` when that identity already exists.
+- `new_identity` should leave `variant` blank. Leaving `identity` blank lets Sentinel auto-name the new identity.
+- `discard` records the decision without creating or updating an identity.
+- `sentinel commit` applies actions in dependency-safe phases (`new_identity` -> `new_variant` -> `merge`), so YAML row order does not control commit behavior.
+- `sentinel commit` rejects blank actions, duplicate review IDs, edited read-only evidence, sidecar metadata mismatches, review/sidecar track-set mismatches, duplicate `new_identity` names within a batch, `new_identity` names that already exist, and exact system-label collisions like `Identity 42` when that identity already exists.
 
 Per-track review artifacts:
 
@@ -186,7 +206,7 @@ Per-track review artifacts:
 
 Review artifacts live under:
 
-- `data/results/<video>/reviews/<review_id>/tracks/<id>/`
+- `data/results/<video>/reviews/<review_id>/tracks/<track_id>/`
 
 ### `commit`
 
@@ -198,6 +218,12 @@ Applies a reviewed scan file to Postgres.
 sentinel commit data/reviews/video.review.yaml
 ```
 
+Notes:
+
+- `commit` reads grouped `potential_identities`, expands their `tracks` lists back into raw track IDs, validates that every raw track is accounted for exactly once, and hydrates machine-only vectors/counts from the sibling `.data.json` sidecar.
+- grouped `new_identity` and `new_variant` create the target once and then merge the remaining member tracks into it in the same batch.
+- on success, Sentinel prints a commit ID that can later be used with `sentinel rollback` or reviewed via `sentinel list commits`.
+
 ### `rollback`
 
 Status: `Admin`
@@ -207,6 +233,10 @@ Rolls back a previously committed batch by commit ID.
 ```bash
 sentinel rollback <commit_id>
 ```
+
+Tip:
+
+- if you forgot a commit ID, use `sentinel list commits` or `sentinel list commits --limit 0`
 
 ### `redact`
 
@@ -219,9 +249,10 @@ Redacts faces from a video.
 | `--input` | `-i` | required | Path to input video |
 | `--output` | `-o` | `output/redacted.mp4` | Output path |
 | `--mode` | `-m` | `blur-all` | `blur-all` or `targeted` |
-| `--target` |  |  | Comma-separated identity IDs for targeted mode |
+| `--target` |  |  | Comma-separated identity IDs to redact. Implies targeted mode unless `--mode blur-all` was explicitly set. |
 | `--style` |  | `black` | `pixel`, `black`, `gauss`, `secure` |
 | `--strength` | `-s` | `15` | Pixel/block strength |
+| `--box-scale` |  | `1.2` | Scale redaction boxes before drawing them |
 | `--linger` |  | `1s` | Keep redacting briefly after loss |
 | `--paranoid` |  | `false` | Blur all faces if a tracked target is lost |
 | `--paranoid-strict` |  | `false` | In paranoid mode, trigger even before a target has appeared |
@@ -230,6 +261,26 @@ Redacts faces from a video.
 | `--detection-threshold` | `-D` | `0.5` | Detection threshold |
 | `--buffer-size` | `-B` | `35` | Max in-flight frames |
 | `--worker-timeout` |  | `30s` | Per-frame worker timeout |
+
+Examples:
+
+```bash
+# Blur every detected face
+sentinel redact -i video.mp4
+
+# Target a committed identity by ID
+sentinel redact -i video.mp4 --target 3 -o output/redacted.mp4
+
+# Tighten matching and expand the redaction box
+sentinel redact -i video.mp4 --target 3 --threshold 0.45 --box-scale 1.3
+```
+
+Notes:
+
+- `--target` implies targeted mode by default, so `-m targeted` is optional in the common case.
+- if you explicitly pass `--mode blur-all`, then `--target` is rejected as a conflicting flag combination.
+- lower `--threshold` values are stricter.
+- `--box-scale 1.0` preserves the detector box size; larger values cover more of the face for privacy.
 
 ### `find`
 
@@ -343,7 +394,7 @@ Inside the launched shell:
 sentinel scan -i video.mp4
 
 # Apply the reviewed scan to Postgres
-sentinel commit reviews/video.review.yaml
+sentinel commit data/reviews/video.<short-video-id>.<review_id>.review.yaml
 
 # Fast but unsafe direct-write mode
 sentinel scan -i video.mp4 --no-staging
@@ -351,11 +402,14 @@ sentinel scan -i video.mp4 --no-staging
 # List identities
 sentinel list
 
+# List commit history if you need a rollback ID later
+sentinel list commits --limit 0
+
 # Search for someone with an image
 sentinel find suspect.jpg
 
 # Targeted redaction
-sentinel redact -i video.mp4 -m targeted --target 3 -o output/redacted.mp4
+sentinel redact -i video.mp4 --target 3 -o output/redacted.mp4
 ```
 
 ### Native Local Installation
@@ -385,7 +439,7 @@ Run:
 
 ```bash
 ./sentinel scan -i video.mp4
-./sentinel commit data/reviews/video.review.yaml
+./sentinel commit data/reviews/video.<short-video-id>.<review_id>.review.yaml
 ```
 
 Important local DB note:
