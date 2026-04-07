@@ -11,47 +11,50 @@ Sentinel is a high-performance biometric video indexing and redaction engine bui
 
 Under the hood, Sentinel is designed like a real systems project: Go orchestrates concurrency, worker lifecycles, FFmpeg streaming, and database coordination, while persistent Python workers handle ML inference over a custom binary IPC pipeline. The result is a zero-disk frame-processing workflow built for long-form video, human-in-the-loop accuracy, and production-style data integrity.
 
-## Legend
+## Contents
 
-| Label | Meaning |
-| :--- | :--- |
-| `Safe default` | Review-first workflow. `scan` stays out of Postgres for identities and intervals until you explicitly run `sentinel commit`. |
-| `Unsafe` | Faster convenience mode that can save ambiguous or wrong identity assignments. |
-| `Admin` | Maintenance or operator-focused command that is outside the normal scan -> review -> commit workflow. |
-| `Destructive` | Deletes or resets data. These actions are not undone by `sentinel rollback`. |
+- [Highlights](#highlights)
+- [Redaction Demo](#redaction-demo)
+- [Default Workflow](#default-workflow)
+- [Architecture](#architecture)
+- [Command Reference](#command-reference)
+- [Installation and Usage](#installation-and-usage)
+- [Roadmap](#roadmap)
 
 ## Highlights
-
-- Zero-Disk Video Pipeline: Streams frames from FFmpeg through Go into warm Python workers without writing temporary frame images to disk.
 - Hybrid Go + Python Architecture: Uses Go for concurrency, orchestration, cancellation, and database coordination, while Python stays focused on InsightFace inference.
+- Zero-Disk Video Pipeline: Streams frames from FFmpeg through Go into warm Python workers without writing temporary frame images to disk.
 - Warm Worker Pool + Binary IPC: Keeps inference workers alive and communicates over a custom binary protocol so the system avoids per-frame Python startup and model warmup overhead.
-- Human-in-the-Loop Identity Review: `scan` stages review YAML by default so ambiguous matches can be reviewed before they affect stored identities or intervals.
+- Iterative Same-Video Identity Refinement: Sentinel does not greedily cluster split tracks once and stop. It stages regrouping decisions against frozen snapshots, reruns refinement rounds until stable, blocks impossible time-overlap merges, and leaves borderline cases unresolved for human review.
+- Distance-Aware Review Suggestions: Sentinel pre-fills `merge`, `new_variant`, `new_identity`, or `needs review` by comparing the strongest nearby identity matches and backing off when the top candidates are too close.
+- Human-in-the-Loop Identity Review with Integrity Checks: `scan` stages editable review YAML by default while keeping machine-only vectors and counts in a fingerprint-protected sidecar.
 - Representative Thumbnail Selection via Embedding Centroid: Sentinel does not just keep the sharpest face crop. For each track, it retains high-quality candidate frames, maintains a running mean embedding, and then selects the candidate whose embedding is closest to that centroid. That makes the chosen thumbnail the most representative view of that track or appearance cluster, not just the loudest frame. Because the selection happens in embedding space instead of using hand-tuned pose-specific rules, the same logic works across different people, looks, poses, lighting conditions, and variants.
-- Transaction-Safe Commit / Rollback: Reviewed identity updates are applied with a ledgered vector-delta model so changes can be committed atomically and rolled back cleanly.
-- Targeted Redaction with Temporal Safety Net: Supports linger and paranoid modes so temporary detection loss is less likely to cause privacy leaks.
+- Atomic, Reversible Commit / Rollback: Reviewed identity updates are applied inside a single transaction as per-track vector deltas with grouped-create support, rollback guards, and mathematically reversible ledger entries.
+- Privacy-First Targeted Redaction: Targeted mode supports linger, paranoid, and box scaling to reduce missed-target leaks when detections blink or drift.
 
-## Visual Overview
+## Redaction Demo
 
-### Architecture
+These sample clips all use the same base command on `samples/1.mp4` and target identity IDs `2` and `3`:
 
-![Sentinel architecture](docs/architecture.svg)
+```bash
+sentinel redact -i samples/1.mp4 --target 2,3 --style <black|gauss|pixel|secure> -o docs/redacted-<style>.mp4
+```
 
-### Review Workflow
+Original clip:
 
-![Review-first workflow](docs/review-workflow.svg)
+- [Original `samples/1.mp4`](samples/1.mp4)
 
-### Centroid Thumbnail Selection
+Style comparison:
 
-![Centroid thumbnail selection](docs/centroid-thumbnail.svg)
+| Black | Gauss |
+| :---: | :---: |
+| [![Black redaction preview](docs/redacted-black.gif)](docs/redacted-black.mp4) | [![Gauss redaction preview](docs/redacted-gauss.gif)](docs/redacted-gauss.mp4) |
+| [Full MP4](docs/redacted-black.mp4) | [Full MP4](docs/redacted-gauss.mp4) |
 
-## Core Components
-
-- Go handles orchestration, worker lifecycle, FFmpeg streaming, concurrency, and database access.
-- Python handles face detection and recognition through InsightFace.
-- FFmpeg streams frames through pipes instead of writing them to disk first.
-- PostgreSQL stores 512-dimensional face embeddings plus appearance intervals.
-
-The worker IPC is a custom binary protocol. Go sends frames over stdin and reads structured responses from a dedicated side pipe, not from normal stdout.
+| Pixel | Secure |
+| :---: | :---: |
+| [![Pixel redaction preview](docs/redacted-pixel.gif)](docs/redacted-pixel.mp4) | [![Secure redaction preview](docs/redacted-secure.gif)](docs/redacted-secure.mp4) |
+| [Full MP4](docs/redacted-pixel.mp4) | [Full MP4](docs/redacted-secure.mp4) |
 
 ## Default Workflow
 
@@ -70,15 +73,67 @@ The staged review file is now grouped around:
 - `unresolved_tracks`: read-only track IDs that scan could not confidently group
 - `potential_identities`: the only editable section; this controls grouping and commit actions
 
+![Review-first workflow](docs/review-workflow.svg)
+
+### Example: `samples/1.mp4`
+
+Running:
+
+```bash
+sentinel scan -i samples/1.mp4
+```
+
+produces a grouped review summary where Sentinel first detects five raw tracks, then regroups split appearances of the same person before anything is committed to Postgres:
+
+![Workflow demo](docs/workflow.gif)
+
+- tracks `1` and `4` are grouped into one potential identity for Monica
+- tracks `2` and `5` are grouped into one potential identity for Phoebe
+- track `3` remains Ross on its own
+
+Example output:
+
+```text
+🔍 Scanning (RAM: 0.95 GB | Buffer: 3/200) 100% |████████████████████████████████████████| (245/245)
+---------------------------------------------------------
+📋 REVIEW SUMMARY [c46b22a30343]
+---------------------------------------------------------
+
+👤 Potential Identity 1
+   tracks: 1, 4
+   spans:
+     - Track 1: 00:00:00 -> 00:00:02 [action: new_identity]
+     - Track 4: 00:00:03 -> 00:00:05 [action: new_identity]
+   linkage:
+     - Track 4 STRONG match to Potential Identity 1 (best link: Track 1, distance: 0.08)
+
+👤 Potential Identity 2
+   tracks: 2, 5
+   spans:
+     - Track 2: 00:00:00 -> 00:00:02 [action: new_identity]
+     - Track 5: 00:00:03 -> 00:00:05 [action: new_identity]
+   linkage:
+     - Track 5 STRONG match to Potential Identity 2 (best link: Track 2, distance: 0.13)
+
+👤 Potential Identity 3
+   tracks: 3
+   spans:
+     - Track 3: 00:00:02 -> 00:00:03 [action: new_identity]
+
+---------------------------------------------------------
+👁️  Total Face Detections:   22
+---------------------------------------------------------
+```
+
+This is the core review-first behavior Sentinel is built around: scan produces grouped evidence and suggested actions, then a human can confirm or edit the result before running `sentinel commit`.
+
 ### Important: `--no-staging` Is Unsafe
 
 > [!WARNING]
 > `sentinel scan --no-staging` bypasses review and writes identities and intervals directly to Postgres.
 > It is faster, but it is intentionally less safe.
 
-`sentinel scan --no-staging` skips review and writes identities and intervals directly to Postgres.
-
-That mode is intentionally faster and riskier. In plain terms, it can save the wrong person under a new identity or variant when a scene is ambiguous.
+That mode is faster and riskier. In plain terms, it can save the wrong person under a new identity or variant when a scene is ambiguous.
 
 Examples of when that can happen:
 
@@ -92,6 +147,8 @@ If you care about correctness, use the default staged workflow. Treat `--no-stag
 
 ## Architecture
 
+![Sentinel architecture](docs/architecture.svg)
+
 ### Hybrid Design
 
 - Go: orchestration, cancellation, worker pools, DB writes, CLI
@@ -99,9 +156,15 @@ If you care about correctness, use the default staged workflow. Treat `--no-stag
 - FFmpeg: decode and encode video streams
 - PostgreSQL + pgvector: embedding storage and nearest-neighbor search
 
+The worker IPC is a custom binary protocol. Go sends frames over stdin and reads structured responses from a dedicated side pipe, not from normal stdout.
+
 ### Zero-Disk Frame Flow
 
 Sentinel does not dump frames to disk as part of the main processing path. Video flows from FFmpeg into Go, then into warm Python workers over pipes. This keeps the hot path in memory.
+
+### Fast Video Fingerprinting
+
+Sentinel generates deterministic video IDs with a full hash for small files and evenly spaced chunk sampling for large ones. That keeps startup responsive on long-form video while staying much stronger than a simple head/tail fingerprint.
 
 ### Review and Commit Model
 
@@ -109,7 +172,23 @@ Sentinel does not dump frames to disk as part of the main processing path. Video
 - `commit` applies reviewed actions atomically and records a rollback ledger
 - `rollback` reverts a specific commit, with guards to prevent rolling back older video commits after newer ones touched the same video
 
+### Representative Thumbnail Selection
+
+Sentinel chooses representative thumbnails in embedding space, not just by picking the sharpest crop. It keeps strong candidate frames for a track, maintains a running mean embedding, and selects the candidate whose embedding is closest to that centroid.
+
+![Centroid thumbnail selection](docs/centroid-thumbnail.svg)
+
 ## Command Reference
+
+Status labels used below:
+
+| Label | Meaning |
+| :--- | :--- |
+| `Safe default` | Review-first workflow. `scan` stays out of Postgres for identities and intervals until you explicitly run `sentinel commit`. |
+| `Unsafe` | Faster convenience mode that can save ambiguous or wrong identity assignments. |
+| `Runtime` | Normal day-to-day command used for scanning, search, or redaction. |
+| `Admin` | Maintenance or operator-focused command that is outside the normal scan -> review -> commit workflow. |
+| `Destructive` | Deletes or resets data. These actions are not undone by `sentinel rollback`. |
 
 Global flag:
 
@@ -146,67 +225,92 @@ Behavior:
 Grouped review YAML shape:
 
 ```yaml
-review_id: a1b2c3d4e5f6
-video_id: <video hash>
-input_path: samples/example.mp4
+review_id: 043df1c8054d
+video_id: c46b22a303430d0d4f2477196dd10ece118b9488c25a3ffa05b1513948e16939
+input_path: samples/1.mp4
 
 raw_tracks:
-    "1":
-        start_time: 0
-        end_time: 2.08
-        nearest_candidates:
-            - identity: Monica
-              variant: Default
-              distance: 0.284
-        confidence: 0.84
-        suggested_identity: Monica
-        suggested_variant: Default
-        suggested_action: merge
-        artifact_dir: results/<video>/reviews/<review_id>/tracks/1
-
-unresolved_tracks:
-    - "3"
+  "1":
+    start_time: 0
+    end_time: 2.0854166666666667
+    confidence: 0
+    suggested_identity: ""
+    suggested_variant: ""
+    suggested_action: new_identity
+    artifact_dir: results/c46b22a303430d0d4f2477196dd10ece118b9488c25a3ffa05b1513948e16939/reviews/043df1c8054d/tracks/1
+  "2":
+    start_time: 0
+    end_time: 2.0854166666666667
+    confidence: 0
+    suggested_identity: ""
+    suggested_variant: ""
+    suggested_action: new_identity
+    artifact_dir: results/c46b22a303430d0d4f2477196dd10ece118b9488c25a3ffa05b1513948e16939/reviews/043df1c8054d/tracks/2
+  "3":
+    start_time: 2.0854166666666667
+    end_time: 3.7537499999999997
+    confidence: 0
+    suggested_identity: ""
+    suggested_variant: ""
+    suggested_action: new_identity
+    artifact_dir: results/c46b22a303430d0d4f2477196dd10ece118b9488c25a3ffa05b1513948e16939/reviews/043df1c8054d/tracks/3
+  "4":
+    start_time: 3.7537499999999997
+    end_time: 5.422083333333333
+    confidence: 0
+    suggested_identity: ""
+    suggested_variant: ""
+    suggested_action: new_identity
+    artifact_dir: results/c46b22a303430d0d4f2477196dd10ece118b9488c25a3ffa05b1513948e16939/reviews/043df1c8054d/tracks/4
+  "5":
+    start_time: 3.7537499999999997
+    end_time: 5.422083333333333
+    confidence: 0
+    suggested_identity: ""
+    suggested_variant: ""
+    suggested_action: new_identity
+    artifact_dir: results/c46b22a303430d0d4f2477196dd10ece118b9488c25a3ffa05b1513948e16939/reviews/043df1c8054d/tracks/5
 
 potential_identities:
-    - id: 1
-      tracks:
-        - "1-2"
-      identity: Monica
-      variant: Default
-      action: merge
-    - id: 2
-      tracks:
-        - "3"
-      identity: ""
-      variant: ""
-      action: new_identity
+  - id: 1
+    tracks:
+      - "1"
+      - "4"
+    identity: ""
+    variant: ""
+    action: new_identity
+  - id: 2
+    tracks:
+      - "2"
+      - "5"
+    identity: ""
+    variant: ""
+    action: new_identity
+  - id: 3
+    tracks:
+      - "3"
+    identity: ""
+    variant: ""
+    action: new_identity
 ```
+
+`unresolved_tracks` appears only when scan leaves some track IDs ungrouped. It is omitted entirely when there are none.
 
 Review rules:
 
 - Leave `raw_tracks`, `unresolved_tracks`, `review_id`, `video_id`, and `input_path` unchanged.
 - Edit only `potential_identities[].tracks`, `potential_identities[].identity`, `potential_identities[].variant`, and `potential_identities[].action`.
 - Each `potential_identities[].tracks` entry must be either a single `<track_id>` or an inclusive `<start>-<end>` range of track IDs listed under `raw_tracks`.
-- `unresolved_tracks` is read-only. To resolve one, add its track ID to an existing `potential_identities[].tracks` entry or create a new potential identity entry.
-- `nearest_candidates` is read-only evidence. The prefilled suggested fields are Sentinel heuristics, not final truth.
+- `unresolved_tracks` is read-only when present. To resolve one, add its track ID to an existing `potential_identities[].tracks` entry or create a new potential identity entry.
 - `merge` requires both `identity` and `variant`.
 - `new_variant` requires `identity` to be the existing person and `variant` to be the new variant name.
 - `new_identity` should leave `variant` blank. Leaving `identity` blank lets Sentinel auto-name the new identity.
 - `discard` records the decision without creating or updating an identity.
-- `sentinel commit` applies actions in dependency-safe phases (`new_identity` -> `new_variant` -> `merge`), so YAML row order does not control commit behavior.
-- `sentinel commit` rejects blank actions, duplicate review IDs, edited read-only evidence, sidecar metadata mismatches, review/sidecar track-set mismatches, duplicate `new_identity` names within a batch, `new_identity` names that already exist, and exact system-label collisions like `Identity 42` when that identity already exists.
-
-Per-track review artifacts:
-
-- `1_First_Detection_[frame_00010]_[score].jpg`
-- `2_Last_Detection_[frame_00025]_[score].jpg`
-- `3_Highest_Confidence_[frame_00018]_[score].jpg`
-- `4_Lowest_Confidence_[frame_00007]_[score].jpg`
-- `frames/` contains sampled appearance snapshots when the face score changes materially during the track
+- `sentinel commit` validates the review YAML and sibling sidecar before applying changes to Postgres.
 
 Review artifacts live under:
 
-- `data/results/<video>/reviews/<review_id>/tracks/<track_id>/`
+- `data/results/<video>/reviews/<review_id>/tracks/<track_id>/`, including representative thumbnails and sampled frame snapshots.
 
 ### `commit`
 
@@ -236,11 +340,11 @@ sentinel rollback <commit_id>
 
 Tip:
 
-- if you forgot a commit ID, use `sentinel list commits` or `sentinel list commits --limit 0`
+- if you forgot a commit ID, use `sentinel list commits`
 
 ### `redact`
 
-Status: normal runtime command
+Status: `Runtime`
 
 Redacts faces from a video.
 
@@ -281,10 +385,11 @@ Notes:
 - if you explicitly pass `--mode blur-all`, then `--target` is rejected as a conflicting flag combination.
 - lower `--threshold` values are stricter.
 - `--box-scale 1.0` preserves the detector box size; larger values cover more of the face for privacy.
+- See [Redaction Demo](#redaction-demo) above for the inline style previews.
 
 ### `find`
 
-Status: normal runtime command
+Status: `Runtime`
 
 Searches the database using a reference image.
 
@@ -360,6 +465,16 @@ sentinel list variants <identity_id>
 sentinel list commits
 ```
 
+Example output:
+
+```text
+ID   NAME     VARIANTS   FACE COUNT   CREATED
+--   ----     --------   ----------   -------
+1    Monica   1          9            2026-04-06 19:15
+2    Phoebe   1          9            2026-04-06 19:15
+3    Ross     1          4            2026-04-06 19:15
+```
+
 ### `reset`
 
 Status: `Admin`, `Destructive`
@@ -403,7 +518,7 @@ sentinel scan -i video.mp4 --no-staging
 sentinel list
 
 # List commit history if you need a rollback ID later
-sentinel list commits --limit 0
+sentinel list commits
 
 # Search for someone with an image
 sentinel find suspect.jpg
@@ -440,41 +555,6 @@ Run:
 ```bash
 ./sentinel scan -i video.mp4
 ./sentinel commit data/reviews/video.<short-video-id>.<review_id>.review.yaml
-```
-
-Important local DB note:
-
-> [!NOTE]
-> The repo `.env` is Docker-oriented by default and often uses `POSTGRES_HOST=db`.
-> For native local runs, change that to a local host or pass `--db`.
-
-Example:
-
-```bash
-./sentinel --db "postgres://user:password@localhost:5432/sentinel" list
-```
-
-## Data Model Notes
-
-- identities are the top-level people
-- variants are appearance clusters under an identity, such as different looks
-- intervals point to variants, not directly to identities
-- `find` searches nearest variants and then shows intervals for the parent identity
-
-## Current Tradeoffs
-
-- staged review is the safe path
-- `--no-staging` is faster but can save wrong identities in ambiguous scenes
-- manual delete commands are destructive admin actions and separate from the review/commit workflow
-- startup expects a Postgres environment that already works for Sentinel's schema needs
-
-## Development
-
-Useful local sanity checks:
-
-```bash
-env GOCACHE=/tmp/sentinel-gocache go test ./...
-env GOCACHE=/tmp/sentinel-gocache go build ./cmd/sentinel
 ```
 
 ## Roadmap
